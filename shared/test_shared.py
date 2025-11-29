@@ -14,7 +14,7 @@ custom_gemm = load(
 
 def test_correctness():
     # Small test case
-    M, K, N = 4, 3, 5
+    M, K, N = 1024, 1024, 1024
 
     # Create simple test matrices
     torch.manual_seed(42)
@@ -25,7 +25,6 @@ def test_correctness():
     result = custom_gemm.gemm_cuda(A, B, C)
     expected = torch.matmul(A, B)
     torch.testing.assert_close(result, expected)
-    breakpoint()
     print("Tests passed")
 
 def benchmark():
