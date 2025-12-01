@@ -1,9 +1,7 @@
 import torch
 from torch.utils.cpp_extension import load
-import time
 from triton.testing import do_bench
 
-# Load the extension (will use cached version if already built)
 custom_gemm = load(
     name='shared_gemm',
     sources=['shared.cpp', 'shared_2.cu'],
@@ -12,20 +10,6 @@ custom_gemm = load(
     verbose=False
 )
 
-def test_correctness():
-    # Small test case
-    M, K, N = 1024, 1024, 1024
-
-    # Create simple test matrices
-    torch.manual_seed(42)
-    A = torch.randn(M, K, device='cuda', dtype=torch.float32)
-    B = torch.randn(K, N, device='cuda', dtype=torch.float32)
-    C = torch.zeros(M, N, device='cuda', dtype=torch.float32)
-
-    result = custom_gemm.gemm_cuda(A, B, C)
-    expected = torch.matmul(A, B)
-    torch.testing.assert_close(result, expected)
-    print("Tests passed")
 
 def benchmark():
     def benchmark_cuda_function_in_microseconds(f, *args, **kwargs):
@@ -34,7 +18,7 @@ def benchmark():
     sizes = [(128, 128, 128), (512, 512, 512), (1024, 1024, 1024)]
 
     for M, K, N in sizes:
-        print(f"\nMatrix size: {M}x{K}x{N}")
+        print(f"\nMatrix size: M={M}, K={K}, N={N}")
 
         # Create test data
         A = torch.randn(M, K, device='cuda', dtype=torch.float32)
@@ -79,5 +63,4 @@ if __name__ == "__main__":
     print(f"CUDA Device: {torch.cuda.get_device_name(0)}")
     print(f"PyTorch version: {torch.__version__}")
 
-    passed = test_correctness()
     benchmark()

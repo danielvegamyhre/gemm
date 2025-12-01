@@ -11,29 +11,46 @@ __global__ void sgemm(float* A, float* B, float* C, int M, int N, int K) {
     int global_row = block_row * BLOCK_SIZE + thread_row;
     int global_col = block_col * BLOCK_SIZE + thread_col;
 
-    // Move pointers to starting points for this block
+    // Move pointers to starting points for this block,
+    // to simplify pointer arithmetic below (we only have to worry about
+    // threadblock local indexing).
     A += block_row * BLOCK_SIZE * K;
-    B += block_col * BLOCK_SIZE;  
-    C += block_row * BLOCK_SIZE * N + block_col * BLOCK_SIZE;
+    B += block_col * BLOCK_SIZE;
 
     float acc = 0.0f;
     int num_tiles = (K + BLOCK_SIZE - 1) / BLOCK_SIZE;
     for (int tile_idx = 0; tile_idx < num_tiles; tile_idx++) {
-        // Load tiles into smem
-        sA[thread_row * BLOCK_SIZE + thread_col] = A[thread_row * K + thread_col];
-        sB[thread_row * BLOCK_SIZE + thread_col] = B[thread_row * N + thread_col];
-        __syncthreads();
-        
-        A += BLOCK_SIZE;
-        B += BLOCK_SIZE * N;
-        
-        // Dot products with data in smem
-        for (int k = 0; k < BLOCK_SIZE; ++k) {
-            acc += sA[thread_row * BLOCK_SIZE + k] * sB[k * BLOCK_SIZE + thread_col];
+        // Load tile of A from GMEM into SMEM
+        if (global_row < M && (tile_idx * BLOCK_SIZE + thread_col) < K)
+        {
+            sA[thread_row * BLOCK_SIZE + thread_col] = A[thread_row * K + thread_col];
+        }
+        else
+        {
+            sA[thread_row * BLOCK_SIZE + thread_col] = 0.0f;
+        }
+
+        // Load tile of B from GMEM into SMEM
+        if (global_col < N && (tile_idx * BLOCK_SIZE + thread_row) < K)
+        {
+            sB[thread_row * BLOCK_SIZE + thread_col] = B[thread_row * N + thread_col];
+        }
+        else
+        {
+            sB[thread_row * BLOCK_SIZE + thread_col] = 0.0f;
         }
         __syncthreads();
-    }
 
+        // Dot products with data in smem
+        for (int k = 0; k < BLOCK_SIZE; k++) {
+            acc += sA[thread_row * BLOCK_SIZE + k] * sB[k * BLOCK_SIZE + thread_col];
+        }
+
+        A += BLOCK_SIZE;
+        B += BLOCK_SIZE * N;
+
+        __syncthreads();
+    }
     if ((global_row < M) && (global_col < N)) {
         C[global_row * N + global_col] = acc;
     }

@@ -18,7 +18,7 @@ def benchmark():
     sizes = [(128, 128, 128), (512, 512, 512), (1024, 1024, 1024)]
 
     for M, K, N in sizes:
-        print(f"\nMatrix size: {M}x{K}x{N}")
+        print(f"\nMatrix size: M={M}, K={K}, N={N}")
 
         # Create test data
         A = torch.randn(M, K, device='cuda', dtype=torch.float32)
