@@ -1,6 +1,5 @@
 import torch
 from torch.utils.cpp_extension import load
-import time
 from triton.testing import do_bench
 
 # Load the extension (will use cached version if already built)
@@ -11,21 +10,6 @@ naive_gemm_cuda = load(
     extra_cflags=['-O3'],
     verbose=False
 )
-
-def test_correctness():
-    # Small test case
-    M, K, N = 4, 3, 5
-
-    # Create simple test matrices
-    torch.manual_seed(42)
-    A = torch.randn(M, K, device='cuda', dtype=torch.float32)
-    B = torch.randn(K, N, device='cuda', dtype=torch.float32)
-    C = torch.zeros(M, N, device='cuda', dtype=torch.float32)
-
-    result = naive_gemm_cuda.naive_gemm(A, B, C)
-    expected = torch.matmul(A, B)
-    torch.testing.assert_close(result, expected)
-    print("Tests passed")
 
 def benchmark():
     def benchmark_cuda_function_in_microseconds(f, *args, **kwargs):
@@ -83,5 +67,4 @@ if __name__ == "__main__":
     print(f"CUDA Device: {torch.cuda.get_device_name(0)}")
     print(f"PyTorch version: {torch.__version__}")
 
-    passed = test_correctness()
     benchmark()

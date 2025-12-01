@@ -16,7 +16,7 @@ setup(
                 'nvcc': [
                     '-O3',
                     '--use_fast_math',
-                    '-arch=sm_89',
+                    '-arch=sm_100a',
                 ]
             }
         )
