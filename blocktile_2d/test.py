@@ -13,8 +13,8 @@ custom_gemm = load(
 
 @pytest.mark.parametrize("M,K,N", [
     (16, 16, 16),
-#    (512, 512, 512),
-#    (1024, 1024, 1024)
+    (512, 512, 512),
+    (1024, 1024, 1024)
 ])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_gemm(M, K, N):
@@ -26,5 +26,5 @@ def test_gemm(M, K, N):
 
     result = custom_gemm.gemm_cuda(A, B, C)
     expected = torch.matmul(A, B)
-    
     torch.testing.assert_close(result, expected)
+
