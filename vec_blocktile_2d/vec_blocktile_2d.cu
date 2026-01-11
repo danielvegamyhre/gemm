@@ -32,14 +32,16 @@ __global__ void gemm(float* A, float* B, float* C, int M, int N, int K) {
             const int a_thread_col = linear_idx % BK;
             const int a_global_row = a_base_row + a_thread_row;
             const int a_global_col = tile_idx * BK + a_thread_col;
+            float4 data = make_float4(0, 0, 0, 0); 
             if (a_global_row < M && a_global_col < K)
             {
-                *reinterpret_cast<float4*>(&sA[a_thread_row * BK + a_thread_col]) = *reinterpret_cast<float4*>(&A[a_global_row * K + a_global_col]);
+                data = *reinterpret_cast<float4*>(&A[a_global_row * K + a_global_col]);
             }
-            else
-            {
-                *reinterpret_cast<float4*>(&sA[a_thread_row * BK + a_thread_col]) = make_float4(0, 0, 0, 0); 
-            }
+            // Store in transposed layout for coalesced smem reads of A column fragments into registers later
+            sA[(a_thread_col + 0) * BM + a_thread_row] = data.x;
+            sA[(a_thread_col + 1) * BM + a_thread_row] = data.y;
+            sA[(a_thread_col + 2) * BM + a_thread_row] = data.z;
+            sA[(a_thread_col + 3) * BM + a_thread_row] = data.w;
         }
 
         // Load tile of B from GMEM into SMEM
@@ -72,7 +74,7 @@ __global__ void gemm(float* A, float* B, float* C, int M, int N, int K) {
             const int a_smem_base_row = (threadIdx.x / (BN/TN)) * TM;
             for (int tm = 0; tm < TM; tm++) {
                 const int a_smem_row = a_smem_base_row + tm;
-                a_reg[tm] = sA[a_smem_row * BK + a_smem_col];
+                a_reg[tm] = sA[a_smem_col * BM + a_smem_row];
             }
             // cache row of B in registers
             const int b_smem_row = k;
