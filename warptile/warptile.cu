@@ -3,7 +3,6 @@
 #include <cassert>
 
 #define BLOCK_SIZE 128
-#define DEBUG
 
 template <int BM, int BN, int BK, int WM, int WN, int WSUBM, int WSUBN, int TM, int TN>
 __global__ void gemm(float* A, float* B, float* C, int M, int N, int K) {
@@ -11,116 +10,156 @@ __global__ void gemm(float* A, float* B, float* C, int M, int N, int K) {
     alignas(16) __shared__ float sB[BK * BN];
     const int block_row = blockIdx.y;
     const int block_col = blockIdx.x;
-    const int a_base_row = block_row * BM;
-    const int b_base_col = block_col * BN;
     const int warp_id = threadIdx.x / 32;
     const int warps_per_row = BN / WN;
+    const int warp_row_subtiles_per_warp = (WM / WSUBM);
     const int warp_row = warp_id / warps_per_row;
     const int warp_col = warp_id % warps_per_row;
+    const int lane_id = threadIdx.x % 32;
+    const int thread_row_in_warp = lane_id / (WSUBN / TN);
+    const int thread_col_in_warp = lane_id % (WSUBN / TN);
 
     // how many iterations each warp has to do within a warp tile
     constexpr int WMITER = WM / WSUBM;
     constexpr int WNITER = WN / WSUBN;
 
-    // update base pointers for this warp
-    A += (a_base_row + warp_row * WM) * N;
-    B += b_base_col + (warp_col * WN);
-
-    // 4 results per thread along M dim
+    // accumulator for this warp tile
     float thread_results[WM * WN] = {0.0f};
     const int num_tiles = (K + BK - 1) / BK;
+
+    // constant for vectorized loads
+    const int floats_per_load = 4;
+    const int loads_per_iter = blockDim.x * floats_per_load; 
+    const int total_a_loads = (BM * BK) / loads_per_iter;
+    const int total_b_loads = (BK * BN) / loads_per_iter;
+
+    #pragma unroll
     for (int tile_idx = 0; tile_idx < num_tiles; tile_idx++) {
-        for (int wmiter = 0; wmiter < WMITER; wmiter++) {
-            // increment base pointer for load from A 
-            A += WSUBM * N;
-            for (int wniter = 0; wniter < WNITER; wniter++) {
-                // increment base pointer for load from B
-                B += WSUBN;
 
-                // load tile of A from GMEM into SMEM.
-                const int floats_per_load = 4;
-                const int loads_per_iter = blockDim.x * floats_per_load; 
-                const int total_a_loads = (BM * BK) / loads_per_iter;
+        // load tile of A from GMEM into SMEM.
+        #pragma unroll
+        for (int load_idx = 0; load_idx < total_a_loads; load_idx++) {
+            const int linear_idx = load_idx * loads_per_iter + (threadIdx.x * floats_per_load);
+            const int a_thread_row = linear_idx / BK;
+            const int a_thread_col = linear_idx % BK;
+            const int a_global_row = (block_row * BM) + a_thread_row;
+            const int a_global_col = (tile_idx * BK) + a_thread_col;
+            float4 data = make_float4(0, 0, 0, 0); 
+            data = *reinterpret_cast<float4*>(&A[a_global_row * K + a_global_col]);
 
-                #pragma unroll
-                for (int load_idx = 0; load_idx < total_a_loads; load_idx++) {
-                    const int linear_idx = load_idx * loads_per_iter + (threadIdx.x * floats_per_load);
-                    const int a_thread_row = linear_idx / BK;
-                    const int a_thread_col = linear_idx % BK;
-                    const int a_global_row = a_base_row + a_thread_row;
-                    const int a_global_col = tile_idx * BK + a_thread_col;
-                    float4 data = make_float4(0, 0, 0, 0); 
-                    if (a_global_row < M && a_global_col < K)
-                    {
-                        data = *reinterpret_cast<float4*>(&A[a_global_row * K + a_global_col]);
-                    }
-                    // Store in transposed layout for coalesced smem reads of A column fragments into registers later
-                    sA[(a_thread_col + 0) * BM + a_thread_row] = data.x;
-                    sA[(a_thread_col + 1) * BM + a_thread_row] = data.y;
-                    sA[(a_thread_col + 2) * BM + a_thread_row] = data.z;
-                    sA[(a_thread_col + 3) * BM + a_thread_row] = data.w;
-                }
-
-                // Load tile of B from GMEM into SMEM
-                const int total_b_loads = (BK * BN) / loads_per_iter;
-                #pragma unroll
-                for (int load_idx = 0; load_idx < total_b_loads; load_idx++) {
-                    const int linear_idx = load_idx * loads_per_iter + (threadIdx.x * floats_per_load);
-                    const int b_thread_row = linear_idx / BN;
-                    const int b_thread_col = linear_idx % BN;
-                    const int b_global_row = tile_idx * BK + b_thread_row;
-                    const int b_global_col = b_base_col + b_thread_col;
-                    if (b_global_row < K && b_global_col < N) 
-                    {
-                        *reinterpret_cast<float4*>(&sB[b_thread_row * BN + b_thread_col]) = *reinterpret_cast<float4*>(&B[b_global_row * N + b_global_col]);
-                    }
-                    else 
-                    {
-                        *reinterpret_cast<float4*>(&sB[b_thread_row * BN + b_thread_col]) = make_float4(0, 0, 0, 0);
-                    }
-                }
-            }
+            // Store in transposed layout for coalesced smem reads of A column fragments into registers later
+            sA[(a_thread_col + 0) * BM + a_thread_row] = data.x;
+            sA[(a_thread_col + 1) * BM + a_thread_row] = data.y;
+            sA[(a_thread_col + 2) * BM + a_thread_row] = data.z;
+            sA[(a_thread_col + 3) * BM + a_thread_row] = data.w;
         }
+
+        // Load tile of B from GMEM into SMEM
+        #pragma unroll
+        for (int load_idx = 0; load_idx < total_b_loads; load_idx++) {
+            const int linear_idx = load_idx * loads_per_iter + (threadIdx.x * floats_per_load);
+            const int b_thread_row = linear_idx / BN;
+            const int b_thread_col = linear_idx % BN;
+            const int b_global_row = (tile_idx * BK) + b_thread_row; 
+            const int b_global_col = (block_col * BN) + b_thread_col;
+            *reinterpret_cast<float4*>(&sB[b_thread_row * BN + b_thread_col]) = *reinterpret_cast<float4*>(&B[b_global_row * N + b_global_col]);
+        }
+
         __syncthreads();
 
+        #ifdef DEBUG
+        if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+            // print smem for debuggin
+            for (int i = 0; i < BM; i++) {
+                for (int j = 0; j < BK; j++) {
+                    printf("sA[%d,%d]=%f\n", i, j, sA[j * BM + i]);
+                }
+                printf("\n");
+            }
+            for (int i = 0; i < BK; i++) {
+                for (int j = 0; j < BN; j++) {
+                    printf("sB[%d,%d]=%f\n", i, j, sB[i * BN + j]);
+                }
+                printf("\n");
+            }
+        }
+        #endif
+
         for (int k = 0; k < BK; k++) {
-            float a_reg[TM] = {0.0f};
-            float b_reg[TN] = {0.0f};
+            float a_reg[TM * WMITER] = {0.0f};
+            float b_reg[TN * WNITER] = {0.0f};
 
             // cache col of A in registers
             const int a_smem_col = k;
-            const int a_smem_base_row = (threadIdx.x / (BN/TN)) * TM;
-            for (int tm = 0; tm < TM; tm++) {
-                const int a_smem_row = a_smem_base_row + tm;
-                a_reg[tm] = sA[a_smem_col * BM + a_smem_row];
+            for (int wmiter = 0; wmiter < WMITER; wmiter++) {
+                for (int tm = 0; tm < TM; tm++) {
+                    const int a_smem_row = (warp_row * WM) + (wmiter * WSUBM) + (thread_row_in_warp * TM) + tm;
+                    a_reg[wmiter * TM + tm] = sA[a_smem_col * BM + a_smem_row];
+                }
             }
-            
+                
             // cache row of B in registers
             const int b_smem_row = k;
-            const int b_smem_base_col = (threadIdx.x % (BN/TN)) * TN;
-            for (int tn = 0; tn < TN; tn++) {
-                const int b_smem_col = b_smem_base_col + tn;
-                b_reg[tn] = sB[b_smem_row * BN + b_smem_col];
+            for (int wniter = 0; wniter < WNITER; wniter++) {
+                for (int tn = 0; tn < TN; tn++) {
+                    const int b_smem_col = (warp_col * WN) + (wniter * WSUBN) + (thread_col_in_warp * TN) + tn;
+                    b_reg[wniter * TN + tn] = sB[b_smem_row * BN + b_smem_col];
+                }
             }
 
             // accumulate outer product
-            for (int tm = 0; tm < TM; tm++) {
-                for (int tn = 0; tn < TN; tn++) {
-                    thread_results[tm * TN + tn] += a_reg[tm] * b_reg[tn];
+            for (int wmiter = 0; wmiter < WMITER; wmiter++) {
+                for (int wniter = 0; wniter < WNITER; wniter++) {
+                    for (int tm = 0; tm < TM; tm++) {
+                        for (int tn = 0; tn < TN; tn++) {
+                            int row = (wmiter * TM) + tm;
+                            int col = (wniter * TN) + tn;
+                            thread_results[row * WN + col] += a_reg[row] * b_reg[col];
+                        }
+                    }
                 }
             }
+            #ifdef DEBUG
+            for (int i=0; i < TM*WMITER; i++) {
+                for (int j=0; j < TN*WNITER; j++) {
+                    printf("a_reg[%d]=%f, b_reg[%d]=%f\n", i, a_reg[i], j, b_reg[j]);
+                }
+          }
+            #endif
         }
+
         __syncthreads();
     }
 
+
+    #ifdef DEBUG
+    // print thread_results
+    for (int i=0; i < WM; i++) {
+        for (int j=0; j < WN; j++) {
+            printf("thread_results[%d,%d]=%f\n", i, j, thread_results[i * WN + j]);
+        }
+    }
+    #endif
+
     // store output
     #pragma unroll
-    for (int tm = 0; tm < TM; tm++) {
-        #pragma unroll
-        for (int tn = 0; tn < TN; tn++) {
-            if (c_row + tm < M && c_col + tn < N)
-            {
-                C[(c_row + tm) * N + (c_col + tn)] = thread_results[tm * TN + tn];
+    for (int wmiter = 0; wmiter < WMITER; wmiter++) {
+        #pragma unroll 
+        for (int wniter = 0; wniter < WNITER; wniter++) {
+            #pragma unroll
+            for (int tm = 0; tm < TM; tm++) {
+                #pragma unroll
+                for (int tn = 0; tn < TN; tn++) {
+                    int c_row = (block_row * BLOCK_SIZE) + (warp_row * WM) + (wmiter * WSUBM) + (thread_row_in_warp * TM) + tm;
+                    int c_col = (block_col * BLOCK_SIZE) + (warp_col * WN) + (wniter * WSUBN) + (thread_col_in_warp * TN) + tn;
+                    int thread_row = (wmiter * TM) + tm;
+                    int thread_col = (wniter * TN) + tn;
+
+                    #ifdef DEBUG
+                    printf("thread_row=%d, thread_col=%d, WM=%d, WN=%d\n", thread_row, thread_col, WM, WN);
+                    #endif
+                    C[c_row * N + c_col] = thread_results[thread_row * WN + thread_col];
+                }
             }
         }
     }
@@ -131,8 +170,8 @@ void launch_gemm(float* A, float* B, float* C, int M, int N, int K) {
         return (x + y - 1) / y;
     };
     // each thread computes 4x4 tile
-    constexpr int TM = 4;
-    constexpr int TN = 4;
+    constexpr int TM = 2;
+    constexpr int TN = 2;
 
     // warp's 32 threads arranged in 8x4, each computing 4x4 tile
     constexpr int WARP_SUBTILE_M = 8 * TM; // 8*4 = 32
@@ -143,8 +182,8 @@ void launch_gemm(float* A, float* B, float* C, int M, int N, int K) {
     constexpr int WARP_TILE_N = 2 * WARP_SUBTILE_N; // 2*16 = 32
 
     // thread block target size divided into warp tiles
-    constexpr int BM = BLOCK_SIZE / WARP_TILE_M; // 128/64 = 2
-    constexpr int BN = BLOCK_SIZE / WARP_TILE_N; // 128/32 = 4
+    constexpr int BM = BLOCK_SIZE; // 128
+    constexpr int BN = BLOCK_SIZE; // 128
     constexpr int BK = 16;
 
 #ifdef DEBUG
