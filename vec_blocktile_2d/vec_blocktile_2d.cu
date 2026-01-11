@@ -6,9 +6,9 @@
 
 template <int BM, int BN, int BK, int TM, int TN>
 __global__ void gemm(float* A, float* B, float* C, int M, int N, int K) {
-    // for simplicity assume SMEM 16 byte alignment for float4 vectorized loads
-    __shared__ float sA[BM * BK];
-    __shared__ float sB[BK * BN];
+    // align shared memory for float4 vectorized loads
+    alignas(16) __shared__ float sA[BM * BK];
+    alignas(16) __shared__ float sB[BK * BN];
     const int block_row = blockIdx.y;
     const int block_col = blockIdx.x;
     const int a_base_row = block_row * BM;
