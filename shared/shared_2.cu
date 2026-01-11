@@ -2,14 +2,15 @@
 #define BLOCK_SIZE 16
 
 __global__ void sgemm(float* A, float* B, float* C, int M, int N, int K) {
-    __shared__ float sA[BLOCK_SIZE * BLOCK_SIZE];
-    __shared__ float sB[BLOCK_SIZE * BLOCK_SIZE];
     int block_row = blockIdx.y;
     int block_col = blockIdx.x;
     int thread_row = (threadIdx.x / BLOCK_SIZE);
     int thread_col = (threadIdx.x % BLOCK_SIZE);
     int global_row = block_row * BLOCK_SIZE + thread_row;
     int global_col = block_col * BLOCK_SIZE + thread_col;
+    
+    __shared__ float sA[BLOCK_SIZE * BLOCK_SIZE];
+    __shared__ float sB[BLOCK_SIZE * BLOCK_SIZE];
 
     // Move pointers to starting points for this block,
     // to simplify pointer arithmetic below (we only have to worry about

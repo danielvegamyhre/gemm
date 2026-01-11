@@ -50,8 +50,8 @@ def benchmark():
         custom_tflops = (flops / 1e12) / (custom_us / 1e6)
         torch_tflops = (flops / 1e12) / (torch_us / 1e6)
 
-        print(f"  Custom kernel:  {custom_us:7.3f} ms ({custom_tflops:6.2f} tflops)")
-        print(f"  PyTorch matmul: {torch_us:7.3f} ms ({torch_tflops:6.2f} tflops)")
+        print(f"  Custom kernel:  {custom_us:7.3f} us ({custom_tflops:6.2f} tflops)")
+        print(f"  PyTorch matmul: {torch_us:7.3f} us ({torch_tflops:6.2f} tflops)")
         print(f"  Speedup: {torch_us/custom_us:.2f}x")
 
 if __name__ == "__main__":

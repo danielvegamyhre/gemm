@@ -17,32 +17,32 @@ __global__ void gemm(float* A, float* B, float* C, int M, int N, int K) {
     float thread_results[TM] = {0.0f};
     const int num_tiles = (K + BK - 1) / BK;
     for (int tile_idx = 0; tile_idx < num_tiles; tile_idx++) {
-        // Load tile of A from GMEM into SMEM
-        const int a_block_row = threadIdx.x / BK;
-        const int a_block_col = threadIdx.x % BK;
-        const int a_global_row = a_base_row + a_block_row;
-        const int a_global_col = tile_idx * BK + a_block_col;
+        // Load tile of A from GMEM into SMEM.
+        const int a_thread_row = threadIdx.x / BK;
+        const int a_thread_col = threadIdx.x % BK;
+        const int a_global_row = a_base_row + a_thread_row;
+        const int a_global_col = tile_idx * BK + a_thread_col;
         if (a_global_row < M && a_global_col < K)
         {
-            sA[a_block_row * BK + a_block_col] = A[a_global_row * K + a_global_col];
+            sA[a_thread_row * BK + a_thread_col] = A[a_global_row * K + a_global_col];
         }
         else
         {
-            sA[a_block_row * BK + a_block_col] = 0.0f;
+            sA[a_thread_row * BK + a_thread_col] = 0.0f;
         }
 
         // Load tile of B from GMEM into SMEM
-        const int b_block_row = threadIdx.x / BN;
-        const int b_block_col = threadIdx.x % BN;
-        const int b_global_row = tile_idx * BK + b_block_row;
-        const int b_global_col = b_base_col + b_block_col;
+        const int b_thread_row = threadIdx.x / BN;
+        const int b_thread_col = threadIdx.x % BN;
+        const int b_global_row = tile_idx * BK + b_thread_row;
+        const int b_global_col = b_base_col + b_thread_col;
         if (b_global_row < K && b_global_col < N)
         {
-            sB[b_block_row * BN + b_block_col] = B[b_global_row * N + b_global_col];
+            sB[b_thread_row * BN + b_thread_col] = B[b_global_row * N + b_global_col];
         }
         else
         {
-            sB[b_block_row * BN + b_block_col] = 0.0f;
+            sB[b_thread_row * BN + b_thread_col] = 0.0f;
         }
         __syncthreads();
 
@@ -50,7 +50,7 @@ __global__ void gemm(float* A, float* B, float* C, int M, int N, int K) {
         // using a column of TM size from A from SMEM and a single elem from B
         // cached in a register.
         for (int k = 0; k < BK; k++) {
-            float b_reg = sB[k * BN + b_block_col];
+            float b_reg = sB[k * BN + b_thread_col];
             for (int tm = 0; tm < TM; tm++) {
                 // computing blocks of size (BM, BN), where each thread computes a column of TM results per iteration
                 const int compute_row = (threadIdx.x / BN) * TM + tm;
@@ -74,9 +74,9 @@ void launch_gemm(float* A, float* B, float* C, int M, int N, int K) {
     constexpr int TM = 4; // 4 results per thread along M dim
     constexpr int BM = BLOCK_SIZE;
     constexpr int BN = BLOCK_SIZE;
-    // divide by TM so we can load (BM, BK) tiles of A and (BK, BN) tiles of B with 1 load per thread, rather than having to do TM loops/loads per thread
-    constexpr int BK = BLOCK_SIZE / TM;
-    dim3 block_dim((BM/TM) * BN);
+    // we are doing 4 elems per thread down M, so we need to divide the K dim by 4 to still do only 1 load per thread (no looping).
+    constexpr int BK = BLOCK_SIZE / TM; 
+    dim3 block_dim((BM/TM) * BN); 
     dim3 grid_dim(ceil_div(N, BN), ceil_div(M, BM));
     gemm<BM, BN, BK, TM><<<grid_dim, block_dim>>>(A, B, C, M, N, K);
 }

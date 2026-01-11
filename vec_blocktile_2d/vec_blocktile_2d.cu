@@ -6,6 +6,7 @@
 
 template <int BM, int BN, int BK, int TM, int TN>
 __global__ void gemm(float* A, float* B, float* C, int M, int N, int K) {
+    // for simplicity assume SMEM 16 byte alignment for float4 vectorized loads
     __shared__ float sA[BM * BK];
     __shared__ float sB[BK * BN];
     const int block_row = blockIdx.y;
@@ -19,8 +20,8 @@ __global__ void gemm(float* A, float* B, float* C, int M, int N, int K) {
     float thread_results[TM * TN] = {0.0f};
     const int num_tiles = (K + BK - 1) / BK;
     for (int tile_idx = 0; tile_idx < num_tiles; tile_idx++) {
-        // Load tile of A from GMEM into SMEM.
-        // We have divided BM/TM and BN/TN so we don't have enough threads to load the full required tile size of A/B at once, we must loop.
+        // load tile of A from GMEM into SMEM.
+        // we have divided BM/TM and BN/TN so we don't have enough threads to load the full required tile size of A/B at once, we must loop.
         const int floats_per_load = 4; // each thread loads 4 float32 vals via float4 vectorized load
         const int loads_per_iter = blockDim.x * floats_per_load; 
         const int total_a_loads = (BM * BK) / loads_per_iter;
@@ -76,6 +77,7 @@ __global__ void gemm(float* A, float* B, float* C, int M, int N, int K) {
                 const int a_smem_row = a_smem_base_row + tm;
                 a_reg[tm] = sA[a_smem_col * BM + a_smem_row];
             }
+            
             // cache row of B in registers
             const int b_smem_row = k;
             const int b_smem_base_col = (threadIdx.x % (BN/TN)) * TN;
@@ -83,6 +85,7 @@ __global__ void gemm(float* A, float* B, float* C, int M, int N, int K) {
                 const int b_smem_col = b_smem_base_col + tn;
                 b_reg[tn] = sB[b_smem_row * BN + b_smem_col];
             }
+
             // accumulate outer product
             for (int tm = 0; tm < TM; tm++) {
                 for (int tn = 0; tn < TN; tn++) {
