@@ -24,7 +24,7 @@ __global__ void gemm(float* A, float* B, float* C, int M, int N, int K) {
     constexpr int WNITER = WN / WSUBN;
 
     // accumulator for this warp tile
-    float thread_results[WM * WN] = {0.0f};
+    float accum[(WMITER * TM) * (WNITER * TN)] = {0.0f};
     const int num_tiles = (K + BK - 1) / BK;
 
     // constant for vectorized loads
@@ -114,17 +114,19 @@ __global__ void gemm(float* A, float* B, float* C, int M, int N, int K) {
                         for (int tn = 0; tn < TN; tn++) {
                             int row = (wmiter * TM) + tm;
                             int col = (wniter * TN) + tn;
-                            thread_results[row * WN + col] += a_reg[row] * b_reg[col];
+                            accum[row * (WNITER * TN) + col] += a_reg[row] * b_reg[col];
                         }
                     }
                 }
             }
             #ifdef DEBUG
-            for (int i=0; i < TM*WMITER; i++) {
-                for (int j=0; j < TN*WNITER; j++) {
-                    printf("a_reg[%d]=%f, b_reg[%d]=%f\n", i, a_reg[i], j, b_reg[j]);
+            if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+                for (int i=0; i < WMITER*TM; i++) {
+                    for (int j=0; j < WNITER*TN; j++) {
+                        printf("a_reg[%d]=%f, b_reg[%d]=%f\n", i, a_reg[i], j, b_reg[j]);
+                    }
                 }
-          }
+            }
             #endif
         }
 
@@ -133,10 +135,12 @@ __global__ void gemm(float* A, float* B, float* C, int M, int N, int K) {
 
 
     #ifdef DEBUG
-    // print thread_results
-    for (int i=0; i < WM; i++) {
-        for (int j=0; j < WN; j++) {
-            printf("thread_results[%d,%d]=%f\n", i, j, thread_results[i * WN + j]);
+    // print accum
+    if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+        for (int i=0; i < WMITER*TM; i++) {
+            for (int j=0; j < WNITER*TN; j++) {
+                printf("accum[%d,%d]=%f\n", i, j, accum[i * (WNITER*TN) + j]);
+            }
         }
     }
     #endif
@@ -154,11 +158,7 @@ __global__ void gemm(float* A, float* B, float* C, int M, int N, int K) {
                     int c_col = (block_col * BLOCK_SIZE) + (warp_col * WN) + (wniter * WSUBN) + (thread_col_in_warp * TN) + tn;
                     int thread_row = (wmiter * TM) + tm;
                     int thread_col = (wniter * TN) + tn;
-
-                    #ifdef DEBUG
-                    printf("thread_row=%d, thread_col=%d, WM=%d, WN=%d\n", thread_row, thread_col, WM, WN);
-                    #endif
-                    C[c_row * N + c_col] = thread_results[thread_row * WN + thread_col];
+                    C[c_row * N + c_col] = accum[thread_row * (WNITER*TN) + thread_col];
                 }
             }
         }
@@ -169,17 +169,17 @@ void launch_gemm(float* A, float* B, float* C, int M, int N, int K) {
     auto ceil_div = [](int x, int y) {
         return (x + y - 1) / y;
     };
-    // each thread computes 4x4 tile
+    // each thread computes 2x2 tile
     constexpr int TM = 2;
     constexpr int TN = 2;
 
-    // warp's 32 threads arranged in 8x4, each computing 4x4 tile
-    constexpr int WARP_SUBTILE_M = 8 * TM; // 8*4 = 32
-    constexpr int WARP_SUBTILE_N = 4 * TN; // 4*4 = 16
+    // warp's 32 threads arranged in 8x4, each computing2x2 tile
+    constexpr int WARP_SUBTILE_M = 8 * TM; // 8*2 = 16
+    constexpr int WARP_SUBTILE_N = 4 * TN; // 4*2 = 8
 
     // warp subtiles arranged in 2x2 layout
-    constexpr int WARP_TILE_M = 2 * WARP_SUBTILE_M; // 2*32 = 64
-    constexpr int WARP_TILE_N = 2 * WARP_SUBTILE_N; // 2*16 = 32
+    constexpr int WARP_TILE_M = 2 * WARP_SUBTILE_M; // 2*16= 32 
+    constexpr int WARP_TILE_N = 2 * WARP_SUBTILE_N; // 2*8 = 16 
 
     // thread block target size divided into warp tiles
     constexpr int BM = BLOCK_SIZE; // 128

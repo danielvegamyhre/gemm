@@ -26,5 +26,8 @@ def test_gemm(M, K, N):
 
     result = custom_gemm.gemm_cuda(A, B, C)
     expected = torch.matmul(A, B)
+    print(result)
+    print()
+    print(expected)
     torch.testing.assert_close(result, expected)
 
