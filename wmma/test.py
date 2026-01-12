@@ -18,14 +18,14 @@ custom_gemm = load(
 ])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_gemm(M, K, N):
-    """Test that shared memory GEMM produces correct results compared to PyTorch matmul."""
     torch.manual_seed(42)
     A = torch.randn(M, K, device='cuda', dtype=torch.bfloat16)
     B = torch.randn(K, N, device='cuda', dtype=torch.bfloat16)
     C = torch.zeros(M, N, device='cuda', dtype=torch.float32)
 
     result = custom_gemm.gemm_cuda(A, B, C)
-    expected = torch.matmul(A, B)
+    expected = torch.matmul(A, B).to(torch.float32)
+
     print(result)
     print()
     print(expected)

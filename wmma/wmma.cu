@@ -19,8 +19,8 @@ template<
     int WARP_TILES_N = 2
 >
 __global__ void gemm(__nv_bfloat16* A, __nv_bfloat16* B, float* C, int M, int N, int K) {
-    alignas(128) __shared__ __nv_bfloat16 sA[BM * BK]; // 64*16
-    alignas(128) __shared__ __nv_bfloat16 sB[BK * BN]; // 16*64
+    alignas(256) __shared__ __nv_bfloat16 sA[BM * BK]; // 64*16
+    alignas(256) __shared__ __nv_bfloat16 sB[BK * BN]; // 16*64
     const int block_row = blockIdx.y;
     const int block_col = blockIdx.x;
     const int warp_id = threadIdx.x / 32;
@@ -42,8 +42,8 @@ __global__ void gemm(__nv_bfloat16* A, __nv_bfloat16* B, float* C, int M, int N,
     }
 
     // constant for vectorized loads
-    const int floats_per_load = 4;
-    const int loads_per_iter = blockDim.x * floats_per_load; 
+    const int bfloats_per_load = 1;
+    const int loads_per_iter = blockDim.x * bfloats_per_load; 
     const int total_a_loads = (BM * BK) / loads_per_iter;
     const int total_b_loads = (BK * BN) / loads_per_iter;
 
@@ -54,24 +54,23 @@ __global__ void gemm(__nv_bfloat16* A, __nv_bfloat16* B, float* C, int M, int N,
         // load tile of A from GMEM into SMEM.
         #pragma unroll
         for (int load_idx = 0; load_idx < total_a_loads; load_idx++) {
-            const int linear_idx = load_idx * loads_per_iter + (threadIdx.x * floats_per_load);
+            const int linear_idx = load_idx * loads_per_iter + (threadIdx.x * bfloats_per_load);
             const int a_thread_row = linear_idx / BK;
             const int a_thread_col = linear_idx % BK;
             const int a_global_row = (block_row * BM) + a_thread_row;
             const int a_global_col = (tile_idx * BK) + a_thread_col;
-            *reinterpret_cast<float4*>(&sA[a_thread_row * BK + a_thread_col]) = *reinterpret_cast<float4*>(&A[a_global_row * K + a_global_col]);
-
+            *reinterpret_cast<__nv_bfloat16*>(&sA[a_thread_row * BK + a_thread_col]) = *reinterpret_cast<__nv_bfloat16*>(&A[a_global_row * K + a_global_col]);
         }
 
         // Load tile of B from GMEM into SMEM
         #pragma unroll
         for (int load_idx = 0; load_idx < total_b_loads; load_idx++) {
-            const int linear_idx = load_idx * loads_per_iter + (threadIdx.x * floats_per_load);
+            const int linear_idx = load_idx * loads_per_iter + (threadIdx.x * bfloats_per_load);
             const int b_thread_row = linear_idx / BN;
             const int b_thread_col = linear_idx % BN;
             const int b_global_row = (tile_idx * BK) + b_thread_row; 
             const int b_global_col = (block_col * BN) + b_thread_col;
-            *reinterpret_cast<float4*>(&sB[b_thread_row * BN + b_thread_col]) = *reinterpret_cast<float4*>(&B[b_global_row * N + b_global_col]);
+            *reinterpret_cast<__nv_bfloat16*>(&sB[b_thread_row * BN + b_thread_col]) = *reinterpret_cast<__nv_bfloat16*>(&B[b_global_row * N + b_global_col]);
         }
 
         __syncthreads();
@@ -85,7 +84,7 @@ __global__ void gemm(__nv_bfloat16* A, __nv_bfloat16* B, float* C, int M, int N,
                 wmma::load_matrix_sync(a_frag, smem_tile_a, BK);
 
                 // cache row of B in registers
-                const int smem_b_col = (warp_col * WARP_TILES_N * WMMA_N) + (warp_tile_n + WMMA_N);
+                const int smem_b_col = (warp_col * WARP_TILES_N * WMMA_N) + (warp_tile_n * WMMA_N);
                 __nv_bfloat16* smem_tile_b = &sB[smem_b_col]; // row major, starting at first row
                 wmma::load_matrix_sync(b_frag, smem_tile_b, BN);
 
