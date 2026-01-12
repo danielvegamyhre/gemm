@@ -27,7 +27,6 @@ __global__ void gemm(__nv_bfloat16* A, __nv_bfloat16* B, float* C, int M, int N,
     constexpr int warps_per_row = BN / (WARP_TILES_N * WMMA_N); // 64 / (2*16) = 2
     const int warp_row = warp_id / warps_per_row;
     const int warp_col = warp_id % warps_per_row;
-    const int lane_id = threadIdx.x % 32;
 
     // fragments for A and B (similar to a_reg/b_reg in warptile kernel)
     wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;

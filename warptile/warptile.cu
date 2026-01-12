@@ -170,8 +170,8 @@ void launch_gemm(float* A, float* B, float* C, int M, int N, int K) {
         return (x + y - 1) / y;
     };
     // each thread computes 2x2 tile
-    constexpr int TM = 2;
-    constexpr int TN = 2;
+    constexpr int TM = 4;
+    constexpr int TN = 4;
 
     // warp's 32 threads arranged in 8x4, each computing2x2 tile
     constexpr int WARP_SUBTILE_M = 8 * TM; // 8*2 = 16
