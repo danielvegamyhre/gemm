@@ -76,23 +76,26 @@ __global__ void gemm(__nv_bfloat16* A, __nv_bfloat16* B, float* C, int M, int N,
         __syncthreads();
 
         // wmma on each warp tile this warp is responsible for
-        for (int warp_tile_m = 0; warp_tile_m < WARP_TILES_M; warp_tile_m++) {
-            for (int warp_tile_n = 0; warp_tile_n < WARP_TILES_N; warp_tile_n++) {
-                // cache col of A in registers
-                const int smem_a_row = (warp_row * WARP_TILES_M * WMMA_M) + (warp_tile_m * WMMA_M);
-                __nv_bfloat16* smem_tile_a = &sA[smem_a_row * BK]; // row major, starting at first col
-                wmma::load_matrix_sync(a_frag, smem_tile_a, BK);
+        for (int k = 0; k < BK; k += WMMA_K) {
+            for (int warp_tile_m = 0; warp_tile_m < WARP_TILES_M; warp_tile_m++) {
+                for (int warp_tile_n = 0; warp_tile_n < WARP_TILES_N; warp_tile_n++) {
+                    // cache col of A in registers
+                    const int smem_a_row = (warp_row * WARP_TILES_M * WMMA_M) + (warp_tile_m * WMMA_M);
+                    const int smem_a_col = k;
+                    __nv_bfloat16* smem_tile_a = &sA[smem_a_row * BK + smem_a_col];
+                    wmma::load_matrix_sync(a_frag, smem_tile_a, BK);
 
-                // cache row of B in registers
-                const int smem_b_col = (warp_col * WARP_TILES_N * WMMA_N) + (warp_tile_n * WMMA_N);
-                __nv_bfloat16* smem_tile_b = &sB[smem_b_col]; // row major, starting at first row
-                wmma::load_matrix_sync(b_frag, smem_tile_b, BN);
+                    // cache row of B in registers
+                    const int smem_b_row = k;
+                    const int smem_b_col = (warp_col * WARP_TILES_N * WMMA_N) + (warp_tile_n * WMMA_N);
+                    __nv_bfloat16* smem_tile_b = &sB[k * BN + smem_b_col];
+                    wmma::load_matrix_sync(b_frag, smem_tile_b, BN);
 
-                // accumulate outer product
-                wmma::mma_sync(c_frag[warp_tile_m][warp_tile_n], a_frag, b_frag, c_frag[warp_tile_m][warp_tile_n]);
+                    // accumulate outer product
+                    wmma::mma_sync(c_frag[warp_tile_m][warp_tile_n], a_frag, b_frag, c_frag[warp_tile_m][warp_tile_n]);
+                }
             }
         }
-
         __syncthreads();
     }
 

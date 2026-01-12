@@ -38,11 +38,13 @@ def benchmark():
         )
 
         # Benchmark PyTorch
+        out = torch.zeros(M, N, device="cuda", dtype=torch.float32)
         torch_us = benchmark_cuda_function_in_microseconds(
-            torch.matmul,
+            torch.mm,
             A,
             B,
-            out=C,
+            out_dtype=torch.float32,
+            out=out,
         )
 
         # Calculate tflops

@@ -24,10 +24,8 @@ def test_gemm(M, K, N):
     C = torch.zeros(M, N, device='cuda', dtype=torch.float32)
 
     result = custom_gemm.gemm_cuda(A, B, C)
-    expected = torch.matmul(A, B).to(torch.float32)
 
-    print(result)
-    print()
-    print(expected)
+    expected = torch.zeros(M, N, device="cuda", dtype=torch.float32)
+    torch.mm(A, B, out_dtype=torch.float32, out=expected)
     torch.testing.assert_close(result, expected)
 
