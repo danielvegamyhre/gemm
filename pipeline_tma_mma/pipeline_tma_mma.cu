@@ -28,6 +28,17 @@ inline void cuda_check_impl(cudaError_t result, const char* file, int line) {
 
 #define CUDA_CHECK(result) cuda_check_impl((result), __FILE__, __LINE__)
 
+// Get the driver entry point for cuTensorMapEncodeTiled (used for TMA tensor maps)
+inline void* get_driver_ptr() {
+    static void *driver_ptr = nullptr;
+    if (!driver_ptr) {
+        cudaDriverEntryPointQueryResult result;
+        CUDA_CHECK(cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &driver_ptr,
+                                cudaEnableDefault, &result));
+    }
+    return driver_ptr;
+}
+
 // Reference: https://docs.nvidia.com/cuda/cuda-c-programming-guide/#using-tma-to-transfer-multi-dimensional-arrays
 void create_tensor_map(
     void* tensor_ptr,
@@ -63,10 +74,76 @@ void create_tensor_map(
     CUDA_CHECK(res);
 }
 
+// init mbar for sync between tma and regular 
+__device__ __forceinline__ void mbarrier_init(uint64_t *mbar, const uint32_t count) {
+  uint32_t mbar_ptr = __cvta_generic_to_shared(mbar);
+  asm volatile(
+    "mbarrier.init.shared.b64 [%0], %1;" 
+    : // no outputs
+    :"r"(mbar_ptr), "r"(count) // inputs
+    : "memory"
+  );
+}
 
+template <int num_barriers, int THREADS_PER_BLOCK>
+__forceinline__ __device__ void initialize_barriers(uint64_t *mbar, const bool is_master_thread) {
+  if (is_master_thread) {
+    #pragma unroll
+    for (int iter = 0; iter < num_barriers; ++iter) {
+        mbarrier_init(&mbar[iter], THREADS_PER_BLOCK);
+    }
+    asm volatile("fence.proxy.async.shared::cta;");
+  }
+  __syncthreads();
+}
+
+__device__ __forceinline__ bool mbarrier_try_wait_parity(uint32_t mbar_ptr, const uint32_t parity) {
+  uint32_t waitComplete;
+  asm volatile(
+    "{\n\t .reg .pred P_OUT; \n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64  P_OUT, [%1], %2; \n\t"
+        "selp.b32 %0, 1, 0, P_OUT; \n"
+        "}"
+        : "=r"(waitComplete)         // outputs
+        : "r"(mbar_ptr), "r"(parity) // inputs
+        : "memory"
+  );
+  return static_cast<bool>(waitComplete);
+}
+
+__device__ __forceinline__ void mbarrier_wait_parity(uint64_t *mbar, const uint32_t parity) {
+  uint32_t mbar_ptr = __cvta_generic_to_shared(mbar);
+  while (!mbarrier_try_wait_parity(mbar_ptr, parity)) {
+  }
+}
+
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-arrive
+__device__ __forceinline__ void mbarrier_arrive(uint64_t *mbar) {
+  uint32_t mbar_ptr = __cvta_generic_to_shared(mbar);
+  asm volatile(
+        "mbarrier.arrive.shared.b64 _, [%0];" 
+        :                // no outputs
+        :"r"(mbar_ptr)   // input
+        : "memory"
+  );
+}
+
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-arrive
+__device__ __forceinline__ void
+mbarrier_arrive_expect_tx(uint64_t *mbar, const uint32_t tx_count) {
+  uint32_t mbar_ptr = __cvta_generic_to_shared(mbar);
+  asm volatile(
+      "mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;" 
+      :                             // no outputs
+      :"r"(mbar_ptr), "r"(tx_count) // inputs
+      : "memory");
+}
+
+
+// async tma load from gmem to smem
 __device__ __forceinline__ void cp_async_bulk_tensor_2d_global_to_shared(
-    const uint64_t *tensor_map_ptr,
     uint64_t *dst_shmem,
+    const uint64_t *tensor_map_ptr,
     const uint32_t offset_x, 
     const uint32_t offset_y, 
     uint64_t *mbar
@@ -78,7 +155,7 @@ __device__ __forceinline__ void cp_async_bulk_tensor_2d_global_to_shared(
       "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
       ".mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];" 
       : // no outputs
-      : // inputs:
+      : // inputs
       "r"(dst_shmem_ptr),
       "l"(tensor_map_ptr), 
       "r"(offset_x), 
@@ -88,71 +165,32 @@ __device__ __forceinline__ void cp_async_bulk_tensor_2d_global_to_shared(
   );
 }
 
-template <int BM, int BN, int BK>
-__device__ void async_load_gmem_to_smem(
-    __nv_bfloat16* A,  // gmem
-    __nv_bfloat16* B,  // gmem
-    __nv_bfloat16* sA, // smem
-    __nv_bfloat16* sB, // smem
-    const __grid_constant__ CUtensorMap a_map,
-    const __grid_constant__ CUtensorMap b_map,
-    uint64_t* mbar,
-    const int k_tile_idx,
-    const int block_row,
-    const int block_col,
-    const int num_threads,
-    const int M,
-    const int N,
-    const int K
+// wraper for cp_async_bulk_tensor_2d_global_to_shared
+__forceinline__ __device__ void copy_2d_to_shared(
+    void *dst, 
+    const void *src, 
+    const size_t global_offset_X,
+    const size_t global_offset_Y, 
+    const size_t num_bytes,
+    uint64_t *mbar, 
+    const bool is_master_thread
 ) {
-    // constant for vectorized loads
-    constexpr int BYTES_PER_LOAD = 16;
-    constexpr int bfloats_per_load = BYTES_PER_LOAD / 2; // 2 bytes per bf16 = 8 vals per load
-    const int loads_per_iter = num_threads * bfloats_per_load; 
-    const int total_a_loads = (BM * BK) / loads_per_iter;
-    const int total_b_loads = (BK * BN) / loads_per_iter;
-
-    // load tile of A from GMEM into SMEM.
-    #pragma unroll
-    for (int load_idx = 0; load_idx < total_a_loads; load_idx++) {
-        const int linear_idx = load_idx * loads_per_iter + (threadIdx.x * bfloats_per_load);
-        const int a_thread_row = linear_idx / BK;
-        const int a_thread_col = linear_idx % BK;
-        const int a_global_row = (block_row * BM) + a_thread_row;
-        const int a_global_col = (k_tile_idx * BK) + a_thread_col;
-        void* dst_ptr = (void*)&sA[a_thread_row * BK + a_thread_col];
-        cp_async_bulk_tensor_2d_global_to_shared(
-            a_map,
-            dst_ptr, 
-            a_global_col,
-            a_global_row,
-            mbar,
-        );
-    }
-
-    // load tile of B from GMEM into SMEM
-    #pragma unroll
-    for (int load_idx = 0; load_idx < total_b_loads; load_idx++) {
-        const int linear_idx = load_idx * loads_per_iter + (threadIdx.x * bfloats_per_load);
-        const int b_thread_row = linear_idx / BN;
-        const int b_thread_col = linear_idx % BN;
-        const int b_global_row = (k_tile_idx * BK) + b_thread_row; 
-        const int b_global_col = (block_col * BN) + b_thread_col;
-        void* dst_ptr = (void*)&sB[b_thread_row * BN + b_thread_col];
-        cp_async_bulk_tensor_2d_global_to_shared(
-            b_map,
-            dst_ptr, 
-            b_global_col,
-            b_global_row,
-            mbar,
-        ); 
-    }
-
-    // commit group of async loads
-    asm volatile("cp.async.bulk.commit_group;\n" ::);
+  if (is_master_thread) {
+    cp_async_bulk_tensor_2d_global_to_shared(
+        reinterpret_cast<uint64_t *>(dst),
+        reinterpret_cast<const uint64_t *>(src), 
+        global_offset_X, 
+        global_offset_Y, 
+        mbar
+    );
+    mbarrier_arrive_expect_tx(mbar, num_bytes);
+  } else {
+    mbarrier_arrive(mbar);
+  }
 }
 
 template<
+    int THREADBLOCK_SIZE,
     int BM = 128,
     int BN = 128,
     int BK = 16,
@@ -164,24 +202,30 @@ template<
     int WARP_TILES_N = 2
 >
 __global__ void gemm(
-    __nv_bfloat16* A, 
-    __nv_bfloat16* B, 
+    const __grid_constant__ CUtensorMap a_map,
+    const __grid_constant__ CUtensorMap b_map,
     float* C, 
-    __grid_constant__ a_map,
-    __grid_constant__ b_map,
     int M, 
     int N, 
-    int K,
+    int K
 ) {
-    alignas(16) __shared__ __nv_bfloat16 sA[NUM_BUFFERS][BM * BK]; // 64*16
-    alignas(16) __shared__ __nv_bfloat16 sB[NUM_BUFFERS][BK * BN]; // 16*64
+    __shared__ __align__(16) __nv_bfloat16 sA[NUM_BUFFERS][BM * BK]; // 64*16
+    __shared__ __align__(16) __nv_bfloat16 sB[NUM_BUFFERS][BK * BN]; // 16*64
     const int block_row = blockIdx.y;
     const int block_col = blockIdx.x;
     const int warp_id = threadIdx.x / 32;
     constexpr int warps_per_row = BN / (WARP_TILES_N * WMMA_N); // 64 / (2*16) = 2
     const int warp_row = warp_id / warps_per_row;
     const int warp_col = warp_id % warps_per_row;
-    const int num_threads = blockDim.x;
+    const int is_master_thread = threadIdx.x == 0;
+
+    // init mbarriers (one per buffer, per A/B)
+    __shared__ __align__(16) uint64_t mbar_a[NUM_BUFFERS];
+    __shared__ __align__(16) uint64_t mbar_b[NUM_BUFFERS];
+    int parity_a[NUM_BUFFERS] = {0};
+    int parity_b[NUM_BUFFERS] = {0};
+    initialize_barriers<NUM_BUFFERS, THREADBLOCK_SIZE>(mbar_a, is_master_thread);
+    initialize_barriers<NUM_BUFFERS, THREADBLOCK_SIZE>(mbar_b, is_master_thread);
 
     // fragments for A and B (similar to a_reg/b_reg in warptile kernel)
     wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;
@@ -195,39 +239,83 @@ __global__ void gemm(
         }
     }
 
-    // prologue - preload first buffer
-    int read_buf_idx = 0;
+    // prologue: prefetch first A/B tiles into first SMEM bufffer
     int write_buf_idx = 0;
-    async_load_gmem_to_smem<BM, BN, BK>(A, B, &sA[write_buf_idx][0], &sB[write_buf_idx][0], 0, block_row, block_col, num_threads, M, N, K);
-    write_buf_idx ^= 1; // toggle next buffer idx
+    int read_buf_idx = 0;
+    int a_global_row = block_row * BM;
+    int a_global_col = 0;
+    int b_global_row = 0;
+    int b_global_col = block_col * BN;
+    constexpr int num_bytes_a = BM * BK;
+    constexpr int num_bytes_b = BK * BN;
+
+    copy_2d_to_shared(
+        reinterpret_cast<void*>(&sA[write_buf_idx][0]), 
+        reinterpret_cast<const void*>(&a_map),
+        a_global_col,
+        a_global_row,
+        num_bytes_a,
+        (uint64_t*)&mbar_a[write_buf_idx],
+        is_master_thread
+    );
+    copy_2d_to_shared(
+        reinterpret_cast<void*>(&sB[write_buf_idx][0]),
+        reinterpret_cast<const void*>(&b_map),
+        b_global_col,
+        b_global_row,
+        num_bytes_b,
+        (uint64_t*)&mbar_b[write_buf_idx],
+        is_master_thread
+    );
+
+    // toggle buf to write to
+    write_buf_idx ^= 1;
 
     const int num_k_tiles = (K + BK - 1) / BK;
     #pragma unroll
-    for (int tile_idx = 0; tile_idx < num_k_tiles; tile_idx++) {
+    for (int k_tile_idx = 0; k_tile_idx < num_k_tiles; k_tile_idx++) {
         // prefetch next a/b tiles into next buffer.
         // note this is not async in this kernel version, so benefits are limited (one fewer syncthreads())
-        if (tile_idx + 1 < num_k_tiles)
+        if (k_tile_idx + 1 < num_k_tiles)
         {
-            async_load_gmem_to_smem<BM, BN, BK>(A, B, &sA[write_buf_idx][0], &sB[write_buf_idx][0], tile_idx + 1, block_row, block_col, num_threads, M, N, K);
-            write_buf_idx ^= 1; // toggle next buffer idx
+            a_global_col = (k_tile_idx + 1) * BK;
+            b_global_row = (k_tile_idx + 1) * BK;
+            copy_2d_to_shared(
+                reinterpret_cast<void*>(&sA[write_buf_idx][0]), 
+                reinterpret_cast<const void*>(&a_map),
+                a_global_col,
+                a_global_row,
+                num_bytes_a,
+                (uint64_t*)&mbar_a[write_buf_idx],
+                is_master_thread
+            ); 
+            copy_2d_to_shared(
+                reinterpret_cast<void*>(&sB[write_buf_idx][0]),
+                reinterpret_cast<const void*>(&b_map),
+                b_global_col,
+                b_global_row,
+                num_bytes_b,
+                (uint64_t*)&mbar_b[write_buf_idx],
+                is_master_thread
+            );
+            write_buf_idx ^= 1;
         }
 
-        // at this point we have 2 cp async loads in flight.
-        // wait for only 1 to be in flight.
-        // it is guaranteed they complete in FIFO order, so we can begin processing the oldest buff.
-        asm volatile("cp.async.wait_group 1;\n" ::);
+        // at this point we have 2 tma commit groups in flight.
+        // wait only for the one we are about to read from.
+        mbarrier_wait_parity(&mbar_a[read_buf_idx], parity_a[read_buf_idx]);
+        mbarrier_wait_parity(&mbar_b[read_buf_idx], parity_b[read_buf_idx]);
+        asm volatile("fence.proxy.async.shared::cta;");
 
         // wmma on each warp tile this warp is responsible for
         for (int k = 0; k < BK; k += WMMA_K) {
             for (int warp_tile_m = 0; warp_tile_m < WARP_TILES_M; warp_tile_m++) {
                 for (int warp_tile_n = 0; warp_tile_n < WARP_TILES_N; warp_tile_n++) {
-                    // cache col fragment of A
                     const int smem_a_row = (warp_row * WARP_TILES_M * WMMA_M) + (warp_tile_m * WMMA_M);
                     const int smem_a_col = k;
                     __nv_bfloat16* smem_tile_a = &sA[read_buf_idx][smem_a_row * BK + smem_a_col];
                     wmma::load_matrix_sync(a_frag, smem_tile_a, BK);
 
-                    // cache row fragment of B
                     const int smem_b_row = k;
                     const int smem_b_col = (warp_col * WARP_TILES_N * WMMA_N) + (warp_tile_n * WMMA_N);
                     __nv_bfloat16* smem_tile_b = &sB[read_buf_idx][smem_b_row * BN + smem_b_col];
@@ -238,7 +326,11 @@ __global__ void gemm(
                 }
             }
         }
-        read_buf_idx ^= 1; // toggle next buff to read from
+
+        // toggle next buffer
+        parity_a[read_buf_idx] ^= 1;
+        parity_b[read_buf_idx] ^= 1;
+        read_buf_idx ^= 1;
         __syncthreads();
     }
 
@@ -254,11 +346,6 @@ __global__ void gemm(
 }
 
 extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
-    // Cast void* to __nv_bfloat16*
-    __nv_bfloat16* a_ptr = reinterpret_cast<__nv_bfloat16*>(A);
-    __nv_bfloat16* b_ptr = reinterpret_cast<__nv_bfloat16*>(B);
-    float* c_ptr = reinterpret_cast<float*>(C);
-
     constexpr int WMMA_M = 16;
     constexpr int WMMA_N = 16;
     constexpr int WMMA_K = 16;
@@ -273,12 +360,11 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     constexpr int BK = 16;
 
     constexpr int num_warps = (BLOCK_SIZE * BLOCK_SIZE) / (WARP_TILES_M * WMMA_M * WARP_TILES_N * WMMA_N); // (64*64) / (2*16*2*16) = 4 warps
-    constexpr int threadblock_size = num_warps * 32; // 4*32 = 128 threads
+    constexpr int THREADBLOCK_SIZE = num_warps * 32; // 4*32 = 128 threads
 
     // create tensor maps
     alignas(64) CUtensorMap a_map = {};
     alignas(64) CUtensorMap b_map = {};
-
     create_tensor_map(
         A,
         a_map,
@@ -287,7 +373,6 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
         BK,
         BM 
     );
-
     create_tensor_map(
         B,
         b_map,
@@ -296,12 +381,14 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
         BN,
         BK
     );
+    float* c_ptr = reinterpret_cast<float*>(C);
 
-    dim3 block_dim(threadblock_size);
+    dim3 block_dim(THREADBLOCK_SIZE);
     dim3 grid_dim(ceil_div(N, BN), ceil_div(M, BM));
     gemm<
+        THREADBLOCK_SIZE,
         BM, BN, BK, 
         WMMA_M, WMMA_N, WMMA_K, 
         WARP_TILES_M, WARP_TILES_N
-    ><<<grid_dim, block_dim>>>(a_ptr, b_ptr, c_ptr, M, N, K);
+    ><<<grid_dim, block_dim>>>(a_map, b_map, c_ptr, M, N, K);
 }
