@@ -2,6 +2,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cuda_runtime.h>
+#include <cudaTypedefs.h>
 #include <mma.h>
 
 using namespace nvcuda; 
@@ -9,17 +10,82 @@ using namespace nvcuda;
 #define BLOCK_SIZE 64
 #define NUM_BUFFERS 2
 
-template <int NUM_BYTES>
-__device__ void cp_async(void* dst, const void* src) {
-    static_assert(NUM_BYTES == 4 || NUM_BYTES == 8 || NUM_BYTES == 16);
-    asm volatile(
-        "cp.async.cg.shared.global [%0], [%1], %2;\n"
-        : // no outputs
-        : // inputs:
-          "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst))),    // dst smem ptr, must be 32bit addr in shared memory addr
-          "l"(src),                                                     // src gmem ptr, regular 64bit ptr
-          "n"(NUM_BYTES)
+// Overloaded error checking for both CUDA driver API (CUresult) and runtime API (cudaError_t)
+inline void cuda_check_impl(CUresult result, const char* file, int line) {
+    if (result != CUDA_SUCCESS) {
+        fprintf(stderr, "CUDA Driver Error at %s:%d - Error code: %d\n", file, line, (int)result);
+        exit(EXIT_FAILURE);
+    }
+}
+
+inline void cuda_check_impl(cudaError_t result, const char* file, int line) {
+    if (result != cudaSuccess) {
+        fprintf(stderr, "CUDA Runtime Error at %s:%d - %s\n", file, line,
+                cudaGetErrorString(result));
+        exit(EXIT_FAILURE);
+    }
+}
+
+#define CUDA_CHECK(result) cuda_check_impl((result), __FILE__, __LINE__)
+
+// Reference: https://docs.nvidia.com/cuda/cuda-c-programming-guide/#using-tma-to-transfer-multi-dimensional-arrays
+void create_tensor_map(
+    void* tensor_ptr,
+    CUtensorMap& tensor_map,
+    const uint64_t gmem_width,
+    const uint64_t gmem_height,
+    const uint32_t smem_width,
+    const uint32_t smem_height
+) {
+    constexpr uint32_t rank = 2;
+    uint64_t size[rank] = {gmem_width, gmem_height};
+    uint64_t stride[rank - 1] = {gmem_width}; // Row major, 1 byte per e8m0
+    uint32_t box_size[rank] = {smem_width, smem_height};
+    uint32_t elem_stride[rank] = {1, 1};
+
+    void *driver_ptr = get_driver_ptr();
+    auto cuTensorMapEncodeTiled = reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(driver_ptr);
+
+    CUresult res = cuTensorMapEncodeTiled(
+        &tensor_map,
+        CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
+        rank,
+        tensor_ptr,
+        size,
+        stride,
+        box_size,
+        elem_stride,
+        CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
+        CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
     );
+    CUDA_CHECK(res);
+}
+
+
+__device__ __forceinline__ void cp_async_bulk_tensor_2d_global_to_shared(
+    const uint64_t *tensor_map_ptr,
+    uint64_t *dst_shmem,
+    const uint32_t offset_x, 
+    const uint32_t offset_y, 
+    uint64_t *mbar
+) {
+  uint32_t dst_shmem_ptr = __cvta_generic_to_shared(dst_shmem);
+  uint32_t mbar_ptr = __cvta_generic_to_shared(mbar);
+
+  asm volatile(
+      "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
+      ".mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];" 
+      : // no outputs
+      : // inputs:
+      "r"(dst_shmem_ptr),
+      "l"(tensor_map_ptr), 
+      "r"(offset_x), 
+      "r"(offset_y), 
+      "r"(mbar_ptr)
+      : "memory"
+  );
 }
 
 template <int BM, int BN, int BK>
@@ -28,6 +94,9 @@ __device__ void async_load_gmem_to_smem(
     __nv_bfloat16* B,  // gmem
     __nv_bfloat16* sA, // smem
     __nv_bfloat16* sB, // smem
+    const __grid_constant__ CUtensorMap a_map,
+    const __grid_constant__ CUtensorMap b_map,
+    uint64_t* mbar,
     const int k_tile_idx,
     const int block_row,
     const int block_col,
@@ -52,8 +121,13 @@ __device__ void async_load_gmem_to_smem(
         const int a_global_row = (block_row * BM) + a_thread_row;
         const int a_global_col = (k_tile_idx * BK) + a_thread_col;
         void* dst_ptr = (void*)&sA[a_thread_row * BK + a_thread_col];
-        const void* src_ptr = (const void*)&A[a_global_row * K + a_global_col];
-        cp_async<BYTES_PER_LOAD>(dst_ptr, src_ptr);
+        cp_async_bulk_tensor_2d_global_to_shared(
+            a_map,
+            dst_ptr, 
+            a_global_col,
+            a_global_row,
+            mbar,
+        );
     }
 
     // load tile of B from GMEM into SMEM
@@ -65,12 +139,17 @@ __device__ void async_load_gmem_to_smem(
         const int b_global_row = (k_tile_idx * BK) + b_thread_row; 
         const int b_global_col = (block_col * BN) + b_thread_col;
         void* dst_ptr = (void*)&sB[b_thread_row * BN + b_thread_col];
-        const void* src_ptr = (const void*)&B[b_global_row * N + b_global_col];
-        cp_async<BYTES_PER_LOAD>(dst_ptr, src_ptr);
+        cp_async_bulk_tensor_2d_global_to_shared(
+            b_map,
+            dst_ptr, 
+            b_global_col,
+            b_global_row,
+            mbar,
+        ); 
     }
 
     // commit group of async loads
-    asm volatile("cp.async.commit_group;\n" ::);
+    asm volatile("cp.async.bulk.commit_group;\n" ::);
 }
 
 template<
@@ -84,7 +163,16 @@ template<
     int WARP_TILES_M = 2,
     int WARP_TILES_N = 2
 >
-__global__ void gemm(__nv_bfloat16* A, __nv_bfloat16* B, float* C, int M, int N, int K) {
+__global__ void gemm(
+    __nv_bfloat16* A, 
+    __nv_bfloat16* B, 
+    float* C, 
+    __grid_constant__ a_map,
+    __grid_constant__ b_map,
+    int M, 
+    int N, 
+    int K,
+) {
     alignas(16) __shared__ __nv_bfloat16 sA[NUM_BUFFERS][BM * BK]; // 64*16
     alignas(16) __shared__ __nv_bfloat16 sB[NUM_BUFFERS][BK * BN]; // 16*64
     const int block_row = blockIdx.y;
@@ -187,7 +275,33 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     constexpr int num_warps = (BLOCK_SIZE * BLOCK_SIZE) / (WARP_TILES_M * WMMA_M * WARP_TILES_N * WMMA_N); // (64*64) / (2*16*2*16) = 4 warps
     constexpr int threadblock_size = num_warps * 32; // 4*32 = 128 threads
 
+    // create tensor maps
+    alignas(64) CUtensorMap a_map = {};
+    alignas(64) CUtensorMap b_map = {};
+
+    create_tensor_map(
+        A,
+        a_map,
+        K,
+        M,
+        BK,
+        BM 
+    );
+
+    create_tensor_map(
+        B,
+        b_map,
+        N,
+        K,
+        BN,
+        BK
+    );
+
     dim3 block_dim(threadblock_size);
     dim3 grid_dim(ceil_div(N, BN), ceil_div(M, BM));
-    gemm<BM, BN, BK, WMMA_M, WMMA_N, WMMA_K, WARP_TILES_M, WARP_TILES_N><<<grid_dim, block_dim>>>(a_ptr, b_ptr, c_ptr, M, N, K);
+    gemm<
+        BM, BN, BK, 
+        WMMA_M, WMMA_N, WMMA_K, 
+        WARP_TILES_M, WARP_TILES_N
+    ><<<grid_dim, block_dim>>>(a_ptr, b_ptr, c_ptr, M, N, K);
 }
