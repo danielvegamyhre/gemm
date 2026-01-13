@@ -50,7 +50,7 @@ void create_tensor_map(
 ) {
     constexpr uint32_t rank = 2;
     uint64_t size[rank] = {gmem_width, gmem_height};
-    uint64_t stride[rank - 1] = {gmem_width}; // Row major, 1 byte per e8m0
+    uint64_t stride[rank - 1] = {gmem_width * 2}; // Row major, 2 byte per bf16
     uint32_t box_size[rank] = {smem_width, smem_height};
     uint32_t elem_stride[rank] = {1, 1};
 
@@ -59,7 +59,7 @@ void create_tensor_map(
 
     CUresult res = cuTensorMapEncodeTiled(
         &tensor_map,
-        CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
+        CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
         rank,
         tensor_ptr,
         size,
@@ -246,8 +246,8 @@ __global__ void gemm(
     int a_global_col = 0;
     int b_global_row = 0;
     int b_global_col = block_col * BN;
-    constexpr int num_bytes_a = BM * BK;
-    constexpr int num_bytes_b = BK * BN;
+    constexpr int num_bytes_a = BM * BK * 2; // 2 bytes per bf16
+    constexpr int num_bytes_b = BK * BN * 2;
 
     copy_2d_to_shared(
         reinterpret_cast<void*>(&sA[write_buf_idx][0]), 
