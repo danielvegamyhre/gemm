@@ -86,26 +86,22 @@ __global__ void gemm(__nv_bfloat16* A, __nv_bfloat16* B, float* C, int M, int N,
     }
 
     // prologue - preload first buffer
+    int read_buf_idx = 0;
     int write_buf_idx = 0;
     load_gmem_to_smem<BM, BN, BK>(A, B, &sA[write_buf_idx][0], &sB[write_buf_idx][0], 0, block_row, block_col, num_threads, M, N, K);
-    write_buf_idx ^= 1; // toggle next buffer idx
+    write_buf_idx ^= 1; // toggle next buffer to write to
 
     __syncthreads();
 
     const int num_k_tiles = (K + BK - 1) / BK;
     #pragma unroll
     for (int tile_idx = 0; tile_idx < num_k_tiles; tile_idx++) {
-        //         p   0   1   2
-        // write   0:1 1:0 0:1 1:0
-        // read        0   1
-        const int read_buf_idx = write_buf_idx^1;
-
         // prefetch next a/b tiles into next buffer.
         // note this is not async in this kernel version, so benefits are limited (one fewer syncthreads())
         if (tile_idx + 1 < num_k_tiles)
         {
             load_gmem_to_smem<BM, BN, BK>(A, B, &sA[write_buf_idx][0], &sB[write_buf_idx][0], tile_idx + 1, block_row, block_col, num_threads, M, N, K);
-            write_buf_idx ^= 1; // toggle next buffer idx
+            write_buf_idx ^= 1;
         }
 
         // wmma on each warp tile this warp is responsible for
@@ -129,6 +125,7 @@ __global__ void gemm(__nv_bfloat16* A, __nv_bfloat16* B, float* C, int M, int N,
                 }
             }
         }
+        read_buf_idx ^= 1; // toggle next buffer to read from
         __syncthreads();
     }
 
