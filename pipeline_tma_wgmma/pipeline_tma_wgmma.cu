@@ -7,7 +7,7 @@
 
 using namespace nvcuda; 
 
-#define BLOCK_SIZE 64
+#define BLOCK_SIZE 128
 #define NUM_BUFFERS 2
 
 // Overloaded error checking for both CUDA driver API (CUresult) and runtime API (cudaError_t)
@@ -75,7 +75,7 @@ void create_tensor_map(
 }
 
 
-__device__ __forceinline__ void wgmma_m64n16k16(uint64_t* smem_desc_a, uint64_t* smem_desc_b, float* reg_c) {
+__device__ __forceinline__ void wgmma_m64n16k16(uint64_t smem_desc_a, uint64_t smem_desc_b, float reg_c[8]) {
     // 64x16 output = 1024 elements / 4 warps / 32 threads per warp = 8 outputs per thread
     // outputs are fp32 which is exactly 1 32bit reg
     asm volatile(
@@ -93,11 +93,11 @@ __device__ __forceinline__ void wgmma_m64n16k16(uint64_t* smem_desc_a, uint64_t*
 // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-matrix-shared-memory-layout-matrix-descriptor
 __device__ uint64_t matrix_desc_encode(uint64_t x) {
     // grabs 18 rightmost bits and shifts right by 4 to get bits 3-13 (14 bits)
-    return (x & 0x3FFFF) >> 4
+    return (x & 0x3FFFF) >> 4;
 }
 
 __device__ uint64_t make_smem_desc(void* smem_ptr, int smem_height) {
-    uint32_t shared_addr = static_cast<uint32_t>__cvta_generic_to_shared(smem_ptr);
+    uint32_t shared_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
 
     // bits 0-13: matrix_desc_encode(matrix addr)
     // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-matrix-shared-memory-layout-matrix-descriptor
@@ -117,6 +117,7 @@ __device__ uint64_t make_smem_desc(void* smem_ptr, int smem_height) {
 
     // bits 49-52: matrix base offset (no swizzle = 0)
     // bits 62-63: swizzle mode (no swizzle = 0)
+    return desc;
 }
 
 // init mbar for sync between tma and regular 
@@ -235,15 +236,13 @@ __forceinline__ __device__ void copy_2d_to_shared(
 }
 
 template<
-    int THREADBLOCK_SIZE,
+    int NUM_THREADS,
     int BM = 128,
     int BN = 128,
     int BK = 16,
     int WGMMA_M = 64,
     int WGMMA_N = 16,
-    int WGMMA_K = 16,
-    int WARP_TILES_M = 2,
-    int WARP_TILES_N = 2,
+    int WGMMA_K = 16
 >
 __global__ void gemm(
     const __grid_constant__ CUtensorMap a_map,
@@ -269,8 +268,8 @@ __global__ void gemm(
     __shared__ __align__(128) uint64_t mbar_b[NUM_BUFFERS];
     int parity_a[NUM_BUFFERS] = {0};
     int parity_b[NUM_BUFFERS] = {0};
-    initialize_barriers<NUM_BUFFERS, THREADBLOCK_SIZE>(mbar_a, is_master_thread);
-    initialize_barriers<NUM_BUFFERS, THREADBLOCK_SIZE>(mbar_b, is_master_thread);
+    initialize_barriers<NUM_BUFFERS, NUM_THREADS>(mbar_a, is_master_thread);
+    initialize_barriers<NUM_BUFFERS, NUM_THREADS>(mbar_b, is_master_thread);
 
     // prologue: prefetch first A/B tiles into first SMEM bufffer
     int write_buf_idx = 0;
@@ -282,6 +281,7 @@ __global__ void gemm(
     constexpr int num_bytes_a = BM * BK * 2; // 2 bytes per bf16
     constexpr int num_bytes_b = BK * BN * 2;
 
+    // TODO: load data to layout required for wgmma
     copy_2d_to_shared(
         reinterpret_cast<void*>(&sA[write_buf_idx][0]), 
         reinterpret_cast<const void*>(&a_map),
@@ -304,8 +304,12 @@ __global__ void gemm(
     // toggle buf to write to
     write_buf_idx ^= 1;
 
-    // one 8 register accum buffer for each warpgroup
+    // one 8 register accum buffer for each warpgroup.
+    // (64,16) @ (16,16) = (64,16) -> 1024 size output per warpgroup
+    // 1024 / 4 warps / 32 threads per warp = 8 elements per thread 
     float accum[BM/WGMMA_M][BN/WGMMA_N][8];
+    static_assert(sizeof(accum) * NUM_THREADS == BM * BN * sizeof(float));
+
     const int num_k_tiles = (K + BK - 1) / BK;
     #pragma unroll
     for (int k_tile_idx = 0; k_tile_idx < num_k_tiles; k_tile_idx++) {
@@ -347,20 +351,20 @@ __global__ void gemm(
         asm volatile("wgmma.fence.sync.aligned; " ::: "memory");
 
         // async wgmma for every subtile in the smem
-        for (int wg_tile_m = 0; wg_tile_m < BM; wg_tile_m += WGMMA_M) {
-            for (int wg_tile_n = 0; wg_tile_n < BN; wg_tile_n += WGMMA_N) {
-                for (int k = 0; k < BK; k += WGMMA_K) {
-                    const int smem_a_row = (wg_row * WGMMA_M) + (wg_tile_m * WGMMA_M);
-                    const int smem_a_col = k;
+        for (int m_tile_idx = 0; m_tile_idx < BM/WGMMA_M; m_tile_idx++) {
+            for (int n_tile_idx = 0; n_tile_idx < BN/WGMMA_N; n_tile_idx++) {
+                for (int k_tile_idx = 0; k_tile_idx < BK; k_tile_idx += WGMMA_K) {
+                    const int smem_a_row = (wg_row * WGMMA_M) + (m_tile_idx * WGMMA_M);
+                    const int smem_a_col = k_tile_idx;
                     __nv_bfloat16* smem_tile_a = &sA[read_buf_idx][smem_a_row * BK + smem_a_col];
-                    uint64_t* smem_a_desc = make_smem_desc((void*)smem_tile_a, BM);
+                    uint64_t smem_a_desc = make_smem_desc((void*)smem_tile_a, BM);
 
-                    const int smem_b_row = k;
-                    const int smem_b_col = (wg_col * WARP_TILES_N * WGMMA_N) + (wg_tile_n * WGMMA_N);
+                    const int smem_b_row = k_tile_idx;
+                    const int smem_b_col = (wg_col * WGMMA_N) + (n_tile_idx * WGMMA_N);
                     __nv_bfloat16* smem_tile_b = &sB[read_buf_idx][smem_b_row * BN + smem_b_col];
-                    uint64_t* smem_b_desc = make_smem_desc((void*)smem_tile_b, BK);
+                    uint64_t smem_b_desc = make_smem_desc((void*)smem_tile_b, BK);
 
-                    wgmma_m64n16k16(smem_a_desc, smem_b_desc, accum[wg_tile_m][wg_tile_n]);
+                    wgmma_m64n16k16(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
                 }
             }
         }
@@ -376,34 +380,51 @@ __global__ void gemm(
         __syncthreads();
     }
 
-    // store output
-    int c_row = (block_row * BM) + (wg_row * WGMMA_M) + (wg_tile_m * WGMMA_M);
-    int c_col = (block_col * BN) + (wg_col * WGMMA_N) + (wg_tile_n * WGMMA_N);
-    float* c_ptr = &C[c_row * N + c_col];
-    int out_bytes = BM * BN;
-    if (is_master_thread) {
-    //     cp_async_bulk_tensor_1d_shared_to_global(
-    //         c_ptr,
-    //         reinterpret_cast<const uint64_t*>(&),
-            
-    //     );
-    // }
+    // accum register layout is confusing: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-register-fragment-wgmma-64n16
+    // each warp in the warpgroup computes WGMMA_M/4 rows.
+    // each consecutive 4 lanes share the same row.
+    // threads in groups of 4, each holding 2 registers of contiguous output memory
+    constexpr int rows_per_warp = WGMMA_M / 4;
+    const int wg_tid = threadIdx.x % 128; 
+    const int warp_idx_in_wg = wg_tid / 32;
+    const int thread_row_c = warp_idx_in_wg * rows_per_warp + wg_tid / 4;
+    const int thread_col_c = 2 * (wg_tid % 4);
+     
+    // 2 rows: row, row+8
+    // 4 cols: col, col+1, col+8, col+9
+    int c_base_row = block_row * BM;
+    int c_base_col = block_col * BN;
+
+    // TODO: make more efficient
+    for (int m_tile_idx = 0; m_tile_idx < BM/WGMMA_M; m_tile_idx++) {
+        for (int n_tile_idx = 0; n_tile_idx < BN/WGMMA_N; n_tile_idx++) {
+            int row = c_base_row + thread_row_c;
+            int col = c_base_col + thread_col_c;
+            C[row * N + col + 0] = accum[m_tile_idx][n_tile_idx][0];
+            C[row * N + col + 1] = accum[m_tile_idx][n_tile_idx][1];
+            C[(row+8) * N + col + 0] = accum[m_tile_idx][n_tile_idx][2];
+            C[(row+8) * N + col + 1] = accum[m_tile_idx][n_tile_idx][3]; 
+            C[row * N + col + 8] = accum[m_tile_idx][n_tile_idx][4];
+            C[row * N + col + 9] = accum[m_tile_idx][n_tile_idx][5]; 
+            C[(row+8) * N + col + 8] = accum[m_tile_idx][n_tile_idx][6];
+            C[(row+8) * N + col + 9] = accum[m_tile_idx][n_tile_idx][7]; 
+        }
+    }
 }
 
 extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
-    constexpr int WGMMA_M = 16;
+    constexpr int WGMMA_M = 64;
     constexpr int WGMMA_N = 16;
     constexpr int WGMMA_K = 16;
     auto ceil_div = [](int x, int y) {
         return (x + y - 1) / y;
     };
     // dims for smem tiles
-    constexpr int BM = BLOCK_SIZE; // 64
-    constexpr int BN = BLOCK_SIZE; // 64
+    constexpr int BM = BLOCK_SIZE; // 128
+    constexpr int BN = BLOCK_SIZE; // 128
     constexpr int BK = 16;
 
-    constexpr int num_warps = (BLOCK_SIZE * BLOCK_SIZE) / (WARP_TILES_M * WGMMA_M * WARP_TILES_N * WGMMA_N); // (64*64) / (2*16*2*16) = 4 warps
-    constexpr int THREADBLOCK_SIZE = num_warps * 32; // 4*32 = 128 threads
+    constexpr int NUM_THREADS = 128;
 
     // create tensor maps
     alignas(64) CUtensorMap a_map = {};
@@ -426,12 +447,11 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     );
     float* c_ptr = reinterpret_cast<float*>(C);
 
-    dim3 block_dim(THREADBLOCK_SIZE);
+    dim3 block_dim(NUM_THREADS);
     dim3 grid_dim(ceil_div(N, BN), ceil_div(M, BM));
     gemm<
-        THREADBLOCK_SIZE,
+        NUM_THREADS,
         BM, BN, BK, 
-        WGMMA_M, WGMMA_N, WGMMA_K, 
-        WARP_TILES_M, WARP_TILES_N
+        WGMMA_M, WGMMA_N, WGMMA_K
     ><<<grid_dim, block_dim>>>(a_map, b_map, c_ptr, M, N, K);
 }
