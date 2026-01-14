@@ -3,8 +3,8 @@ import torch
 from torch.utils.cpp_extension import load
 
 custom_gemm = load(
-    name='pipeline_tma_mma',
-    sources=['pipeline_tma_mma.cpp', 'pipeline_tma_mma.cu'],
+    name='pipeline_tma_wgmma',
+    sources=['pipeline_tma_wgmma.cpp', 'pipeline_tma_wgmma.cu'],
     extra_cuda_cflags=['-O3', '--use_fast_math'],
     extra_cflags=['-O3'],
     verbose=False
