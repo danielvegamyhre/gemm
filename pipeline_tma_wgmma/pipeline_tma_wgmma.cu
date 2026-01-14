@@ -74,7 +74,7 @@ void create_tensor_map(
     CUDA_CHECK(res);
 }
 
-
+template<int SCALE_D, int SCALE_A, int SCALE_B, int TRANS_A, int TRANS_B>
 __device__ __forceinline__ void wgmma_m64n16k16(uint64_t smem_desc_a, uint64_t smem_desc_b, float reg_c[8]) {
     // 64x16 output = 1024 elements / 4 warps / 32 threads per warp = 8 outputs per thread
     // outputs are fp32 which is exactly 1 32bit reg
@@ -82,11 +82,14 @@ __device__ __forceinline__ void wgmma_m64n16k16(uint64_t smem_desc_a, uint64_t s
         "{\n"
         "wgmma.mma_async.sync.aligned.m64n16k16.f32.bf16.bf16 "
         "{%0, %1, %2, %3, %4, %5, %6, %7}, " // 8 register vector for accum
-        "%8, %9, 1, 1, 0, 0;\n"
+        "%8, %9, "
+        "%10, %11, %12, %13, %14;\n"
         "}\n"
         : "+f"(reg_c[0]), "+f"(reg_c[1]), "+f"(reg_c[2]), "+f"(reg_c[3]), 
           "+f"(reg_c[4]), "+f"(reg_c[5]), "+f"(reg_c[6]), "+f"(reg_c[7]) 
-        : "l"(smem_desc_a), "l"(smem_desc_b)
+        : "l"(smem_desc_a), "l"(smem_desc_b), 
+          "n"((int32_t)SCALE_D), "n"((int32_t)SCALE_A), "n"((int32_t)SCALE_B), 
+          "n"((int32_t)TRANS_A), "n"((int32_t)TRANS_B)
     );
 }
 
@@ -364,7 +367,7 @@ __global__ void gemm(
                     __nv_bfloat16* smem_tile_b = &sB[read_buf_idx][smem_b_row * BN + smem_b_col];
                     uint64_t smem_b_desc = make_smem_desc((void*)smem_tile_b, BK);
 
-                    wgmma_m64n16k16(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
+                    wgmma_m64n16k16<1,1,1,0,0>(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
                 }
             }
         }

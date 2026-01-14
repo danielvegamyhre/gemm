@@ -5,7 +5,7 @@ from torch.utils.cpp_extension import load
 custom_gemm = load(
     name='pipeline_tma_wgmma',
     sources=['pipeline_tma_wgmma.cpp', 'pipeline_tma_wgmma.cu'],
-    extra_cuda_cflags=['-O3', '--use_fast_math'],
+    extra_cuda_cflags=['-O3', '--use_fast_math', '-gencode=arch=compute_90a,code=sm_90a', '--keep'],
     extra_cflags=['-O3'],
     verbose=False
 )
@@ -27,5 +27,10 @@ def test_gemm(M, K, N):
 
     expected = torch.zeros(M, N, device="cuda", dtype=torch.float32)
     torch.mm(A, B, out_dtype=torch.float32, out=expected)
+
+    print()
+    print(result)
+    print()
+    print(expected)
     torch.testing.assert_close(result, expected)
 

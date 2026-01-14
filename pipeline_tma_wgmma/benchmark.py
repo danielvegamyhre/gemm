@@ -5,7 +5,7 @@ from triton.testing import do_bench
 custom_gemm = load(
     name='pipeline_tma_mma',
     sources=['pipeline_tma_mma.cpp', 'pipeline_tma_mma.cu'],
-    extra_cuda_cflags=['-O3', '--use_fast_math'],
+    extra_cuda_cflags=['-O3', '--use_fast_math', '-gencode=arch=compute_90a,code=sm_90a'],
     extra_cflags=['-O3'],
     verbose=False
 )
