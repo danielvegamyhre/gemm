@@ -261,9 +261,11 @@ __global__ void gemm(
     const int block_col = blockIdx.x;
     const int warp_id = threadIdx.x / 32;
     const int wg_id = warp_id / 4;
-    constexpr int wg_per_row = BN / WGMMA_N;
-    const int wg_row = wg_id / wg_per_row;
-    const int wg_col = wg_id % wg_per_row;
+    const int num_wg = NUM_THREADS / 128;
+    constexpr int rows_per_wg = BM / num_wg;
+    constexpr int cols_per_wg = BN / num_wg;
+    const int wg_row = wg_id / wg_along_N;
+    const int wg_col = wg_id % wg_along_N;
     const int is_master_thread = threadIdx.x == 0;
 
     // init mbarriers (one per buffer, per A/B)
@@ -309,8 +311,10 @@ __global__ void gemm(
 
     // one 8 register accum buffer for each warpgroup.
     // (64,16) @ (16,16) = (64,16) -> 1024 size output per warpgroup
-    // 1024 / 4 warps / 32 threads per warp = 8 elements per thread 
-    float accum[BM/WGMMA_M][BN/WGMMA_N][8];
+    // 1024 / 4 warps / 32 threads per warp = 8 elements per thread.
+    // These 8 elements are distributed across 16 columns of the output D:
+    // see: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-register-fragment-wgmma-64n16
+    float accum[wg_along_M/WGMMA_M][WGMMA_N/16][8];
     static_assert(sizeof(accum) * NUM_THREADS == BM * BN * sizeof(float));
 
     const int num_k_tiles = (K + BK - 1) / BK;
@@ -355,14 +359,14 @@ __global__ void gemm(
 
         // async wgmma for every subtile in the smem
         for (int m_tile_idx = 0; m_tile_idx < BM/WGMMA_M; m_tile_idx++) {
-            for (int n_tile_idx = 0; n_tile_idx < BN/WGMMA_N; n_tile_idx++) {
-                for (int k_tile_idx = 0; k_tile_idx < BK; k_tile_idx += WGMMA_K) {
+            for (int n_tile_idx = 0; n_tile_idx < WGMMA_N/16; n_tile_idx++) {
+                for (int k_tile_idx = 0; k_tile_idx < BK; k_tile_idx++) {
                     const int smem_a_row = (wg_row * WGMMA_M) + (m_tile_idx * WGMMA_M);
-                    const int smem_a_col = k_tile_idx;
+                    const int smem_a_col = k_tile_idx * WGMMA_K;
                     __nv_bfloat16* smem_tile_a = &sA[read_buf_idx][smem_a_row * BK + smem_a_col];
                     uint64_t smem_a_desc = make_smem_desc((void*)smem_tile_a, BM);
 
-                    const int smem_b_row = k_tile_idx;
+                    const int smem_b_row = k_tile_idx * WGMMA_K;
                     const int smem_b_col = (wg_col * WGMMA_N) + (n_tile_idx * WGMMA_N);
                     __nv_bfloat16* smem_tile_b = &sB[read_buf_idx][smem_b_row * BN + smem_b_col];
                     uint64_t smem_b_desc = make_smem_desc((void*)smem_tile_b, BK);
@@ -393,14 +397,14 @@ __global__ void gemm(
     const int thread_row_c = warp_idx_in_wg * rows_per_warp + wg_tid / 4;
     const int thread_col_c = 2 * (wg_tid % 4);
      
-    // 2 rows: row, row+8
-    // 4 cols: col, col+1, col+8, col+9
     int c_base_row = block_row * BM;
     int c_base_col = block_col * BN;
 
-    // TODO: make more efficient
+    // accum register layout:
+    // 2 rows: row, row+8
+    // 4 cols: col, col+1, col+8, col+9
     for (int m_tile_idx = 0; m_tile_idx < BM/WGMMA_M; m_tile_idx++) {
-        for (int n_tile_idx = 0; n_tile_idx < BN/WGMMA_N; n_tile_idx++) {
+        for (int n_tile_idx = 0; n_tile_idx < WGMMA_N/16; n_tile_idx++) {
             int row = c_base_row + thread_row_c;
             int col = c_base_col + thread_col_c;
             C[row * N + col + 0] = accum[m_tile_idx][n_tile_idx][0];
