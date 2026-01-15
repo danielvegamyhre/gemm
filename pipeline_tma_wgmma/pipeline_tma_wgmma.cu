@@ -73,42 +73,6 @@ void create_2d_tensor_map(
     CUDA_CHECK(res);
 }
 
-// Reference: https://gau-nernst.github.io/tcgen05
-void create_3d_tensor_map(
-    void* tensor_ptr,
-    CUtensorMap& tensor_map,
-    const uint64_t global_height,
-    const uint64_t global_width,
-    const uint32_t smem_height,
-    const uint32_t smem_width
-) {
-    constexpr uint32_t rank = 3;
-    uint64_t size[rank] = {8, global_height, global_width/8};
-    uint64_t stride[rank - 1] = {global_width * sizeof(__nv_bfloat16), 16};
-    uint32_t box_size[rank] = {8, smem_height, smem_width/8};
-    uint32_t elem_stride[rank] = {1, 1, 1};
-
-    void *driver_ptr = get_driver_ptr();
-    auto cuTensorMapEncodeTiled = reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(driver_ptr);
-
-    CUresult res = cuTensorMapEncodeTiled(
-        &tensor_map,
-        CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-        rank,
-        tensor_ptr,
-        size,
-        stride,
-        box_size,
-        elem_stride,
-        CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
-        CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
-        CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
-    );
-    CUDA_CHECK(res);
-}
-
-
 template<int SCALE_D, int SCALE_A, int SCALE_B, int TRANS_A, int TRANS_B>
 __device__ __forceinline__ void wgmma_m64n16k16(uint64_t smem_desc_a, uint64_t smem_desc_b, float reg_c[8]) {
     // 64x16 output = 1024 elements / 4 warps / 32 threads per warp = 8 outputs per thread
@@ -150,7 +114,7 @@ __device__ uint64_t make_smem_desc(void* smem_ptr) {
 
     // bits 32-45: matrix_desc_encode(stride dim byte offset)
     // SBO (stride byte offset) is stride between rows of core matrices (along M/N) dim
-    uint64_t SBO = BK*16;
+    uint64_t SBO = 8*BK*2;
     desc |= (matrix_desc_encode(SBO) << 32);
 
     // bits 49-52: matrix base offset (no swizzle = 0)
@@ -316,7 +280,6 @@ __global__ void gemm(
     constexpr int num_bytes_a = BM * BK * 2; // 2 bytes per bf16
     constexpr int num_bytes_b = BK * BN * 2;
 
-    // TODO: load data to layout required for wgmma
     copy_2d_to_shared(
         reinterpret_cast<void*>(&sA[write_buf_idx][0]),
         reinterpret_cast<const void*>(&a_map),
@@ -329,7 +292,7 @@ __global__ void gemm(
     copy_2d_to_shared(
         reinterpret_cast<void*>(&sB[write_buf_idx][0]),
         reinterpret_cast<const void*>(&b_map),
-        b_global_row,
+        b_global_row, // swapped for col major
         b_global_col, // swapped for col major
         num_bytes_b,
         (uint64_t*)&mbar_b[write_buf_idx],
@@ -373,7 +336,7 @@ __global__ void gemm(
                 reinterpret_cast<void*>(&sB[write_buf_idx][0]),
                 reinterpret_cast<const void*>(&b_map),
                 b_global_row, // swapped for col major
-                b_global_col,
+                b_global_col, // swapped for col major
                 num_bytes_b,
                 (uint64_t*)&mbar_b[write_buf_idx],
                 is_master_thread
@@ -396,16 +359,17 @@ __global__ void gemm(
         const int wg_row = threadIdx.x / 128;
         const int k_iters = BK / WGMMA_K;
         for (int m_tile_idx = 0; m_tile_idx < m_iters; m_tile_idx++) {
-            for (int n_tile_idx = 0; n_tile_idx < n_iters; n_tile_idx++) {
-                for (int k_tile_idx = 0; k_tile_idx < k_iters; k_tile_idx++) {
-                    const int smem_a_row = (wg_row * ROWS_PER_WG) + (m_tile_idx * WGMMA_M);
-                    const int smem_a_col = k_tile_idx * WGMMA_K;
-                    __nv_bfloat16* smem_tile_a = &sA[read_buf_idx][smem_a_row * BK + smem_a_col];
-                    uint64_t smem_a_desc = make_smem_desc<BK>((void*)smem_tile_a);
+            const int smem_a_row = ((wg_row * ROWS_PER_WG + m_tile_idx) * WGMMA_M);
 
+            for (int k_tile_idx = 0; k_tile_idx < k_iters; k_tile_idx++) {
+                const int smem_a_col = k_tile_idx * WGMMA_K;
+                void* smem_tile_a = (void*)&sA[read_buf_idx][smem_a_row * BK + smem_a_col];
+                uint64_t smem_a_desc = make_smem_desc<BK>((void*)smem_tile_a);
+
+                for (int n_tile_idx = 0; n_tile_idx < n_iters; n_tile_idx++) {
                     const int smem_b_row = k_tile_idx * WGMMA_K;
                     const int smem_b_col = n_tile_idx * WGMMA_N;
-                    __nv_bfloat16* smem_tile_b = &sB[read_buf_idx][smem_b_row * BN + smem_b_col];
+                    void* smem_tile_b = (void*)&sB[read_buf_idx][smem_b_row + smem_b_col * BK];
                     uint64_t smem_b_desc = make_smem_desc<BK>((void*)smem_tile_b);
 
                     wgmma_m64n16k16<1,1,1,0,0>(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
@@ -470,7 +434,7 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
 
     // dims for smem tiles
     constexpr int BM = 128;
-    constexpr int BN = 128;
+    constexpr int BN = 16;
     constexpr int BK = 64;
 
     constexpr int NUM_THREADS = 128;
