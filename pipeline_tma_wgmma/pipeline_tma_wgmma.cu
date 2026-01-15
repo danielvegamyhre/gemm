@@ -5,7 +5,7 @@
 #include <cudaTypedefs.h>
 #include <mma.h>
 
-using namespace nvcuda; 
+using namespace nvcuda;
 
 #define BLOCK_SIZE 128
 #define NUM_BUFFERS 2
@@ -85,10 +85,10 @@ __device__ __forceinline__ void wgmma_m64n16k16(uint64_t smem_desc_a, uint64_t s
         "%8, %9, "
         "%10, %11, %12, %13, %14;\n"
         "}\n"
-        : "+f"(reg_c[0]), "+f"(reg_c[1]), "+f"(reg_c[2]), "+f"(reg_c[3]), 
-          "+f"(reg_c[4]), "+f"(reg_c[5]), "+f"(reg_c[6]), "+f"(reg_c[7]) 
-        : "l"(smem_desc_a), "l"(smem_desc_b), 
-          "n"((int32_t)SCALE_D), "n"((int32_t)SCALE_A), "n"((int32_t)SCALE_B), 
+        : "+f"(reg_c[0]), "+f"(reg_c[1]), "+f"(reg_c[2]), "+f"(reg_c[3]),
+          "+f"(reg_c[4]), "+f"(reg_c[5]), "+f"(reg_c[6]), "+f"(reg_c[7])
+        : "l"(smem_desc_a), "l"(smem_desc_b),
+          "n"((int32_t)SCALE_D), "n"((int32_t)SCALE_A), "n"((int32_t)SCALE_B),
           "n"((int32_t)TRANS_A), "n"((int32_t)TRANS_B)
     );
 }
@@ -109,7 +109,7 @@ __device__ uint64_t make_smem_desc(void* smem_ptr, int smem_height) {
     // bits 16-29: matrix_desc_encode(leading dim byte offset)
     // LBO (leading byte offset) is the stride between BMx1 (or BMx16byte) slices
     // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-leading-dimension-byte-offset
-    uint64_t LBO = smem_height * 16; 
+    uint64_t LBO = smem_height * 16;
     desc |= (matrix_desc_encode(LBO) << 16);
 
     // bits 32-45: matrix_desc_encode(stride dim byte offset)
@@ -123,11 +123,11 @@ __device__ uint64_t make_smem_desc(void* smem_ptr, int smem_height) {
     return desc;
 }
 
-// init mbar for sync between tma and regular 
+// init mbar for sync between tma and regular
 __device__ __forceinline__ void mbarrier_init(uint64_t *mbar, const uint32_t count) {
   uint32_t mbar_ptr = __cvta_generic_to_shared(mbar);
   asm volatile(
-    "mbarrier.init.shared.b64 [%0], %1;" 
+    "mbarrier.init.shared.b64 [%0], %1;"
     : // no outputs
     :"r"(mbar_ptr), "r"(count) // inputs
     : "memory"
@@ -170,7 +170,7 @@ __device__ __forceinline__ void mbarrier_wait_parity(uint64_t *mbar, const uint3
 __device__ __forceinline__ void mbarrier_arrive(uint64_t *mbar) {
   uint32_t mbar_ptr = __cvta_generic_to_shared(mbar);
   asm volatile(
-        "mbarrier.arrive.shared.b64 _, [%0];" 
+        "mbarrier.arrive.shared.b64 _, [%0];"
         :                // no outputs
         :"r"(mbar_ptr)   // input
         : "memory"
@@ -182,7 +182,7 @@ __device__ __forceinline__ void
 mbarrier_arrive_expect_tx(uint64_t *mbar, const uint32_t tx_count) {
   uint32_t mbar_ptr = __cvta_generic_to_shared(mbar);
   asm volatile(
-      "mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;" 
+      "mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;"
       :                             // no outputs
       :"r"(mbar_ptr), "r"(tx_count) // inputs
       : "memory");
@@ -193,8 +193,8 @@ mbarrier_arrive_expect_tx(uint64_t *mbar, const uint32_t tx_count) {
 __device__ __forceinline__ void cp_async_bulk_tensor_2d_global_to_shared(
     uint64_t *dst_shmem,
     const uint64_t *tensor_map_ptr,
-    const uint32_t offset_x, 
-    const uint32_t offset_y, 
+    const uint32_t offset_x,
+    const uint32_t offset_y,
     uint64_t *mbar
 ) {
   uint32_t dst_shmem_ptr = __cvta_generic_to_shared(dst_shmem);
@@ -202,13 +202,13 @@ __device__ __forceinline__ void cp_async_bulk_tensor_2d_global_to_shared(
 
   asm volatile(
       "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
-      ".mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];" 
+      ".mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
       : // no outputs
       : // inputs
       "r"(dst_shmem_ptr),
-      "l"(tensor_map_ptr), 
-      "r"(offset_x), 
-      "r"(offset_y), 
+      "l"(tensor_map_ptr),
+      "r"(offset_x),
+      "r"(offset_y),
       "r"(mbar_ptr)
       : "memory"
   );
@@ -216,20 +216,20 @@ __device__ __forceinline__ void cp_async_bulk_tensor_2d_global_to_shared(
 
 // wraper for cp_async_bulk_tensor_2d_global_to_shared
 __forceinline__ __device__ void copy_2d_to_shared(
-    void *dst, 
-    const void *src, 
+    void *dst,
+    const void *src,
     const size_t global_offset_X,
-    const size_t global_offset_Y, 
+    const size_t global_offset_Y,
     const size_t num_bytes,
-    uint64_t *mbar, 
+    uint64_t *mbar,
     const bool is_master_thread
 ) {
   if (is_master_thread) {
     cp_async_bulk_tensor_2d_global_to_shared(
         reinterpret_cast<uint64_t *>(dst),
-        reinterpret_cast<const uint64_t *>(src), 
-        global_offset_X, 
-        global_offset_Y, 
+        reinterpret_cast<const uint64_t *>(src),
+        global_offset_X,
+        global_offset_Y,
         mbar
     );
     mbarrier_arrive_expect_tx(mbar, num_bytes);
@@ -250,22 +250,15 @@ template<
 __global__ void gemm(
     const __grid_constant__ CUtensorMap a_map,
     const __grid_constant__ CUtensorMap b_map,
-    float* C, 
-    int M, 
-    int N, 
+    float* C,
+    int M,
+    int N,
     int K
 ) {
     __shared__ __align__(16) __nv_bfloat16 sA[NUM_BUFFERS][BM * BK]; // 64*16
     __shared__ __align__(16) __nv_bfloat16 sB[NUM_BUFFERS][BK * BN]; // 16*64
     const int block_row = blockIdx.y;
     const int block_col = blockIdx.x;
-    const int warp_id = threadIdx.x / 32;
-    const int wg_id = warp_id / 4;
-    const int num_wg = NUM_THREADS / 128;
-    constexpr int rows_per_wg = BM / num_wg;
-    constexpr int cols_per_wg = BN / num_wg;
-    const int wg_row = wg_id / wg_along_N;
-    const int wg_col = wg_id % wg_along_N;
     const int is_master_thread = threadIdx.x == 0;
 
     // init mbarriers (one per buffer, per A/B)
@@ -288,7 +281,7 @@ __global__ void gemm(
 
     // TODO: load data to layout required for wgmma
     copy_2d_to_shared(
-        reinterpret_cast<void*>(&sA[write_buf_idx][0]), 
+        reinterpret_cast<void*>(&sA[write_buf_idx][0]),
         reinterpret_cast<const void*>(&a_map),
         a_global_col,
         a_global_row,
@@ -314,27 +307,31 @@ __global__ void gemm(
     // 1024 / 4 warps / 32 threads per warp = 8 elements per thread.
     // These 8 elements are distributed across 16 columns of the output D:
     // see: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-register-fragment-wgmma-64n16
-    float accum[wg_along_M/WGMMA_M][WGMMA_N/16][8];
+    constexpr int NUM_WG = NUM_THREADS / 128;
+    constexpr int ROWS_PER_WG = BM / NUM_WG;
+    constexpr int m_iters = ROWS_PER_WG/WGMMA_M;    // each wg covers 64 rows of output *per wgmma iter along M*
+    constexpr int n_iters = BN/WGMMA_N;             // each wg covers 16 cols of output *per wgmma iter along N*
+    float accum[m_iters][n_iters][8] = {0};         // each thread in wg has 8 registers of accum output
     static_assert(sizeof(accum) * NUM_THREADS == BM * BN * sizeof(float));
 
-    const int num_k_tiles = (K + BK - 1) / BK;
+    const int num_bk_tiles = (K + BK - 1) / BK;
     #pragma unroll
-    for (int k_tile_idx = 0; k_tile_idx < num_k_tiles; k_tile_idx++) {
+    for (int bk_tile_idx = 0; bk_tile_idx < num_bk_tiles; bk_tile_idx++) {
         // prefetch next a/b tiles into next buffer.
         // note this is not async in this kernel version, so benefits are limited (one fewer syncthreads())
-        if (k_tile_idx + 1 < num_k_tiles)
+        if (bk_tile_idx + 1 < num_bk_tiles)
         {
-            a_global_col = (k_tile_idx + 1) * BK;
-            b_global_row = (k_tile_idx + 1) * BK;
+            a_global_col = (bk_tile_idx + 1) * BK;
+            b_global_row = (bk_tile_idx + 1) * BK;
             copy_2d_to_shared(
-                reinterpret_cast<void*>(&sA[write_buf_idx][0]), 
+                reinterpret_cast<void*>(&sA[write_buf_idx][0]),
                 reinterpret_cast<const void*>(&a_map),
                 a_global_col,
                 a_global_row,
                 num_bytes_a,
                 (uint64_t*)&mbar_a[write_buf_idx],
                 is_master_thread
-            ); 
+            );
             copy_2d_to_shared(
                 reinterpret_cast<void*>(&sB[write_buf_idx][0]),
                 reinterpret_cast<const void*>(&b_map),
@@ -353,25 +350,28 @@ __global__ void gemm(
         mbarrier_wait_parity(&mbar_b[read_buf_idx], parity_b[read_buf_idx]);
         asm volatile("fence.proxy.async.shared::cta;");
 
-        // wgmma executed in the async proxy, so use fence to enforce 
+        // wgmma executed in the async proxy, so use fence to enforce
         // ordering requirements of warpgroup accesses to registers before wgmma.mma_async
         asm volatile("wgmma.fence.sync.aligned; " ::: "memory");
 
-        // async wgmma for every subtile in the smem
-        for (int m_tile_idx = 0; m_tile_idx < BM/WGMMA_M; m_tile_idx++) {
-            for (int n_tile_idx = 0; n_tile_idx < WGMMA_N/16; n_tile_idx++) {
-                for (int k_tile_idx = 0; k_tile_idx < BK; k_tile_idx++) {
+        // async wgmma for every subtile in the smem.
+        // warpgroups are arranged vertically and iterate horizontally over BN
+        const int wg_row = threadIdx.x / 128;
+        const int k_iters = BK / WGMMA_K;
+        for (int m_tile_idx = 0; m_tile_idx < m_iters; m_tile_idx++) {
+            for (int n_tile_idx = 0; n_tile_idx < n_iters; n_tile_idx++) {
+                for (int k_tile_idx = 0; k_tile_idx < k_iters; k_tile_idx++) {
                     const int smem_a_row = (wg_row * WGMMA_M) + (m_tile_idx * WGMMA_M);
                     const int smem_a_col = k_tile_idx * WGMMA_K;
                     __nv_bfloat16* smem_tile_a = &sA[read_buf_idx][smem_a_row * BK + smem_a_col];
                     uint64_t smem_a_desc = make_smem_desc((void*)smem_tile_a, BM);
 
                     const int smem_b_row = k_tile_idx * WGMMA_K;
-                    const int smem_b_col = (wg_col * WGMMA_N) + (n_tile_idx * WGMMA_N);
+                    const int smem_b_col = n_tile_idx * WGMMA_N;
                     __nv_bfloat16* smem_tile_b = &sB[read_buf_idx][smem_b_row * BN + smem_b_col];
                     uint64_t smem_b_desc = make_smem_desc((void*)smem_tile_b, BK);
 
-                    wgmma_m64n16k16<1,1,1,0,0>(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
+                    wgmma_m64n16k16<1,1,1,0,1>(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
                 }
             }
         }
@@ -392,29 +392,31 @@ __global__ void gemm(
     // each consecutive 4 lanes share the same row.
     // threads in groups of 4, each holding 2 registers of contiguous output memory
     constexpr int rows_per_warp = WGMMA_M / 4;
-    const int wg_tid = threadIdx.x % 128; 
-    const int warp_idx_in_wg = wg_tid / 32;
-    const int thread_row_c = warp_idx_in_wg * rows_per_warp + wg_tid / 4;
-    const int thread_col_c = 2 * (wg_tid % 4);
-     
+    const int wg_row = threadIdx.x / 128;
+    const int warp_id = threadIdx.x / 32;
+    const int warp_idx_in_wg = warp_id % 4;
+    const int lane_id = threadIdx.x % 32;
+    const int thread_row_c = warp_idx_in_wg * rows_per_warp + lane_id / 4;
+    const int thread_col_c = 2 * (lane_id % 4); // 2 reg per thread, 4 threads per row before wrapping to next row
+
     int c_base_row = block_row * BM;
     int c_base_col = block_col * BN;
 
     // accum register layout:
     // 2 rows: row, row+8
     // 4 cols: col, col+1, col+8, col+9
-    for (int m_tile_idx = 0; m_tile_idx < BM/WGMMA_M; m_tile_idx++) {
-        for (int n_tile_idx = 0; n_tile_idx < WGMMA_N/16; n_tile_idx++) {
-            int row = c_base_row + thread_row_c;
-            int col = c_base_col + thread_col_c;
+    for (int m_tile_idx = 0; m_tile_idx < m_iters; m_tile_idx++) {
+        for (int n_tile_idx = 0; n_tile_idx < n_iters; n_tile_idx++) {
+            int row = c_base_row + (wg_row * ROWS_PER_WG) + (m_tile_idx * WGMMA_M) + thread_row_c;
+            int col = c_base_col + (n_tile_idx * WGMMA_N) + thread_col_c;
             C[row * N + col + 0] = accum[m_tile_idx][n_tile_idx][0];
             C[row * N + col + 1] = accum[m_tile_idx][n_tile_idx][1];
             C[(row+8) * N + col + 0] = accum[m_tile_idx][n_tile_idx][2];
-            C[(row+8) * N + col + 1] = accum[m_tile_idx][n_tile_idx][3]; 
+            C[(row+8) * N + col + 1] = accum[m_tile_idx][n_tile_idx][3];
             C[row * N + col + 8] = accum[m_tile_idx][n_tile_idx][4];
-            C[row * N + col + 9] = accum[m_tile_idx][n_tile_idx][5]; 
+            C[row * N + col + 9] = accum[m_tile_idx][n_tile_idx][5];
             C[(row+8) * N + col + 8] = accum[m_tile_idx][n_tile_idx][6];
-            C[(row+8) * N + col + 9] = accum[m_tile_idx][n_tile_idx][7]; 
+            C[(row+8) * N + col + 9] = accum[m_tile_idx][n_tile_idx][7];
         }
     }
 }
@@ -442,7 +444,7 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
         K,
         M,
         BK,
-        BM 
+        BM
     );
     create_tensor_map(
         B,
@@ -458,7 +460,7 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     dim3 grid_dim(ceil_div(N, BN), ceil_div(M, BM));
     gemm<
         NUM_THREADS,
-        BM, BN, BK, 
+        BM, BN, BK,
         WGMMA_M, WGMMA_N, WGMMA_K
     ><<<grid_dim, block_dim>>>(a_map, b_map, c_ptr, M, N, K);
 }
