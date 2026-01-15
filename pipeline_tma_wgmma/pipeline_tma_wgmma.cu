@@ -7,7 +7,6 @@
 
 using namespace nvcuda;
 
-#define BLOCK_SIZE 128
 #define NUM_BUFFERS 2
 
 // Overloaded error checking for both CUDA driver API (CUresult) and runtime API (cudaError_t)
@@ -45,13 +44,49 @@ void create_2d_tensor_map(
     const uint64_t global_height,
     const uint64_t global_width,
     const uint32_t smem_height,
-    const uint32_t smem_width
+    const uint32_t smem_width,
+    const uint32_t stride_bytes
 ) {
     constexpr uint32_t rank = 2;
     uint64_t size[rank] = {global_width, global_height};
-    uint64_t stride[rank - 1] = {global_width * sizeof(__nv_bfloat16)};
+    uint64_t stride[rank - 1] = {stride_bytes};
     uint32_t box_size[rank] = {smem_width, smem_height};
     uint32_t elem_stride[rank] = {1, 1};
+
+    void *driver_ptr = get_driver_ptr();
+    auto cuTensorMapEncodeTiled = reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(driver_ptr);
+
+    CUresult res = cuTensorMapEncodeTiled(
+        &tensor_map,
+        CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        rank,
+        tensor_ptr,
+        size,
+        stride,
+        box_size,
+        elem_stride,
+        CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+        CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    );
+    CUDA_CHECK(res);
+}
+
+// Reference: https://gau-nernst.github.io/tcgen05
+void create_3d_tensor_map(
+    void* tensor_ptr,
+    CUtensorMap& tensor_map,
+    const uint64_t global_height,
+    const uint64_t global_width,
+    const uint32_t smem_height,
+    const uint32_t smem_width
+) {
+    constexpr uint32_t rank = 3;
+    uint64_t size[rank] = {8, global_height, global_width/8};
+    uint64_t stride[rank - 1] = {global_width * sizeof(__nv_bfloat16), 16};
+    uint32_t box_size[rank] = {8, smem_height, smem_width/8};
+    uint32_t elem_stride[rank] = {1, 1, 1};
 
     void *driver_ptr = get_driver_ptr();
     auto cuTensorMapEncodeTiled = reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(driver_ptr);
@@ -99,7 +134,8 @@ __device__ uint64_t matrix_desc_encode(uint64_t x) {
     return (x & 0x3FFFF) >> 4;
 }
 
-__device__ uint64_t make_smem_desc(void* smem_ptr, int smem_height) {
+template <int BK>
+__device__ uint64_t make_smem_desc(void* smem_ptr) {
     uint32_t shared_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
 
     // bits 0-13: matrix_desc_encode(matrix addr)
@@ -107,21 +143,22 @@ __device__ uint64_t make_smem_desc(void* smem_ptr, int smem_height) {
     uint64_t desc = matrix_desc_encode(shared_addr);
 
     // bits 16-29: matrix_desc_encode(leading dim byte offset)
-    // LBO (leading byte offset) is the stride between BMx1 (or BMx16byte) slices
+    // LBO (leading byte offset) is the stride between core-matrices along the K dim
     // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-leading-dimension-byte-offset
-    uint64_t LBO = smem_height * 16;
+    uint64_t LBO = 16;
     desc |= (matrix_desc_encode(LBO) << 16);
 
     // bits 32-45: matrix_desc_encode(stride dim byte offset)
-    // SBO (stride byte offset) is stride between contiguous 8x1 (or 8x16B) tiles within a slice
-    // gaunerst has good blog that covers this, works the same way for tcgen05: https://gau-nernst.github.io/tcgen05/
-    uint64_t SBO = 8*16;
+    // SBO (stride byte offset) is stride between rows of core matrices (along M/N) dim
+    uint64_t SBO = BK*16;
     desc |= (matrix_desc_encode(SBO) << 32);
 
     // bits 49-52: matrix base offset (no swizzle = 0)
     // bits 62-63: swizzle mode (no swizzle = 0)
+    desc |= (1llu << 62);
     return desc;
 }
+
 
 // init mbar for sync between tma and regular
 __device__ __forceinline__ void mbarrier_init(uint64_t *mbar, const uint32_t count) {
@@ -279,38 +316,25 @@ __global__ void gemm(
     constexpr int num_bytes_a = BM * BK * 2; // 2 bytes per bf16
     constexpr int num_bytes_b = BK * BN * 2;
 
-    // prologue: prefetch first A/B tiles
-    if (is_master_thread)
-    {
-        // load A tile as BMx16b tiles of memory (BK/8 iterations)
-        #pragma unroll
-        for (int k = 0; k < BK/8; k++) {
-            cp_async_bulk_tensor_2d_global_to_shared(
-                reinterpret_cast<uint64_t*>(&sA[write_buf_idx][k * BM * 8]),
-                reinterpret_cast<const uint64_t*>(&a_map),
-                a_global_col + k * 8,
-                a_global_row,
-                (uint64_t*)&mbar_a[write_buf_idx]
-            );
-        }
-        #pragma unroll
-        for (int n = 0; n < BN/8; n++) {
-            cp_async_bulk_tensor_2d_global_to_shared(
-                reinterpret_cast<uint64_t*>(&sB[write_buf_idx][n * BK * 8]),
-                reinterpret_cast<const uint64_t*>(&b_map),
-                b_global_col + n * 8,
-                b_global_row,
-                (uint64_t*)&mbar_b[write_buf_idx]
-            );
-        }
-        mbarrier_arrive_expect_tx((uint64_t*)&mbar_a[write_buf_idx], num_bytes_a);
-        mbarrier_arrive_expect_tx((uint64_t*)&mbar_b[write_buf_idx], num_bytes_b);
-    }
-    else
-    {
-        mbarrier_arrive((uint64_t*)&mbar_a[write_buf_idx]);
-        mbarrier_arrive((uint64_t*)&mbar_b[write_buf_idx]);
-    }
+    // TODO: load data to layout required for wgmma
+    copy_2d_to_shared(
+        reinterpret_cast<void*>(&sA[write_buf_idx][0]),
+        reinterpret_cast<const void*>(&a_map),
+        a_global_col,
+        a_global_row,
+        num_bytes_a,
+        (uint64_t*)&mbar_a[write_buf_idx],
+        is_master_thread
+    );
+    copy_2d_to_shared(
+        reinterpret_cast<void*>(&sB[write_buf_idx][0]),
+        reinterpret_cast<const void*>(&b_map),
+        b_global_row,
+        b_global_col, // swapped for col major
+        num_bytes_b,
+        (uint64_t*)&mbar_b[write_buf_idx],
+        is_master_thread
+    );
 
     // toggle buf to write to
     write_buf_idx ^= 1;
@@ -336,37 +360,24 @@ __global__ void gemm(
         {
             a_global_col = (bk_tile_idx + 1) * BK;
             b_global_row = (bk_tile_idx + 1) * BK;
-            if (is_master_thread)
-            {
-                // load A tile as BMx16b tiles of memory (BK/8 iterations)
-                #pragma unroll
-                for (int k = 0; k < BK/8; k++) {
-                    cp_async_bulk_tensor_2d_global_to_shared(
-                        reinterpret_cast<uint64_t*>(&sA[write_buf_idx][k * BM * 8]),
-                        reinterpret_cast<const uint64_t*>(&a_map),
-                        a_global_col + k * 8,
-                        a_global_row,
-                        (uint64_t*)&mbar_a[write_buf_idx]
-                    );
-                }
-                #pragma unroll
-                for (int n = 0; n < BN/8; n++) {
-                    cp_async_bulk_tensor_2d_global_to_shared(
-                        reinterpret_cast<uint64_t*>(&sB[write_buf_idx][n * BK * 8]),
-                        reinterpret_cast<const uint64_t*>(&b_map),
-                        b_global_col + n * 8,
-                        b_global_row,
-                        (uint64_t*)&mbar_b[write_buf_idx]
-                    );
-                }
-                mbarrier_arrive_expect_tx((uint64_t*)&mbar_a[write_buf_idx], num_bytes_a);
-                mbarrier_arrive_expect_tx((uint64_t*)&mbar_b[write_buf_idx], num_bytes_b);
-            }
-            else
-            {
-                mbarrier_arrive((uint64_t*)&mbar_a[write_buf_idx]);
-                mbarrier_arrive((uint64_t*)&mbar_b[write_buf_idx]);
-            }
+            copy_2d_to_shared(
+                reinterpret_cast<void*>(&sA[write_buf_idx][0]),
+                reinterpret_cast<const void*>(&a_map),
+                a_global_col,
+                a_global_row,
+                num_bytes_a,
+                (uint64_t*)&mbar_a[write_buf_idx],
+                is_master_thread
+            );
+            copy_2d_to_shared(
+                reinterpret_cast<void*>(&sB[write_buf_idx][0]),
+                reinterpret_cast<const void*>(&b_map),
+                b_global_row, // swapped for col major
+                b_global_col,
+                num_bytes_b,
+                (uint64_t*)&mbar_b[write_buf_idx],
+                is_master_thread
+            );
             write_buf_idx ^= 1;
         }
 
@@ -387,18 +398,17 @@ __global__ void gemm(
         for (int m_tile_idx = 0; m_tile_idx < m_iters; m_tile_idx++) {
             for (int n_tile_idx = 0; n_tile_idx < n_iters; n_tile_idx++) {
                 for (int k_tile_idx = 0; k_tile_idx < k_iters; k_tile_idx++) {
-                    const int smem_a_row = (wg_row * WGMMA_M) + (m_tile_idx * WGMMA_M);
+                    const int smem_a_row = (wg_row * ROWS_PER_WG) + (m_tile_idx * WGMMA_M);
                     const int smem_a_col = k_tile_idx * WGMMA_K;
                     __nv_bfloat16* smem_tile_a = &sA[read_buf_idx][smem_a_row * BK + smem_a_col];
-                    uint64_t smem_a_desc = make_smem_desc((void*)smem_tile_a, BM);
+                    uint64_t smem_a_desc = make_smem_desc<BK>((void*)smem_tile_a);
 
                     const int smem_b_row = k_tile_idx * WGMMA_K;
                     const int smem_b_col = n_tile_idx * WGMMA_N;
                     __nv_bfloat16* smem_tile_b = &sB[read_buf_idx][smem_b_row * BN + smem_b_col];
-                    uint64_t smem_b_desc = make_smem_desc((void*)smem_tile_b, BK);
+                    uint64_t smem_b_desc = make_smem_desc<BK>((void*)smem_tile_b);
 
-                    const int TRANS_A = 0, TRANS_B = 1;
-                    wgmma_m64n16k16<1,1,1,TRANS_A,TRANS_B>(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
+                    wgmma_m64n16k16<1,1,1,0,0>(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
                 }
             }
         }
@@ -457,50 +467,33 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     auto ceil_div = [](int x, int y) {
         return (x + y - 1) / y;
     };
+
     // dims for smem tiles
-    constexpr int BM = BLOCK_SIZE; // 128
-    constexpr int BN = BLOCK_SIZE; // 128
+    constexpr int BM = 128;
+    constexpr int BN = 128;
     constexpr int BK = 64;
 
     constexpr int NUM_THREADS = 128;
 
-    // create tensor maps
-    // A shape: MxK
-    // B shape: KxN
-    // both inputs K-major (A row major, B col major)
-    const int A_stride_bytes = BK * sizeof(__nv_bfloat16);
-    const int B_stride_bytes = BK * sizeof(__nv_bfloat16);
     alignas(64) CUtensorMap a_map = {};
     alignas(64) CUtensorMap b_map = {};
-
-    /*
-    "The matrices wA and wB are divided into a number of
-    smaller matrices called core matrices. Each core matrix
-    has a strided direction and a contiguous direction,
-    such that its length is 8 in the strided direction
-    and 16 bytes in the contiguous direction."
-
-    see: https://research.colfax-intl.com/cutlass-tutorial-wgmma-hopper/
-    */
-
-    // load BMx8 chunks of A
     create_2d_tensor_map(
         A,
         a_map,
         M,
         K,
         BM,
-        8
+        BK,
+        K * sizeof(__nv_bfloat16) // row major stride
     );
-
-    // load BKx8 chunks of B
     create_2d_tensor_map(
         B,
         b_map,
-        K,
         N,
+        K,
+        BN,
         BK,
-        8
+        K * sizeof(__nv_bfloat16) // col major stride
     );
     float* c_ptr = reinterpret_cast<float*>(C);
 
