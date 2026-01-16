@@ -92,6 +92,40 @@ __device__ __forceinline__ void wgmma_m64n16k16(uint64_t smem_desc_a, uint64_t s
     );
 }
 
+template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
+__device__ void wgmma_m64n128k16(uint64_t smem_desc_a, uint64_t smem_desc_b, float d[8][8]) {
+    asm volatile(
+        "{\n"
+        "wgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 "
+        "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7,   "
+        " %8,   %9,   %10,  %11,  %12,  %13,  %14,  %15,  "
+        " %16,  %17,  %18,  %19,  %20,  %21,  %22,  %23,  "
+        " %24,  %25,  %26,  %27,  %28,  %29,  %30,  %31,  "
+        " %32,  %33,  %34,  %35,  %36,  %37,  %38,  %39,  "
+        " %40,  %41,  %42,  %43,  %44,  %45,  %46,  %47,  "
+        " %48,  %49,  %50,  %51,  %52,  %53,  %54,  %55,  "
+        " %56,  %57,  %58,  %59,  %60,  %61,  %62,  %63},"
+        " %64,"
+        " %65,"
+        " %66,    %67,  %68,  %69,  %70;\n"
+        "}\n"
+        : "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]), "+f"(d[0][4]), "+f"(d[0][5]),
+            "+f"(d[0][6]), "+f"(d[0][7]), "+f"(d[1][0]), "+f"(d[1][1]), "+f"(d[1][2]), "+f"(d[1][3]),
+            "+f"(d[1][4]), "+f"(d[1][5]), "+f"(d[1][6]), "+f"(d[1][7]), "+f"(d[2][0]), "+f"(d[2][1]),
+            "+f"(d[2][2]), "+f"(d[2][3]), "+f"(d[2][4]), "+f"(d[2][5]), "+f"(d[2][6]), "+f"(d[2][7]),
+            "+f"(d[3][0]), "+f"(d[3][1]), "+f"(d[3][2]), "+f"(d[3][3]), "+f"(d[3][4]), "+f"(d[3][5]),
+            "+f"(d[3][6]), "+f"(d[3][7]), "+f"(d[4][0]), "+f"(d[4][1]), "+f"(d[4][2]), "+f"(d[4][3]),
+            "+f"(d[4][4]), "+f"(d[4][5]), "+f"(d[4][6]), "+f"(d[4][7]), "+f"(d[5][0]), "+f"(d[5][1]),
+            "+f"(d[5][2]), "+f"(d[5][3]), "+f"(d[5][4]), "+f"(d[5][5]), "+f"(d[5][6]), "+f"(d[5][7]),
+            "+f"(d[6][0]), "+f"(d[6][1]), "+f"(d[6][2]), "+f"(d[6][3]), "+f"(d[6][4]), "+f"(d[6][5]),
+            "+f"(d[6][6]), "+f"(d[6][7]), "+f"(d[7][0]), "+f"(d[7][1]), "+f"(d[7][2]), "+f"(d[7][3]),
+            "+f"(d[7][4]), "+f"(d[7][5]), "+f"(d[7][6]), "+f"(d[7][7])
+        : "l"(smem_desc_a), "l"(smem_desc_b), "n"(int32_t(ScaleD)), "n"(int32_t(ScaleA)),
+            "n"(int32_t(ScaleB)), "n"(int32_t(TransA)), "n"(int32_t(TransB)));
+}
+
+
+
 // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-matrix-shared-memory-layout-matrix-descriptor
 __device__ uint64_t matrix_desc_encode(uint64_t x) {
     // grabs 18 rightmost bits and shifts right by 4 to get bits 3-13 (14 bits)
@@ -309,9 +343,13 @@ __global__ void gemm(
     // see: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-register-fragment-wgmma-64n16
     constexpr int NUM_WG = NUM_THREADS / 128;
     constexpr int ROWS_PER_WG = BM / NUM_WG;
-    constexpr int m_iters = ROWS_PER_WG/WGMMA_M;    // each wg covers 64 rows of output *per wgmma iter along M*
-    constexpr int n_iters = BN/WGMMA_N;             // each wg covers 16 cols of output *per wgmma iter along N*
-    float accum[m_iters][n_iters][8] = {0};         // each thread in wg has 8 registers of accum output
+    constexpr int m_iters = ROWS_PER_WG/WGMMA_M;    // each wg covers 64 rows of output *per wgmma iter along BM*
+    constexpr int n_iters = BN/WGMMA_N;             // each wg covers N cols of output *per wgmma iter along BN*
+
+    // each wgmma distributes 64xN outputs across the 128 threads in the warpgroup.
+    // every thread always holds 8 values, which are spread across 16 columns of
+    // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#wgmma-64n16-d
+    float accum[m_iters][n_iters][WGMMA_N/16][8] = {0};         // each thread in wg has 8 registers of accum output
     static_assert(sizeof(accum) * NUM_THREADS == BM * BN * sizeof(float));
 
     const int num_bk_tiles = (K + BK - 1) / BK;
@@ -371,8 +409,10 @@ __global__ void gemm(
                     const int smem_b_col = n_tile_idx * WGMMA_N;
                     void* smem_tile_b = (void*)&sB[read_buf_idx][smem_b_row + smem_b_col * BK];
                     uint64_t smem_b_desc = make_smem_desc<BK>((void*)smem_tile_b);
-
-                    wgmma_m64n16k16<1,1,1,0,0>(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
+                    if constexpr (WGMMA_N == 16)
+                        wgmma_m64n16k16<1,1,1,0,0>(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
+                    else if constexpr (WGMMA_N == 128)
+                        wgmma_m64n128k16<1,1,1,0,0>(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
                 }
             }
         }
@@ -406,27 +446,31 @@ __global__ void gemm(
     // accum register layout:
     // 2 rows: row, row+8
     // 4 cols: col, col+1, col+8, col+9
+    // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#wgmma-64n16-d
     #pragma unroll
     for (int m_tile_idx = 0; m_tile_idx < m_iters; m_tile_idx++) {
         #pragma unroll
         for (int n_tile_idx = 0; n_tile_idx < n_iters; n_tile_idx++) {
             int row = c_base_row + (wg_row * ROWS_PER_WG) + (m_tile_idx * WGMMA_M) + thread_row_c;
-            int col = c_base_col + (n_tile_idx * WGMMA_N) + thread_col_c;
-            C[row * N + col + 0] = accum[m_tile_idx][n_tile_idx][0];
-            C[row * N + col + 1] = accum[m_tile_idx][n_tile_idx][1];
-            C[(row+8) * N + col + 0] = accum[m_tile_idx][n_tile_idx][2];
-            C[(row+8) * N + col + 1] = accum[m_tile_idx][n_tile_idx][3];
-            C[row * N + col + 8] = accum[m_tile_idx][n_tile_idx][4];
-            C[row * N + col + 9] = accum[m_tile_idx][n_tile_idx][5];
-            C[(row+8) * N + col + 8] = accum[m_tile_idx][n_tile_idx][6];
-            C[(row+8) * N + col + 9] = accum[m_tile_idx][n_tile_idx][7];
+            #pragma unroll
+            for (int wn = 0; wn < WGMMA_N/16; wn++) {
+                int col = c_base_col + (n_tile_idx * WGMMA_N) + wn*16 + thread_col_c;
+                C[row * N + col + 0] = accum[m_tile_idx][n_tile_idx][wn][0];
+                C[row * N + col + 1] = accum[m_tile_idx][n_tile_idx][wn][1];
+                C[(row+8) * N + col + 0] = accum[m_tile_idx][n_tile_idx][wn][2];
+                C[(row+8) * N + col + 1] = accum[m_tile_idx][n_tile_idx][wn][3];
+                C[row * N + col + 8] = accum[m_tile_idx][n_tile_idx][wn][4];
+                C[row * N + col + 9] = accum[m_tile_idx][n_tile_idx][wn][5];
+                C[(row+8) * N + col + 8] = accum[m_tile_idx][n_tile_idx][wn][6];
+                C[(row+8) * N + col + 9] = accum[m_tile_idx][n_tile_idx][wn][7];
+            }
         }
     }
 }
 
 extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     constexpr int WGMMA_M = 64;
-    constexpr int WGMMA_N = 16;
+    constexpr int WGMMA_N = 128;
     constexpr int WGMMA_K = 16;
     auto ceil_div = [](int x, int y) {
         return (x + y - 1) / y;
@@ -434,9 +478,9 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
 
     // dims for smem tiles
     constexpr int BM = 128;
-    constexpr int BN = 16;
+    constexpr int BN = 128;
     constexpr int BK = 64;
-
+    assert(BN >= WGMMA_N && BN % WGMMA_N == 0);
     constexpr int NUM_THREADS = 128;
 
     alignas(64) CUtensorMap a_map = {};
