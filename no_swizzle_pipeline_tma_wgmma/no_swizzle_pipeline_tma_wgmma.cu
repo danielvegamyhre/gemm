@@ -123,7 +123,7 @@ __device__ void wgmma_m64n128k16(uint64_t smem_desc_a, uint64_t smem_desc_b, flo
 }
 
 template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
-__device__ void wgmma256(uint64_t smem_desc_a, uint64_t smem_desc_b, float d[16][8]) {
+__device__ void wgmma_n64n256k16(uint64_t smem_desc_a, uint64_t smem_desc_b, float d[16][8]) {
     asm volatile(
         "{\n"
         "wgmma.mma_async.sync.aligned.m64n256k16.f32.bf16.bf16 "
@@ -376,7 +376,7 @@ __global__ void gemm(
     int write_buf_idx = 0;
     int read_buf_idx = 0;
     int global_m_off = block_row * BM;
-    int global_n_off = block_row * BN; // treat B as (N,K) but blockIdx.y is what gives our block idx along N
+    int global_n_off = block_col * BN; // treat B as (N,K) but blockIdx.x is what gives our block idx along N
     int global_k_off = 0;
     constexpr int num_bytes_a = BM * BK * 2; // 2 bytes per bf16
     constexpr int num_bytes_b = BK * BN * 2;
@@ -386,9 +386,9 @@ __global__ void gemm(
     copy_3d_to_shared(
         reinterpret_cast<void*>(&sA[write_buf_idx][0]),
         reinterpret_cast<const void*>(&a_map),
-        global_k_off/8,         // z  (K/8 dim)
-        global_m_off,           // y  (M dim)
         0,                      // x  (8 dim)
+        global_m_off,           // y  (M dim)
+        global_k_off/8,         // z  (K/8 dim)
         num_bytes_a,
         (uint64_t*)&mbar_a[write_buf_idx],
         is_master_thread
@@ -396,9 +396,9 @@ __global__ void gemm(
     copy_3d_to_shared(
         reinterpret_cast<void*>(&sB[write_buf_idx][0]),
         reinterpret_cast<const void*>(&b_map),
-        global_k_off/8,         // z  (K/8 dim)
-        global_n_off,           // y  (N dim)
         0,                      // x  (8 dim)
+        global_n_off,           // y  (N dim)
+        global_k_off/8,         // z  (K/8 dim)
         num_bytes_b,
         (uint64_t*)&mbar_b[write_buf_idx],
         is_master_thread
@@ -433,20 +433,20 @@ __global__ void gemm(
             global_k_off = (bk_tile_idx + 1) * BK;
             copy_3d_to_shared(
                 reinterpret_cast<void*>(&sA[write_buf_idx][0]),
-                reinterpret_cast<const void*>(&b_map),
-                global_k_off/8,         // z  (K/8 dim)
-                global_m_off,           // y  (M dim)
+                reinterpret_cast<const void*>(&a_map),
                 0,                      // x  (8 dim)
-                num_bytes_b,
+                global_m_off,           // y  (M dim)
+                global_k_off/8,         // z  (K/8 dim)
+                num_bytes_a,
                 (uint64_t*)&mbar_a[write_buf_idx],
                 is_master_thread
             );
             copy_3d_to_shared(
                 reinterpret_cast<void*>(&sB[write_buf_idx][0]),
                 reinterpret_cast<const void*>(&b_map),
-                global_k_off/8,         // z  (K/8 dim)
-                global_n_off,           // y  (N dim)
                 0,                      // x  (8 dim)
+                global_n_off,           // y  (N dim)
+                global_k_off/8,         // z  (K/8 dim)
                 num_bytes_b,
                 (uint64_t*)&mbar_b[write_buf_idx],
                 is_master_thread
@@ -477,9 +477,9 @@ __global__ void gemm(
                 uint64_t smem_a_desc = make_smem_desc<BM>((void*)smem_tile_a);
 
                 for (int n_tile_idx = 0; n_tile_idx < n_iters; n_tile_idx++) {
-                    const int smem_b_row = k_tile_idx * WGMMA_K;
-                    const int smem_b_col = n_tile_idx * WGMMA_N;
-                    void* smem_tile_b = (void*)&sB[read_buf_idx][smem_b_row + smem_b_col * BK];
+                    const int smem_b_row = n_tile_idx * WGMMA_N;
+                    const int smem_b_col = k_tile_idx * WGMMA_K;
+                    void* smem_tile_b = (void*)&sB[read_buf_idx][smem_b_row * BK + smem_b_col];
                     uint64_t smem_b_desc = make_smem_desc<BN>((void*)smem_tile_b);
 
                     constexpr int TRANS_A = 0, TRANS_B = 1;
@@ -488,7 +488,7 @@ __global__ void gemm(
                     else if constexpr (WGMMA_N == 128)
                         wgmma_m64n128k16<1,1,1,TRANS_A,TRANS_B>(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
                     else if constexpr (WGMMA_N == 256)
-                        wgmma256<1,1,1,TRANS_A,TRANS_B>(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
+                        wgmma_n64n256k16<1,1,1,TRANS_A,TRANS_B>(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
                 }
             }
         }

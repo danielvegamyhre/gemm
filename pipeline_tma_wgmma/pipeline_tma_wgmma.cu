@@ -125,7 +125,7 @@ __device__ void wgmma_m64n128k16(uint64_t smem_desc_a, uint64_t smem_desc_b, flo
 }
 
 template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
-__device__ void wgmma256(uint64_t smem_desc_a, uint64_t smem_desc_b, float d[16][8]) {
+__device__ void wgmma_n64n256k16(uint64_t smem_desc_a, uint64_t smem_desc_b, float d[16][8]) {
     asm volatile(
         "{\n"
         "wgmma.mma_async.sync.aligned.m64n256k16.f32.bf16.bf16 "
@@ -457,7 +457,7 @@ __global__ void gemm(
                     else if constexpr (WGMMA_N == 128)
                         wgmma_m64n128k16<1,1,1,0,0>(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
                     else if constexpr (WGMMA_N == 256)
-                        wgmma256<1,1,1,0,0>(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
+                        wgmma_n64n256k16<1,1,1,0,0>(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
                 }
             }
         }
