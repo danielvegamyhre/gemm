@@ -64,7 +64,7 @@ void create_3d_tensor_map(
         box_size,
         elem_stride,
         CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
         CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
         CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
     );
@@ -482,7 +482,7 @@ __global__ void gemm(
                     void* smem_tile_b = (void*)&sB[read_buf_idx][smem_b_row * BK + smem_b_col];
                     uint64_t smem_b_desc = make_smem_desc<BN>((void*)smem_tile_b);
 
-                    constexpr int TRANS_A = 0, TRANS_B = 1;
+                    constexpr int TRANS_A = 0, TRANS_B = 0;
                     if constexpr (WGMMA_N == 16)
                         wgmma_m64n16k16<1,1,1,TRANS_A,TRANS_B>(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
                     else if constexpr (WGMMA_N == 128)

@@ -20,7 +20,7 @@ custom_gemm = load(
 def test_gemm(M, K, N):
     torch.manual_seed(42)
     A = torch.randn(M, K, device='cuda', dtype=torch.bfloat16)
-    B = torch.randn(K, N, device='cuda', dtype=torch.bfloat16).t().contiguous().t()
+    B = torch.randn(N, K, device='cuda', dtype=torch.bfloat16).t()
     C = torch.zeros(M, N, device='cuda', dtype=torch.float32)
 
     result = custom_gemm.gemm_cuda(A, B, C)
