@@ -333,7 +333,7 @@ __global__ void gemm(
 ) {
     const int block_row = blockIdx.y;
     const int block_col = blockIdx.x;
-    const int is_master_thread = threadIdx.x == 0;
+    const int is_master_thread = threadIdx.x == blockDim.x - 1;
     const int warp_id = threadIdx.x / 32;
 
     // init smem queue buffers
@@ -353,9 +353,10 @@ __global__ void gemm(
     int read_buf_idx = 0;
 
     // consumer warps 0-3, producer warp 4
-    // producer
     constexpr int PRODUCER_WARP_ID = 4;
     const int num_k_tiles = (K + BK - 1) / BK;
+
+    // producer
     if (warp_id == PRODUCER_WARP_ID)
     {
         int a_global_row = block_row * BM;
@@ -520,7 +521,7 @@ __global__ void gemm(
 
 extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     constexpr int WGMMA_M = 64;
-    constexpr int WGMMA_N = 16;
+    constexpr int WGMMA_N = 256;
     constexpr int WGMMA_K = 16;
     auto ceil_div = [](int x, int y) {
         return (x + y - 1) / y;
@@ -528,7 +529,7 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
 
     // dims for smem tiles
     constexpr int BM = 64;
-    constexpr int BN = 16;
+    constexpr int BN = 256;
     constexpr int BK = 64;
     assert(BM >= WGMMA_M && BM % WGMMA_M == 0);
     assert(BN >= WGMMA_N && BN % WGMMA_N == 0);
@@ -559,7 +560,7 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     constexpr int PRODUCER_WARPS = 1;
     constexpr int CONSUMER_WARPS = 4;
     constexpr int NUM_THREADS = 128 + 32; // 1 producer warp + 4 consumer warps (1 wargroup for wgmma)
-    constexpr int QUEUE_SIZE = 2;
+    constexpr int QUEUE_SIZE = 4;
 
     dim3 block_dim(NUM_THREADS);
     dim3 grid_dim(ceil_div(N, BN), ceil_div(M, BM));
