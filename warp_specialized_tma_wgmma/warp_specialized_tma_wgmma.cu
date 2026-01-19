@@ -7,8 +7,6 @@
 
 using namespace nvcuda;
 
-#define NUM_BUFFERS 2
-
 // Overloaded error checking for both CUDA driver API (CUresult) and runtime API (cudaError_t)
 inline void cuda_check_impl(CUresult result, const char* file, int line) {
     if (result != CUDA_SUCCESS) {
@@ -318,6 +316,9 @@ __forceinline__ __device__ void copy_2d_to_shared(
 
 template<
     int NUM_THREADS,
+    int PRODUCER_WARPS,
+    int CONSUMER_WARPS,
+    int QUEUE_SIZE,
     int BM = 128,
     int BN = 128,
     int BK = 16,
@@ -333,21 +334,24 @@ __global__ void gemm(
     int N,
     int K
 ) {
-    __shared__ __align__(128) __nv_bfloat16 sA[NUM_BUFFERS][BM * BK];
-    __shared__ __align__(128) __nv_bfloat16 sB[NUM_BUFFERS][BN * BK];  // TMA loads (BN x BK) with K contiguous
     const int block_row = blockIdx.y;
     const int block_col = blockIdx.x;
     const int is_master_thread = threadIdx.x == 0;
+    const int warp_id = threadIdx.x / 32;
 
-    // init mbarriers (one per buffer, per A/B)
-    __shared__ __align__(128) uint64_t mbar_a[NUM_BUFFERS];
-    __shared__ __align__(128) uint64_t mbar_b[NUM_BUFFERS];
-    int parity_a[NUM_BUFFERS] = {0};
-    int parity_b[NUM_BUFFERS] = {0};
-    initialize_barriers<NUM_BUFFERS, NUM_THREADS>(mbar_a, is_master_thread);
-    initialize_barriers<NUM_BUFFERS, NUM_THREADS>(mbar_b, is_master_thread);
+    // init smem queue buffers
+    __shared__ __align__(128) __nv_bfloat16 sA[QUEUE_SIZE][BM * BK];
+    __shared__ __align__(128) __nv_bfloat16 sB[QUEUE_SIZE][BN * BK];  // TMA loads (BN x BK) with K contiguous
 
-    // prologue: prefetch first A/B tiles into first SMEM bufffer
+    // init mbarriers
+    __shared__ __align__(128) uint64_t full_mbar[QUEUE_SIZE];
+    __shared__ __align__(128) uint64_t empty_mbar[QUEUE_SIZE];
+    initialize_barriers<QUEUE_SIZE, NUM_THREADS>(full_mbar, is_master_thread);
+    initialize_barriers<QUEUE_SIZE, NUM_THREADS>(empty_mbar, is_master_thread);
+    int full_parity[QUEUE_SIZE] = {0};
+    int empty_parity[QUEUE_SIZE] = {0};
+
+    // prologue: prefetch first A/B tiles into first SMEM buffer
     int write_buf_idx = 0;
     int read_buf_idx = 0;
     int a_global_row = block_row * BM;
@@ -357,60 +361,29 @@ __global__ void gemm(
     constexpr int num_bytes_a = BM * BK * 2; // 2 bytes per bf16
     constexpr int num_bytes_b = BK * BN * 2;
 
-    copy_2d_to_shared(
-        reinterpret_cast<void*>(&sA[write_buf_idx][0]),
-        reinterpret_cast<const void*>(&a_map),
-        a_global_col,
-        a_global_row,
-        num_bytes_a,
-        (uint64_t*)&mbar_a[write_buf_idx],
-        is_master_thread
-    );
-    copy_2d_to_shared(
-        reinterpret_cast<void*>(&sB[write_buf_idx][0]),
-        reinterpret_cast<const void*>(&b_map),
-        b_global_row, // swapped for col major
-        b_global_col, // swapped for col major
-        num_bytes_b,
-        (uint64_t*)&mbar_b[write_buf_idx],
-        is_master_thread
-    );
+    // producer
+    constexpr int PRODUCER_WARP_ID = 0;
+    const int num_k_tiles = (K + BK - 1) / BK;
+    if (warp_id == PRODUCER_WARP_ID)
+    {
+        for (int bk_tile_idx = 0; bk_tile_idx < num_k_tiles; bk_tile_idx++) {
+            a_global_col = bk_tile_idx * BK;
+            b_global_row = bk_tile_idx * BK;
 
-    // toggle buf to write to
-    write_buf_idx ^= 1;
+            // once we loop around to beginning of circular buffer for the first time,
+            // we need to start waiing for consumer to finish reading from target buffer
+            if (bk_tile_idx >= QUEUE_SIZE)
+            {
+                mbarrier_wait_parity((uint64_t*)&empty_parity[write_buf_idx], empty_parity[write_buf_idx]);
+            }
 
-    // one 8 register accum buffer for each warpgroup.
-    // (64,16) @ (16,16) = (64,16) -> 1024 size output per warpgroup
-    // 1024 / 4 warps / 32 threads per warp = 8 elements per thread.
-    // These 8 elements are distributed across 16 columns of the output D:
-    // see: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-register-fragment-wgmma-64n16
-    constexpr int NUM_WG = NUM_THREADS / 128;
-    constexpr int ROWS_PER_WG = BM / NUM_WG;
-    constexpr int m_iters = ROWS_PER_WG/WGMMA_M;    // each wg covers 64 rows of output *per wgmma iter along BM*
-    constexpr int n_iters = BN/WGMMA_N;             // each wg covers N cols of output *per wgmma iter along BN*
-
-    // each wgmma distributes 64xN outputs across the 128 threads in the warpgroup.
-    // every thread always holds 8 values, which are spread across 16 columns of
-    // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#wgmma-64n16-d
-    float accum[m_iters][n_iters][WGMMA_N/16][8] = {0};         // each thread in wg has 8 registers of accum output
-    static_assert(sizeof(accum) * NUM_THREADS == BM * BN * sizeof(float));
-
-    const int num_bk_tiles = (K + BK - 1) / BK;
-    #pragma unroll
-    for (int bk_tile_idx = 0; bk_tile_idx < num_bk_tiles; bk_tile_idx++) {
-        // prefetch next a/b tiles into next buffer.
-        // note this is not async in this kernel version, so benefits are limited (one fewer syncthreads())
-        if (bk_tile_idx + 1 < num_bk_tiles)
-        {
-            a_global_col = (bk_tile_idx + 1) * BK;
-            b_global_row = (bk_tile_idx + 1) * BK;
             copy_2d_to_shared(
                 reinterpret_cast<void*>(&sA[write_buf_idx][0]),
                 reinterpret_cast<const void*>(&a_map),
                 a_global_col,
                 a_global_row,
                 num_bytes_a,
-                (uint64_t*)&mbar_a[write_buf_idx],
+                (uint64_t*)&full_mbar[write_buf_idx],
                 is_master_thread
             );
             copy_2d_to_shared(
@@ -419,103 +392,124 @@ __global__ void gemm(
                 b_global_row, // swapped for col major
                 b_global_col, // swapped for col major
                 num_bytes_b,
-                (uint64_t*)&mbar_b[write_buf_idx],
+                (uint64_t*)&full_mbar[write_buf_idx], // using same mbar for both a/b, will sum the expected bytes
                 is_master_thread
             );
-            write_buf_idx ^= 1;
+            write_buf_idx = (write_buf_idx + 1) % QUEUE_SIZE;
         }
+    }
+    // consumer
+    else
+    {
 
-        // at this point we have 2 tma commit groups in flight.
-        // wait only for the one we are about to read from.
-        mbarrier_wait_parity(&mbar_a[read_buf_idx], parity_a[read_buf_idx]);
-        mbarrier_wait_parity(&mbar_b[read_buf_idx], parity_b[read_buf_idx]);
-        asm volatile("fence.proxy.async.shared::cta;");
+        // one 8 register accum buffer for each warpgroup.
+        // (64,16) @ (16,16) = (64,16) -> 1024 size output per warpgroup
+        // 1024 / 4 warps / 32 threads per warp = 8 elements per thread.
+        // These 8 elements are distributed across 16 columns of the output D:
+        // see: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-register-fragment-wgmma-64n16
+        constexpr int CONSUMER_WARPGROUPS = CONSUMER_WARPS / 4;
+        constexpr int ROWS_PER_WARPGROUP = BM / CONSUMER_WARPGROUPS;
+        constexpr int m_iters = ROWS_PER_WARPGROUP/WGMMA_M;     // each wg covers 64 rows of output *per wgmma iter along BM*
+        constexpr int n_iters = BN/WGMMA_N;                     // each wg covers N cols of output *per wgmma iter along BN*
 
-        // wgmma executed in the async proxy, so use fence to enforce
-        // ordering requirements of warpgroup accesses to registers before wgmma.mma_async
-        asm volatile("wgmma.fence.sync.aligned; " ::: "memory");
+        // each wgmma distributes 64xN outputs across the 128 threads in the warpgroup.
+        // every thread always holds 8 values, which are spread across 16 columns of
+        // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#wgmma-64n16-d
+        float accum[m_iters][n_iters][WGMMA_N/16][8] = {0};         // each thread in wg has 8 registers of accum output
+        static_assert(sizeof(accum) * (CONSUMER_WARPS * 32) == BM * BN * sizeof(float));
 
-        // async wgmma for every subtile in the smem.
-        // warpgroups are arranged vertically and iterate horizontally over BN
-        const int wg_row = threadIdx.x / 128;
-        const int k_iters = BK / WGMMA_K;
-        for (int m_tile_idx = 0; m_tile_idx < m_iters; m_tile_idx++) {
-            const int smem_a_row = wg_row * ROWS_PER_WG + m_tile_idx * WGMMA_M;
+        const int num_bk_tiles = (K + BK - 1) / BK;
+        #pragma unroll
+        for (int bk_tile_idx = 0; bk_tile_idx < num_bk_tiles; bk_tile_idx++) {
+            // wait for the tma load to the buffers we are about to read from.
+            mbarrier_wait_parity(&full_mbar[read_buf_idx], full_parity[read_buf_idx]);
+            asm volatile("fence.proxy.async.shared::cta;");
 
-            for (int k_tile_idx = 0; k_tile_idx < k_iters; k_tile_idx++) {
-                const int smem_a_col = k_tile_idx * WGMMA_K;
-                void* smem_tile_a = (void*)&sA[read_buf_idx][smem_a_row * BK + smem_a_col];
-                uint64_t smem_a_desc = make_smem_desc<BK>((void*)smem_tile_a);
+            // wgmma executed in the async proxy, so use fence to enforce
+            // ordering requirements of warpgroup accesses to registers before wgmma.mma_async
+            asm volatile("wgmma.fence.sync.aligned; " ::: "memory");
 
-                for (int n_tile_idx = 0; n_tile_idx < n_iters; n_tile_idx++) {
-                    const int smem_b_row = k_tile_idx * WGMMA_K;
-                    const int smem_b_col = n_tile_idx * WGMMA_N;
-                    void* smem_tile_b = (void*)&sB[read_buf_idx][smem_b_row + smem_b_col * BK];
-                    uint64_t smem_b_desc = make_smem_desc<BK>((void*)smem_tile_b);
-                    if constexpr (WGMMA_N == 16)
-                        wgmma_m64n16k16<1,1,1,0,0>(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
-                    else if constexpr (WGMMA_N == 128)
-                        wgmma_m64n128k16<1,1,1,0,0>(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
-                    else if constexpr (WGMMA_N == 256)
-                        wgmma_n64n256k16<1,1,1,0,0>(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
+            // async wgmma for every subtile in the smem.
+            // warpgroups are arranged vertically and iterate horizontally over BN
+            const int wg_row = threadIdx.x / 128;
+            const int k_iters = BK / WGMMA_K;
+            for (int m_tile_idx = 0; m_tile_idx < m_iters; m_tile_idx++) {
+                const int smem_a_row = wg_row * ROWS_PER_WARPGROUP + m_tile_idx * WGMMA_M;
+
+                for (int k_tile_idx = 0; k_tile_idx < k_iters; k_tile_idx++) {
+                    const int smem_a_col = k_tile_idx * WGMMA_K;
+                    void* smem_tile_a = (void*)&sA[read_buf_idx][smem_a_row * BK + smem_a_col];
+                    uint64_t smem_a_desc = make_smem_desc<BK>((void*)smem_tile_a);
+
+                    for (int n_tile_idx = 0; n_tile_idx < n_iters; n_tile_idx++) {
+                        const int smem_b_row = k_tile_idx * WGMMA_K;
+                        const int smem_b_col = n_tile_idx * WGMMA_N;
+                        void* smem_tile_b = (void*)&sB[read_buf_idx][smem_b_row + smem_b_col * BK];
+                        uint64_t smem_b_desc = make_smem_desc<BK>((void*)smem_tile_b);
+                        if constexpr (WGMMA_N == 16)
+                            wgmma_m64n16k16<1,1,1,0,0>(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
+                        else if constexpr (WGMMA_N == 128)
+                            wgmma_m64n128k16<1,1,1,0,0>(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
+                        else if constexpr (WGMMA_N == 256)
+                            wgmma_n64n256k16<1,1,1,0,0>(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
+                    }
                 }
             }
+
+            // commit batch of wgmmas and wait for completion
+            asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+            asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+
+            // signal we finished reading from this buffer
+            mbarrier_arrive((uint64_t*)&empty_mbar[read_buf_idx]);
+            empty_parity[read_buf_idx] ^= 1;
+            read_buf_idx = (read_buf_idx + 1) % QUEUE_SIZE;
+            __syncthreads();
         }
 
-        // commit batch of wgmmas and wait for completion
-        asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
-        asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+        // accum register layout is confusing: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-register-fragment-wgmma-64n16
+        // each warp in the warpgroup computes WGMMA_M/4 rows.
+        // each consecutive 4 lanes share the same row.
+        // threads in groups of 4, each holding 2 registers of contiguous output memory
+        constexpr int rows_per_warp = WGMMA_M / 4;
+        const int wg_row = threadIdx.x / 128;
+        const int warp_idx_in_wg = warp_id % 4;
+        const int lane_id = threadIdx.x % 32;
+        const int thread_row_c = warp_idx_in_wg * rows_per_warp + lane_id / 4;
+        const int thread_col_c = 2 * (lane_id % 4); // 2 reg per thread, 4 threads per row before wrapping to next row
 
-        // toggle next buffer
-        parity_a[read_buf_idx] ^= 1;
-        parity_b[read_buf_idx] ^= 1;
-        read_buf_idx ^= 1;
-        __syncthreads();
-    }
+        int c_base_row = block_row * BM;
+        int c_base_col = block_col * BN;
 
-    // accum register layout is confusing: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-register-fragment-wgmma-64n16
-    // each warp in the warpgroup computes WGMMA_M/4 rows.
-    // each consecutive 4 lanes share the same row.
-    // threads in groups of 4, each holding 2 registers of contiguous output memory
-    constexpr int rows_per_warp = WGMMA_M / 4;
-    const int wg_row = threadIdx.x / 128;
-    const int warp_id = threadIdx.x / 32;
-    const int warp_idx_in_wg = warp_id % 4;
-    const int lane_id = threadIdx.x % 32;
-    const int thread_row_c = warp_idx_in_wg * rows_per_warp + lane_id / 4;
-    const int thread_col_c = 2 * (lane_id % 4); // 2 reg per thread, 4 threads per row before wrapping to next row
-
-    int c_base_row = block_row * BM;
-    int c_base_col = block_col * BN;
-
-    // accum register layout:
-    // 2 rows: row, row+8
-    // 4 cols: col, col+1, col+8, col+9
-    // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#wgmma-64n16-d
-    #pragma unroll
-    for (int m_tile_idx = 0; m_tile_idx < m_iters; m_tile_idx++) {
-        int row = c_base_row + (wg_row * ROWS_PER_WG) + (m_tile_idx * WGMMA_M) + thread_row_c;
+        // accum register layout:
+        // 2 rows: row, row+8
+        // 4 cols: col, col+1, col+8, col+9
+        // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#wgmma-64n16-d
         #pragma unroll
-        for (int n_tile_idx = 0; n_tile_idx < n_iters; n_tile_idx++) {
+        for (int m_tile_idx = 0; m_tile_idx < m_iters; m_tile_idx++) {
+            int row = c_base_row + (wg_row * ROWS_PER_WARPGROUP) + (m_tile_idx * WGMMA_M) + thread_row_c;
             #pragma unroll
-            for (int wn = 0; wn < WGMMA_N/16; wn++) {
-                int col = c_base_col + (n_tile_idx * WGMMA_N) + wn*16 + thread_col_c;
-                // Bounds check to avoid invalid global writes
-                if (row < M && col + 1 < N) {
-                    C[row * N + col + 0] = accum[m_tile_idx][n_tile_idx][wn][0];
-                    C[row * N + col + 1] = accum[m_tile_idx][n_tile_idx][wn][1];
-                }
-                if (row + 8 < M && col + 1 < N) {
-                    C[(row+8) * N + col + 0] = accum[m_tile_idx][n_tile_idx][wn][2];
-                    C[(row+8) * N + col + 1] = accum[m_tile_idx][n_tile_idx][wn][3];
-                }
-                if (row < M && col + 9 < N) {
-                    C[row * N + col + 8] = accum[m_tile_idx][n_tile_idx][wn][4];
-                    C[row * N + col + 9] = accum[m_tile_idx][n_tile_idx][wn][5];
-                }
-                if (row + 8 < M && col + 9 < N) {
-                    C[(row+8) * N + col + 8] = accum[m_tile_idx][n_tile_idx][wn][6];
-                    C[(row+8) * N + col + 9] = accum[m_tile_idx][n_tile_idx][wn][7];
+            for (int n_tile_idx = 0; n_tile_idx < n_iters; n_tile_idx++) {
+                #pragma unroll
+                for (int wn = 0; wn < WGMMA_N/16; wn++) {
+                    int col = c_base_col + (n_tile_idx * WGMMA_N) + wn*16 + thread_col_c;
+                    // Bounds check to avoid invalid global writes
+                    if (row < M && col + 1 < N) {
+                        C[row * N + col + 0] = accum[m_tile_idx][n_tile_idx][wn][0];
+                        C[row * N + col + 1] = accum[m_tile_idx][n_tile_idx][wn][1];
+                    }
+                    if (row + 8 < M && col + 1 < N) {
+                        C[(row+8) * N + col + 0] = accum[m_tile_idx][n_tile_idx][wn][2];
+                        C[(row+8) * N + col + 1] = accum[m_tile_idx][n_tile_idx][wn][3];
+                    }
+                    if (row < M && col + 9 < N) {
+                        C[row * N + col + 8] = accum[m_tile_idx][n_tile_idx][wn][4];
+                        C[row * N + col + 9] = accum[m_tile_idx][n_tile_idx][wn][5];
+                    }
+                    if (row + 8 < M && col + 9 < N) {
+                        C[(row+8) * N + col + 8] = accum[m_tile_idx][n_tile_idx][wn][6];
+                        C[(row+8) * N + col + 9] = accum[m_tile_idx][n_tile_idx][wn][7];
+                    }
                 }
             }
         }
@@ -524,7 +518,7 @@ __global__ void gemm(
 
 extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     constexpr int WGMMA_M = 64;
-    constexpr int WGMMA_N = 256;
+    constexpr int WGMMA_N = 128;
     constexpr int WGMMA_K = 16;
     auto ceil_div = [](int x, int y) {
         return (x + y - 1) / y;
@@ -532,12 +526,11 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
 
     // dims for smem tiles
     constexpr int BM = 64;
-    constexpr int BN = 256;
+    constexpr int BN = 128;
     constexpr int BK = 64;
     assert(BM >= WGMMA_M && BM % WGMMA_M == 0);
     assert(BN >= WGMMA_N && BN % WGMMA_N == 0);
     assert(BK >= WGMMA_K && BK % WGMMA_K == 0);
-    constexpr int NUM_THREADS = 128;
 
     alignas(64) CUtensorMap a_map = {};
     alignas(64) CUtensorMap b_map = {};
@@ -561,8 +554,14 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     );
     float* c_ptr = reinterpret_cast<float*>(C);
 
+    constexpr int PRODUCER_WARPS = 1;
+    constexpr int CONSUMER_WARPS = 4;
+    constexpr int NUM_THREADS = 32 + 128; // 1 producer warp + 4 consumer warps (1 wargroup for wgmma)
+    constexpr int QUEUE_SIZE = 2;
+
     dim3 block_dim(NUM_THREADS);
     dim3 grid_dim(ceil_div(N, BN), ceil_div(M, BM));
-    auto kernel = gemm<NUM_THREADS, BM, BN, BK, WGMMA_M, WGMMA_N, WGMMA_K>;
+
+    auto kernel = gemm<NUM_THREADS, PRODUCER_WARPS, CONSUMER_WARPS, QUEUE_SIZE, BM, BN, BK, WGMMA_M, WGMMA_N, WGMMA_K>;
     kernel<<<grid_dim, block_dim>>>(a_map, b_map, c_ptr, M, N, K);
 }
