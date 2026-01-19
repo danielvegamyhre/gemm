@@ -72,7 +72,7 @@ void create_2d_tensor_map(
 }
 
 template<int SCALE_D, int SCALE_A, int SCALE_B, int TRANS_A, int TRANS_B>
-__device__ __forceinline__ void wgmma_m64n16k16(uint64_t smem_desc_a, uint64_t smem_desc_b, float reg_c[8]) {
+__device__ __forceinline__ void wgmma_m64n16k16(uint64_t smem_desc_a, uint64_t smem_desc_b, float reg_c[1][8]) {
     // 64x16 output = 1024 elements / 4 warps / 32 threads per warp = 8 outputs per thread
     // outputs are fp32 which is exactly 1 32bit reg
     asm volatile(
@@ -82,8 +82,8 @@ __device__ __forceinline__ void wgmma_m64n16k16(uint64_t smem_desc_a, uint64_t s
         "%8, %9, "
         "%10, %11, %12, %13, %14;\n"
         "}\n"
-        : "+f"(reg_c[0]), "+f"(reg_c[1]), "+f"(reg_c[2]), "+f"(reg_c[3]),
-          "+f"(reg_c[4]), "+f"(reg_c[5]), "+f"(reg_c[6]), "+f"(reg_c[7])
+        : "+f"(reg_c[0][0]), "+f"(reg_c[0][1]), "+f"(reg_c[0][2]), "+f"(reg_c[0][3]),
+          "+f"(reg_c[0][4]), "+f"(reg_c[0][5]), "+f"(reg_c[0][6]), "+f"(reg_c[0][7])
         : "l"(smem_desc_a), "l"(smem_desc_b),
           "n"((int32_t)SCALE_D), "n"((int32_t)SCALE_A), "n"((int32_t)SCALE_B),
           "n"((int32_t)TRANS_A), "n"((int32_t)TRANS_B)
@@ -182,14 +182,11 @@ __device__ uint64_t make_smem_desc(void* smem_ptr) {
     uint64_t desc = matrix_desc_encode(shared_addr);
 
     // bits 16-29: matrix_desc_encode(leading dim byte offset)
-    // LBO (leading byte offset) is the stride between core-matrices along the K dim
-    // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-leading-dimension-byte-offset
-    uint64_t LBO = 16;
-    desc |= (matrix_desc_encode(LBO) << 16);
+    // ignored for swizzled layout
 
     // bits 32-45: matrix_desc_encode(stride dim byte offset)
     // SBO (stride byte offset) is stride between rows of core matrices (along M/N) dim
-    uint64_t SBO = 8*BK*2;
+    uint64_t SBO = 8 * BK * 2;
     desc |= (matrix_desc_encode(SBO) << 32);
 
     // bits 49-52: matrix base offset (no swizzle = 0)
@@ -344,57 +341,62 @@ __global__ void gemm(
     __shared__ __align__(128) __nv_bfloat16 sB[QUEUE_SIZE][BN * BK];  // TMA loads (BN x BK) with K contiguous
 
     // init mbarriers
-    __shared__ __align__(128) uint64_t full_mbar[QUEUE_SIZE];
-    __shared__ __align__(128) uint64_t empty_mbar[QUEUE_SIZE];
-    initialize_barriers<QUEUE_SIZE, NUM_THREADS>(full_mbar, is_master_thread);
-    initialize_barriers<QUEUE_SIZE, NUM_THREADS>(empty_mbar, is_master_thread);
+    __shared__ __align__(8) uint64_t full_mbar[QUEUE_SIZE];
+    __shared__ __align__(8) uint64_t empty_mbar[QUEUE_SIZE];
+    initialize_barriers<QUEUE_SIZE, PRODUCER_WARPS * 32>(full_mbar, is_master_thread);
+    initialize_barriers<QUEUE_SIZE, CONSUMER_WARPS * 32>(empty_mbar, is_master_thread);
     int full_parity[QUEUE_SIZE] = {0};
     int empty_parity[QUEUE_SIZE] = {0};
 
     // prologue: prefetch first A/B tiles into first SMEM buffer
     int write_buf_idx = 0;
     int read_buf_idx = 0;
-    int a_global_row = block_row * BM;
-    int a_global_col = 0;
-    int b_global_row = 0;
-    int b_global_col = block_col * BN;
-    constexpr int num_bytes_a = BM * BK * 2; // 2 bytes per bf16
-    constexpr int num_bytes_b = BK * BN * 2;
 
+    // consumer warps 0-3, producer warp 4
     // producer
-    constexpr int PRODUCER_WARP_ID = 0;
+    constexpr int PRODUCER_WARP_ID = 4;
     const int num_k_tiles = (K + BK - 1) / BK;
     if (warp_id == PRODUCER_WARP_ID)
     {
+        int a_global_row = block_row * BM;
+        int b_global_col = block_col * BN;
+        constexpr int num_bytes_a = BM * BK * 2; // 2 bytes per bf16
+        constexpr int num_bytes_b = BK * BN * 2;
         for (int bk_tile_idx = 0; bk_tile_idx < num_k_tiles; bk_tile_idx++) {
-            a_global_col = bk_tile_idx * BK;
-            b_global_row = bk_tile_idx * BK;
+            int a_global_col = bk_tile_idx * BK;
+            int b_global_row = bk_tile_idx * BK;
 
             // once we loop around to beginning of circular buffer for the first time,
             // we need to start waiing for consumer to finish reading from target buffer
             if (bk_tile_idx >= QUEUE_SIZE)
             {
-                mbarrier_wait_parity((uint64_t*)&empty_parity[write_buf_idx], empty_parity[write_buf_idx]);
+                mbarrier_wait_parity(&empty_mbar[write_buf_idx], empty_parity[write_buf_idx]);
+                empty_parity[write_buf_idx] ^= 1;
             }
 
-            copy_2d_to_shared(
-                reinterpret_cast<void*>(&sA[write_buf_idx][0]),
-                reinterpret_cast<const void*>(&a_map),
-                a_global_col,
-                a_global_row,
-                num_bytes_a,
-                (uint64_t*)&full_mbar[write_buf_idx],
-                is_master_thread
-            );
-            copy_2d_to_shared(
-                reinterpret_cast<void*>(&sB[write_buf_idx][0]),
-                reinterpret_cast<const void*>(&b_map),
-                b_global_row, // swapped for col major
-                b_global_col, // swapped for col major
-                num_bytes_b,
-                (uint64_t*)&full_mbar[write_buf_idx], // using same mbar for both a/b, will sum the expected bytes
-                is_master_thread
-            );
+            // tma loads for next A/B tiles
+            if (is_master_thread)
+            {
+                cp_async_bulk_tensor_2d_global_to_shared(
+                    reinterpret_cast<uint64_t*>(&sA[write_buf_idx][0]),
+                    reinterpret_cast<const uint64_t*>(&a_map),
+                    (uint32_t)a_global_col,
+                    (uint32_t)a_global_row,
+                    (uint64_t*)&full_mbar[write_buf_idx]
+                );
+                cp_async_bulk_tensor_2d_global_to_shared(
+                    reinterpret_cast<uint64_t*>(&sB[write_buf_idx][0]),
+                    reinterpret_cast<const uint64_t*>(&b_map),
+                    (uint32_t)b_global_row, // swapped for col major
+                    (uint32_t)b_global_col, // swapped for col major
+                    (uint64_t*)&full_mbar[write_buf_idx]
+                );
+                mbarrier_arrive_expect_tx(&full_mbar[write_buf_idx], num_bytes_a + num_bytes_b);
+            }
+            else
+            {
+                mbarrier_arrive(&full_mbar[write_buf_idx]);
+            }
             write_buf_idx = (write_buf_idx + 1) % QUEUE_SIZE;
         }
     }
@@ -423,6 +425,7 @@ __global__ void gemm(
         for (int bk_tile_idx = 0; bk_tile_idx < num_bk_tiles; bk_tile_idx++) {
             // wait for the tma load to the buffers we are about to read from.
             mbarrier_wait_parity(&full_mbar[read_buf_idx], full_parity[read_buf_idx]);
+            full_parity[read_buf_idx] ^= 1;
             asm volatile("fence.proxy.async.shared::cta;");
 
             // wgmma executed in the async proxy, so use fence to enforce
@@ -461,10 +464,8 @@ __global__ void gemm(
             asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
 
             // signal we finished reading from this buffer
-            mbarrier_arrive((uint64_t*)&empty_mbar[read_buf_idx]);
-            empty_parity[read_buf_idx] ^= 1;
+            mbarrier_arrive(&empty_mbar[read_buf_idx]);
             read_buf_idx = (read_buf_idx + 1) % QUEUE_SIZE;
-            __syncthreads();
         }
 
         // accum register layout is confusing: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-register-fragment-wgmma-64n16
@@ -472,8 +473,9 @@ __global__ void gemm(
         // each consecutive 4 lanes share the same row.
         // threads in groups of 4, each holding 2 registers of contiguous output memory
         constexpr int rows_per_warp = WGMMA_M / 4;
-        const int wg_row = threadIdx.x / 128;
-        const int warp_idx_in_wg = warp_id % 4;
+        const int wg_row = threadIdx.x/ 128;
+        const int consumer_warp_id = threadIdx.x / 32;
+        const int warp_idx_in_wg = consumer_warp_id % 4;
         const int lane_id = threadIdx.x % 32;
         const int thread_row_c = warp_idx_in_wg * rows_per_warp + lane_id / 4;
         const int thread_col_c = 2 * (lane_id % 4); // 2 reg per thread, 4 threads per row before wrapping to next row
@@ -518,7 +520,7 @@ __global__ void gemm(
 
 extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     constexpr int WGMMA_M = 64;
-    constexpr int WGMMA_N = 128;
+    constexpr int WGMMA_N = 16;
     constexpr int WGMMA_K = 16;
     auto ceil_div = [](int x, int y) {
         return (x + y - 1) / y;
@@ -526,7 +528,7 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
 
     // dims for smem tiles
     constexpr int BM = 64;
-    constexpr int BN = 128;
+    constexpr int BN = 16;
     constexpr int BK = 64;
     assert(BM >= WGMMA_M && BM % WGMMA_M == 0);
     assert(BN >= WGMMA_N && BN % WGMMA_N == 0);
@@ -556,7 +558,7 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
 
     constexpr int PRODUCER_WARPS = 1;
     constexpr int CONSUMER_WARPS = 4;
-    constexpr int NUM_THREADS = 32 + 128; // 1 producer warp + 4 consumer warps (1 wargroup for wgmma)
+    constexpr int NUM_THREADS = 128 + 32; // 1 producer warp + 4 consumer warps (1 wargroup for wgmma)
     constexpr int QUEUE_SIZE = 2;
 
     dim3 block_dim(NUM_THREADS);
