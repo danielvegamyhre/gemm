@@ -323,7 +323,7 @@ template<
     int WGMMA_N = 16,
     int WGMMA_K = 16
 >
-__global__ void gemm(
+__global__ void ws_gemm(
     const __grid_constant__ CUtensorMap a_map,
     const __grid_constant__ CUtensorMap b_map,
     float* C,
@@ -560,11 +560,11 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     constexpr int PRODUCER_WARPS = 1;
     constexpr int CONSUMER_WARPS = 4;
     constexpr int NUM_THREADS = 128 + 32; // 1 producer warp + 4 consumer warps (1 wargroup for wgmma)
-    constexpr int QUEUE_SIZE = 4;
+    constexpr int QUEUE_SIZE = 2;
 
     dim3 block_dim(NUM_THREADS);
     dim3 grid_dim(ceil_div(N, BN), ceil_div(M, BM));
 
-    auto kernel = gemm<NUM_THREADS, PRODUCER_WARPS, CONSUMER_WARPS, QUEUE_SIZE, BM, BN, BK, WGMMA_M, WGMMA_N, WGMMA_K>;
+    auto kernel = ws_gemm<NUM_THREADS, PRODUCER_WARPS, CONSUMER_WARPS, QUEUE_SIZE, BM, BN, BK, WGMMA_M, WGMMA_N, WGMMA_K>;
     kernel<<<grid_dim, block_dim>>>(a_map, b_map, c_ptr, M, N, K);
 }
