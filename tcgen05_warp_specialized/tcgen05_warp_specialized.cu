@@ -264,6 +264,15 @@ __device__ __forceinline__ void tcgen05_mma(
     );
 }
 
+// see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-instructions-mma
+__device__ __forceinline__ void tcgen05_commit(uint64_t* mbar_ptr) {
+    asm volatile(
+        "tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];"
+        :
+        : "l"(mbar_ptr)
+    );
+}
+
 template<
     int NUM_THREADS,
     int PRODUCER_WARPS,
@@ -377,10 +386,8 @@ __global__ void ws_gemm(
         // 1024 / 4 warps / 32 threads per warp = 8 elements per thread.
         // These 8 elements are distributed across 16 columns of the output D:
         // see: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-register-fragment-wgmma-64n16
-        constexpr int CONSUMER_WARPGROUPS = CONSUMER_WARPS / 4;
-        constexpr int ROWS_PER_WARPGROUP = BM / CONSUMER_WARPGROUPS;
-        constexpr int m_iters = ROWS_PER_WARPGROUP/MMA_M;     // each wg covers 64 rows of output *per wgmma iter along BM*
-        constexpr int n_iters = BN/MMA_N;                     // each wg covers N cols of output *per wgmma iter along BN*
+        constexpr int m_iters = BM/MMA_M;
+        constexpr int n_iters = BN/MMA_N;
 
         // each wgmma distributes 64xN outputs across the 128 threads in the warpgroup.
         // every thread always holds 8 values, which are spread across 16 columns of
@@ -397,14 +404,8 @@ __global__ void ws_gemm(
             // wait for the tma load to the buffers we are about to read from.
             mbarrier_wait_parity(&full_mbar[read_buf_idx], full_parity[read_buf_idx]);
             full_parity[read_buf_idx] ^= 1;
-            asm volatile("fence.proxy.async.shared::cta;");
 
-            // wgmma executed in the async proxy, so use fence to enforce
-            // ordering requirements of warpgroup accesses to registers before wgmma.mma_async
-            asm volatile("wgmma.fence.sync.aligned; " ::: "memory");
-
-            // async wgmma for every subtile in the smem.
-            // warpgroups are arranged vertically and iterate horizontally over BN
+            // tcgen05 mma for every subtile in the smem.
             const int wg_row = threadIdx.x / 128;
             const int k_iters = BK / MMA_K;
             for (int m_tile_idx = 0; m_tile_idx < m_iters; m_tile_idx++) {
