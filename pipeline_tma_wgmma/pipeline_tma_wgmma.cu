@@ -171,7 +171,7 @@ __device__ void wgmma_n64n256k16(uint64_t smem_desc_a, uint64_t smem_desc_b, flo
 
 // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-matrix-shared-memory-layout-matrix-descriptor
 __device__ uint64_t matrix_desc_encode(uint64_t x) {
-    // grabs 18 rightmost bits and shifts right by 4 to get bits 3-13 (14 bits)
+    // grabs 18 rightmost bits and shifts right by 4 to get bits 3-17 (14 bits)
     return (x & 0x3FFFF) >> 4;
 }
 

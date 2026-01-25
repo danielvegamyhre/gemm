@@ -74,16 +74,16 @@ void create_2d_tensor_map(
 
 // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-matrix-shared-memory-layout-matrix-descriptor
 __device__ uint64_t matrix_desc_encode(uint64_t x) {
-    // grabs 18 rightmost bits and shifts right by 4 to get bits 3-13 (14 bits)
+    // grabs 18 rightmost bits and shifts right by 4 to get bits 3-17 (14 bits)
     return (x & 0x3FFFF) >> 4;
 }
 
+// see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-shared-memory-descriptor
 template <int BK>
 __device__ uint64_t make_smem_desc(void* smem_ptr) {
     uint32_t shared_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
 
     // bits 0-13: matrix_desc_encode(matrix addr)
-    // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-matrix-shared-memory-layout-matrix-descriptor
     uint64_t desc = matrix_desc_encode(shared_addr);
 
     // bits 16-29: matrix_desc_encode(leading dim byte offset)
@@ -91,12 +91,11 @@ __device__ uint64_t make_smem_desc(void* smem_ptr) {
 
     // bits 32-45: matrix_desc_encode(stride dim byte offset)
     // SBO (stride byte offset) is stride between rows of core matrices (along M/N) dim
-    uint64_t SBO = 8 * BK * 2;
+    uint64_t SBO = 8 * BK * 2; // 8 rows in core matrix * BK * 2 bytes per elem
     desc |= (matrix_desc_encode(SBO) << 32);
 
-    // bits 49-52: matrix base offset (no swizzle = 0)
-    // bits 62-63: swizzle mode (no swizzle = 0)
-    desc |= (1llu << 62);
+    // bits 62-63: swizzle mode (1 = 128b swizzle with 32b atomicity)
+    desc |= (1llu << 61);
     return desc;
 }
 
@@ -119,6 +118,8 @@ __forceinline__ __device__ void initialize_barriers(uint64_t *mbar, const bool i
     for (int iter = 0; iter < num_barriers; ++iter) {
         mbarrier_init(&mbar[iter], THREADS_PER_BLOCK);
     }
+
+    // explicit fence to make mbar init (generic proxy) visible to async proxy (TMA)
     asm volatile("fence.proxy.async.shared::cta;");
   }
 }
@@ -227,6 +228,42 @@ __device__ __forceinline__ void tcgen05_alloc(uint32_t tmem_addr) {
     );
 }
 
+
+template <int MMA_M, int MMA_N>
+__device__ __forceinline__ void tcgen05_idesc() {
+    // create idesc
+    // from PTX docs: "The 32-bit register operand idesc is the instruction descriptor as described in 
+    //   Instruction descriptor, specifies the shapes, exact types, sparsity and other details of the 
+    //   input matrices, output matrix and the matrix multiply and accumulate operation."
+    // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instruction-descriptor
+    uint32_t idesc = 0;
+    idesc |= (1 << 4);              // fp32 output matrix D
+    idesc |= (1 << 7);              // bf16 input matrix A
+    idesc |= (1 << 10);             // bf16 input matrix B
+    idesc |= (MMA_N >> 3) << 17;    // N dim of matrix B
+    idesc |= (MMA_M >> 4) << 24;    // M dim of matrix A
+    return idesc;
+}
+
+__device__ __forceinline__ void tcgen05_mma(
+    uint64_t smem_a_desc,
+    uint64_t smem_b_desc,
+    int tmem_accum_addr,
+    uint32_t idesc
+) {
+    // tcgen05.mma.cta_group.kind   [d-tmem],  a-desc,  b-desc, idesc, { disable-output-lane }, enable-input-d {, scale-input-d};
+    // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-instructions-mma
+    asm volatile(
+        "{\n\t"
+        ".reg .pred p;\n\t"     // declare predicate register for enable-input-d
+        "mov.pred p, 0;\n\t"    // disable since we are just doing "D=A@B" not "D=A@B+D"
+        "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n"
+        "}"
+        :
+        : "r"(tmem_accum_addr), "l"(smem_a_desc), "l"(smem_b_desc), "r"(idesc)
+    );
+}
+
 template<
     int NUM_THREADS,
     int PRODUCER_WARPS,
@@ -235,9 +272,9 @@ template<
     int BM = 128,
     int BN = 128,
     int BK = 16,
-    int WGMMA_M = 64,
-    int WGMMA_N = 16,
-    int WGMMA_K = 16
+    int MMA_M = 64,
+    int MMA_N = 16,
+    int MMA_K = 16
 >
 __global__ void ws_gemm(
     const __grid_constant__ CUtensorMap a_map,
@@ -268,11 +305,11 @@ __global__ void ws_gemm(
     // 1 warp must do the allocation, from PTX docs:
     // "When .cta_group::1 is specified, one warp from the CTA must perform the allocation and de-allocation."
     // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-memory-alloc-manage-instructions
-    __shared__ int tmem_addr; 
+    __shared__ int tmem_addr_smem; 
     if (warp_id == 0)
     {
-        // tmem accum 
-       tcgen05_alloc<BN>(tmem_addr);
+        // after this call, we can load tmem_addr from smem -> to register to use.
+       tcgen05_alloc<BN>(tmem_addr_smem);
     }
 
     // make sure mbarriers and tmem addr are visible to full threadblock
@@ -342,15 +379,18 @@ __global__ void ws_gemm(
         // see: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-register-fragment-wgmma-64n16
         constexpr int CONSUMER_WARPGROUPS = CONSUMER_WARPS / 4;
         constexpr int ROWS_PER_WARPGROUP = BM / CONSUMER_WARPGROUPS;
-        constexpr int m_iters = ROWS_PER_WARPGROUP/WGMMA_M;     // each wg covers 64 rows of output *per wgmma iter along BM*
-        constexpr int n_iters = BN/WGMMA_N;                     // each wg covers N cols of output *per wgmma iter along BN*
+        constexpr int m_iters = ROWS_PER_WARPGROUP/MMA_M;     // each wg covers 64 rows of output *per wgmma iter along BM*
+        constexpr int n_iters = BN/MMA_N;                     // each wg covers N cols of output *per wgmma iter along BN*
 
         // each wgmma distributes 64xN outputs across the 128 threads in the warpgroup.
         // every thread always holds 8 values, which are spread across 16 columns of
         // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#wgmma-64n16-d
-        float accum[m_iters][n_iters][WGMMA_N/16][8] = {0};         // each thread in wg has 8 registers of accum output
+        float accum[m_iters][n_iters][MMA_N/16][8] = {0};         // each thread in wg has 8 registers of accum output
         static_assert(sizeof(accum) * (CONSUMER_WARPS * 32) == BM * BN * sizeof(float));
 
+        // make tcgen05 mma instruction descriptor, to be re-used at every iter of the loop
+        uint32_t idesc = tcgen05_idesc<MMA_M, MMA_N>();
+        int tmem_addr = tmem_addr_smem; // read tmem accum addr from smem
         const int num_bk_tiles = (K + BK - 1) / BK;
         #pragma unroll
         for (int bk_tile_idx = 0; bk_tile_idx < num_bk_tiles; bk_tile_idx++) {
@@ -366,26 +406,21 @@ __global__ void ws_gemm(
             // async wgmma for every subtile in the smem.
             // warpgroups are arranged vertically and iterate horizontally over BN
             const int wg_row = threadIdx.x / 128;
-            const int k_iters = BK / WGMMA_K;
+            const int k_iters = BK / MMA_K;
             for (int m_tile_idx = 0; m_tile_idx < m_iters; m_tile_idx++) {
-                const int smem_a_row = wg_row * ROWS_PER_WARPGROUP + m_tile_idx * WGMMA_M;
+                const int smem_a_row = wg_row * ROWS_PER_WARPGROUP + m_tile_idx * MMA_M;
 
                 for (int k_tile_idx = 0; k_tile_idx < k_iters; k_tile_idx++) {
-                    const int smem_a_col = k_tile_idx * WGMMA_K;
+                    const int smem_a_col = k_tile_idx * MMA_K;
                     void* smem_tile_a = (void*)&sA[read_buf_idx][smem_a_row * BK + smem_a_col];
                     uint64_t smem_a_desc = make_smem_desc<BK>((void*)smem_tile_a);
 
                     for (int n_tile_idx = 0; n_tile_idx < n_iters; n_tile_idx++) {
-                        const int smem_b_row = k_tile_idx * WGMMA_K;
-                        const int smem_b_col = n_tile_idx * WGMMA_N;
+                        const int smem_b_row = k_tile_idx * MMA_K;
+                        const int smem_b_col = n_tile_idx * MMA_N;
                         void* smem_tile_b = (void*)&sB[read_buf_idx][smem_b_row + smem_b_col * BK];
                         uint64_t smem_b_desc = make_smem_desc<BK>((void*)smem_tile_b);
-                        if constexpr (WGMMA_N == 16)
-                            wgmma_m64n16k16<1,1,1,0,0>(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
-                        else if constexpr (WGMMA_N == 128)
-                            wgmma_m64n128k16<1,1,1,0,0>(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
-                        else if constexpr (WGMMA_N == 256)
-                            wgmma_n64n256k16<1,1,1,0,0>(smem_a_desc, smem_b_desc, accum[m_tile_idx][n_tile_idx]);
+                        tcgen05_mma(smem_a_desc, smem_b_desc, tmem_addr, idesc);
                     }
                 }
             }
@@ -400,10 +435,10 @@ __global__ void ws_gemm(
         }
 
         // accum register layout is confusing: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-register-fragment-wgmma-64n16
-        // each warp in the warpgroup computes WGMMA_M/4 rows.
+        // each warp in the warpgroup computes MMA_M/4 rows.
         // each consecutive 4 lanes share the same row.
         // threads in groups of 4, each holding 2 registers of contiguous output memory
-        constexpr int rows_per_warp = WGMMA_M / 4;
+        constexpr int rows_per_warp = MMA_M / 4;
         const int wg_row = threadIdx.x/ 128;
         const int consumer_warp_id = threadIdx.x / 32;
         const int warp_idx_in_wg = consumer_warp_id % 4;
@@ -420,12 +455,12 @@ __global__ void ws_gemm(
         // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#wgmma-64n16-d
         #pragma unroll
         for (int m_tile_idx = 0; m_tile_idx < m_iters; m_tile_idx++) {
-            int row = c_base_row + (wg_row * ROWS_PER_WARPGROUP) + (m_tile_idx * WGMMA_M) + thread_row_c;
+            int row = c_base_row + (wg_row * ROWS_PER_WARPGROUP) + (m_tile_idx * MMA_M) + thread_row_c;
             #pragma unroll
             for (int n_tile_idx = 0; n_tile_idx < n_iters; n_tile_idx++) {
                 #pragma unroll
-                for (int wn = 0; wn < WGMMA_N/16; wn++) {
-                    int col = c_base_col + (n_tile_idx * WGMMA_N) + wn*16 + thread_col_c;
+                for (int wn = 0; wn < MMA_N/16; wn++) {
+                    int col = c_base_col + (n_tile_idx * MMA_N) + wn*16 + thread_col_c;
                     // Bounds check to avoid invalid global writes
                     if (row < M && col + 1 < N) {
                         C[row * N + col + 0] = accum[m_tile_idx][n_tile_idx][wn][0];
@@ -450,9 +485,9 @@ __global__ void ws_gemm(
 }
 
 extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
-    constexpr int WGMMA_M = 64;
-    constexpr int WGMMA_N = 256;
-    constexpr int WGMMA_K = 16;
+    constexpr int MMA_M = 64;
+    constexpr int MMA_N = 256;
+    constexpr int MMA_K = 16;
     auto ceil_div = [](int x, int y) {
         return (x + y - 1) / y;
     };
@@ -461,9 +496,9 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     constexpr int BM = 64;
     constexpr int BN = 256;
     constexpr int BK = 64;
-    assert(BM >= WGMMA_M && BM % WGMMA_M == 0);
-    assert(BN >= WGMMA_N && BN % WGMMA_N == 0);
-    assert(BK >= WGMMA_K && BK % WGMMA_K == 0);
+    assert(BM >= MMA_M && BM % MMA_M == 0);
+    assert(BN >= MMA_N && BN % MMA_N == 0);
+    assert(BK >= MMA_K && BK % MMA_K == 0);
 
     alignas(64) CUtensorMap a_map = {};
     alignas(64) CUtensorMap b_map = {};
@@ -495,6 +530,6 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     dim3 block_dim(NUM_THREADS);
     dim3 grid_dim(ceil_div(N, BN), ceil_div(M, BM));
 
-    auto kernel = ws_gemm<NUM_THREADS, PRODUCER_WARPS, CONSUMER_WARPS, QUEUE_SIZE, BM, BN, BK, WGMMA_M, WGMMA_N, WGMMA_K>;
+    auto kernel = ws_gemm<NUM_THREADS, PRODUCER_WARPS, CONSUMER_WARPS, QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K>;
     kernel<<<grid_dim, block_dim>>>(a_map, b_map, c_ptr, M, N, K);
 }
