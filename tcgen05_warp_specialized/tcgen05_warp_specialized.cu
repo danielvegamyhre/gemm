@@ -36,20 +36,19 @@ inline void* get_driver_ptr() {
     return driver_ptr;
 }
 
-void create_2d_tensor_map(
+
+void create_3d_tensor_map(
     void* tensor_ptr,
     CUtensorMap& tensor_map,
-    const uint64_t global_height,
-    const uint64_t global_width,
-    const uint32_t smem_height,
-    const uint32_t smem_width,
-    const uint32_t stride_bytes
+    const uint64_t global_dims[3],
+    const uint32_t smem_dims[3],
+    const uint32_t stride_bytes[2]
 ) {
-    constexpr uint32_t rank = 2;
-    uint64_t size[rank] = {global_width, global_height};
-    uint64_t stride[rank - 1] = {stride_bytes};
-    uint32_t box_size[rank] = {smem_width, smem_height};
-    uint32_t elem_stride[rank] = {1, 1};
+    constexpr uint32_t rank = 3;
+    uint64_t size[rank] = {global_dims[0], global_dims[1], global_dims[2]};
+    uint64_t stride[rank - 1] = {stride_bytes[0], stride_bytes[1]};
+    uint32_t box_size[rank] = {smem_dims[0], smem_dims[1], smem_dims[2]};
+    uint32_t elem_stride[rank] = {1, 1, 1};
 
     void *driver_ptr = get_driver_ptr();
     auto cuTensorMapEncodeTiled = reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(driver_ptr);
@@ -165,6 +164,31 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t *mbar, const 
 }
 
 
+__device__ __forceinline__ void cp_async_bulk_tensor_3d_global_to_shared(
+    uint64_t *dst_shmem,
+    const uint64_t *tensor_map_ptr,
+    const uint32_t offset_x,
+    const uint32_t offset_y,
+    const uint32_t offset_z,
+    uint64_t *mbar
+) {
+  uint32_t dst_shmem_ptr = __cvta_generic_to_shared(dst_shmem);
+  uint32_t mbar_ptr = __cvta_generic_to_shared(mbar);    
+    asm volatile(
+        "cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes "
+        "[%0], [%1, {%2, %3, %4}], [%5];"
+        :
+        :
+        "r"(dst_shmem_ptr),
+        "l"(tensor_map_ptr),
+        "r"(offset_x),
+        "r"(offset_y),
+        "r"(offset_z),
+        "r"(mbar_ptr)
+        : "memory"
+    );
+}
+
 // async tma load from gmem to smem
 __device__ __forceinline__ void cp_async_bulk_tensor_2d_global_to_shared(
     uint64_t *dst_shmem,
@@ -202,18 +226,16 @@ __device__ __forceinline__ void tcgen05_alloc(int* tmem_addr_smem) {
 }
 
 template <int BN>
-__device__ __forceinline__ void tcgen05_dealloc(int* tmem_addr_smem) {
-    // convert to shared addr
-    const int addr = static_cast<int>(__cvta_generic_to_shared(tmem_addr_smem));
+__device__ __forceinline__ void tcgen05_dealloc(int tmem_addr_reg) {
     asm volatile(
         "tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
         : // no outputs
-        : "r"(addr), "r"(BN) // inputs
+        : "r"(tmem_addr_reg), "r"(BN) // inputs
     );    
 }
 
 template <int MMA_M, int MMA_N>
-__device__ __forceinline__ void tcgen05_encode_idesc(uint32_t idesc) {
+__device__ __forceinline__ void tcgen05_encode_idesc(uint32_t& idesc) {
     // create idesc
     // from PTX docs: "The 32-bit register operand idesc is the instruction descriptor as described in 
     //   Instruction descriptor, specifies the shapes, exact types, sparsity and other details of the 
@@ -323,15 +345,40 @@ __global__ void ws_gemm(
     const int is_master_thread = threadIdx.x == 128; // 4 epilogue warps -> 1 producer warp -> 1 consumer warp
     const int warp_id = threadIdx.x / 32;
 
-    // init smem queue buffers
-    __shared__ __align__(128) __nv_bfloat16 sA[QUEUE_SIZE][BM * BK];
-    __shared__ __align__(128) __nv_bfloat16 sB[QUEUE_SIZE][BN * BK];  // TMA loads (BN x BK) with K contiguous
+    // init smem buffer, 1024 alignment for 128b swizzle
+    extern __shared__ __align__(1024) __nv_bfloat16 smem_buffer[];
 
-    // init mbarriers
-    __shared__ __align__(8) uint64_t smem_full_mbar[QUEUE_SIZE];    // for signaling buffer in queue is full/ready 
-    __shared__ __align__(8) uint64_t smem_empty_mbar[QUEUE_SIZE];   // for signaling buffer in queue has been read/can be re-used
-    __shared__ __align__(8) uint64_t mma_mbar;                      // for signaling tcgen05.mma batch is done
-    __shared__ __align__(8) uint64_t tmem_full_mbar;                // for mma warp to signal TMEM buffer is ready
+    constexpr int SMEM_A_SIZE = QUEUE_SIZE * BM * BK * sizeof(__nv_bfloat16);
+    constexpr int SMEM_B_SIZE = QUEUE_SIZE * BN * BK * sizeof(__nv_bfloat16);
+    constexpr int SMEM_FULL_MBAR_SIZE = QUEUE_SIZE * sizeof(uint64_t);
+    constexpr int SMEM_EMPTY_MBAR_SIZE = QUEUE_SIZE * sizeof(uint64_t);
+    constexpr int SMEM_MMA_MBAR_SIZE = 1 * sizeof(uint64_t);
+    constexpr int SMEM_TMEM_MBAR_SIZE = 1 * sizeof(uint64_t);
+
+    constexpr int SMEM_B_OFFSET = SMEM_A_SIZE;
+    constexpr int SMEM_FULL_MBAR_OFFSET = SMEM_B_OFFSET + SMEM_B_SIZE;
+    constexpr int SMEM_EMPTY_MBAR_OFFSET = SMEM_FULL_MBAR_OFFSET + SMEM_FULL_MBAR_SIZE;
+    constexpr int SMEM_MMA_MBAR_OFFSET = SMEM_EMPTY_MBAR_OFFSET + SMEM_EMPTY_MBAR_SIZE;
+    constexpr int SMEM_TMEM_MBAR_OFFSET = SMEM_MMA_MBAR_OFFSET + SMEM_MMA_MBAR_SIZE;
+    constexpr int SMEM_TMEM_ADDR_OFFSET = SMEM_TMEM_MBAR_OFFSET + SMEM_TMEM_MBAR_SIZE;
+
+    auto* sA = reinterpret_cast<__nv_bfloat16*[BM*BK]>(smem_buffer);
+    auto* sB = reinterpret_cast<__nv_bfloat16*[BN*BK]>(smem_buffer + SMEM_A_SIZE);
+
+     // for signaling buffer in queue is full/ready 
+    auto* smem_full_mbar = reinterpret_cast<uint64_t*>(smem_buffer + SMEM_FULL_MBAR_OFFSET);
+
+    // for signaling buffer in queue has been read/can be re-used
+    auto* smem_empty_mbar = reinterpret_cast<uint64_t*>(smem_buffer + SMEM_EMPTY_MBAR_OFFSET);
+
+    // for signaling tcgen05.mma batch is done
+    auto* mma_mbar = reinterpret_cast<uint64_t*>(smem_buffer + SMEM_MMA_MBAR_OFFSET);
+
+    // for mma warp to signal TMEM buffer is ready
+    auto* tmem_full_mbar = reinterpret_cast<uint64_t*>(smem_buffer + SMEM_TMEM_MBAR_OFFSET);
+
+    // for holding tmem addr in smem
+    auto* tmem_addr_smem = reinterpret_cast<int*>(smem_buffer + SMEM_TMEM_ADDR_OFFSET);
 
     initialize_barriers<QUEUE_SIZE, 1>(smem_full_mbar, is_master_thread);   // 1 thread issues tma and arrive + expect tx
     initialize_barriers<QUEUE_SIZE, 1>(smem_empty_mbar, is_master_thread);  // 1 mma-issuing/waiting thread arrives when smem buffer can be re-used
@@ -358,25 +405,25 @@ __global__ void ws_gemm(
     // make sure mbarriers and tmem addr are visible to full threadblock
     __syncthreads();
 
+    // read tmem addr from smem -> register
+    int tmem_addr_reg = tmem_addr_smem[0];
+
     // prologue: prefetch first A/B tiles into first SMEM buffer
     int tma_buf_idx = 0;
     int mma_buf_idx = 0;
-    int ep_buf_idx = 0;
 
     constexpr int PRODUCER_WARP_ID = 4, CONSUMER_WARP_ID = 5;
 
     // producer 
     if (warp_id == PRODUCER_WARP_ID)
     {
-        int a_global_row = block_row * BM;
-        int b_global_col = block_col * BN;
+        int global_m_off = block_row * BM;
+        int global_n_off = block_col * BN;
         constexpr int num_bytes_a = BM * BK * 2; // 2 bytes per bf16
         constexpr int num_bytes_b = BK * BN * 2;
-        const int num_k_tiles = (K + BK - 1) / BK;
-        for (int block_k_idx = 0; block_k_idx < num_k_tiles; block_k_idx++) {
-            int a_global_col = block_k_idx * BK;
-            int b_global_row = block_k_idx * BK;
+        const int num_blocks_k = (K + BK - 1) / BK;
 
+        for (int block_k_idx = 0; block_k_idx < num_blocks_k; block_k_idx++) {
             // once we loop around to beginning of circular buffer for the first time,
             // we need to start waiing for consumer to finish reading from target buffer
             if (block_k_idx >= QUEUE_SIZE)
@@ -388,18 +435,21 @@ __global__ void ws_gemm(
             // tma loads for next A/B tiles
             if (is_master_thread)
             {
-                cp_async_bulk_tensor_2d_global_to_shared(
+                int global_k_off = block_k_idx * BK;
+                cp_async_bulk_tensor_3d_global_to_shared(
                     reinterpret_cast<uint64_t*>(&sA[tma_buf_idx][0]),
                     reinterpret_cast<const uint64_t*>(&a_map),
-                    (uint32_t)a_global_col,
-                    (uint32_t)a_global_row,
+                    0,                          // x (64 dim)
+                    (uint32_t)global_m_off,     // y (M dim)
+                    (uint32_t)global_k_off/64,  // z (K/64 dim)
                     (uint64_t*)&smem_full_mbar[tma_buf_idx]
                 );
-                cp_async_bulk_tensor_2d_global_to_shared(
+                cp_async_bulk_tensor_3d_global_to_shared(
                     reinterpret_cast<uint64_t*>(&sB[tma_buf_idx][0]),
                     reinterpret_cast<const uint64_t*>(&b_map),
-                    (uint32_t)b_global_row, // swapped for col major
-                    (uint32_t)b_global_col, // swapped for col major
+                    0,                          // x (64 dim)
+                    (uint32_t)global_n_off,     // y (N dim)
+                    (uint32_t)global_k_off/64,  // z (K/64 dim)
                     (uint64_t*)&smem_full_mbar[tma_buf_idx]
                 );
                 mbarrier_arrive_expect_tx(&smem_full_mbar[tma_buf_idx], num_bytes_a + num_bytes_b);
@@ -416,9 +466,7 @@ __global__ void ws_gemm(
             // make tcgen05 mma instruction descriptor, to be re-used at every iter of the loop
             uint32_t idesc = 0;
             tcgen05_encode_idesc<MMA_M, MMA_N>(idesc);
-
-            // read tmem addr from smem -> register
-            int tmem_buff_addr = tmem_addr_smem[0];
+            printf("idesc: %d\n", idesc);
 
             const int num_blocks_k = (K + BK - 1) / BK;
             constexpr int mma_tiles_per_block = BK / MMA_K;
@@ -438,7 +486,7 @@ __global__ void ws_gemm(
                     void* smem_tile_b = (void*)&sB[mma_buf_idx][smem_k_off];
                     uint64_t smem_b_desc = make_smem_desc<BK>((void*)smem_tile_b);
 
-                    tcgen05_mma(smem_a_desc, smem_b_desc, tmem_buff_addr, idesc);
+                    tcgen05_mma(smem_a_desc, smem_b_desc, tmem_addr_reg, idesc);
                 }
 
                 // signal to producer/TMA warp this smem buffer can be re-used
@@ -464,17 +512,16 @@ __global__ void ws_gemm(
         int ep_warp_id = (threadIdx.x / 32);
         int lane_id = threadIdx.x % 32;
 
-        // read tmem addr from smem -> register
-        int tmem_buff_addr = tmem_addr_smem[0];
-
         // wait for mmas to complete for this buffer idx
         mbarrier_wait_parity(&tmem_full_mbar, tmem_full_parity);
         tmem_full_parity ^= 1;
 
+        asm volatile("tcgen05.fence::after_thread_sync;");
+
         // now each warp in the epilogue warpgroup reads 32 cols from TMEM to registers,
         // for a full 128x64 tile of floats. 
         float c_reg[32];
-        tcgen05_ld<BN>(tmem_buff_addr, ep_warp_id, c_reg);
+        tcgen05_ld<BN>(tmem_addr_reg, ep_warp_id, c_reg);
 
         // vectorized but uncoalesced writes to gmem, improve later.
         // each thread writes 16 bytes per iteration.
@@ -482,14 +529,14 @@ __global__ void ws_gemm(
         int c_col = block_col * BN;
         int num_iters = 32 / 16;
         for (int iter = 0; iter < num_iters; iter++) {
-            *reinterpret_cast<float4*>(C + c_row * N + c_col) = *reinterpret_cast<float4*>(&c_reg[iter * 16]);
+            *reinterpret_cast<float4*>(C + c_row * N + c_col + iter * 16) = *reinterpret_cast<float4*>(&c_reg[iter * 16]);
         }
     }
 
     // tmem deallocation
     if (warp_id == 0) 
     {
-        tcgen05_dealloc<BN>(tmem_addr_smem);
+        tcgen05_dealloc<BN>(tmem_addr_reg);
     }
 }
 
@@ -497,7 +544,7 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     // dims for smem tiles
     constexpr int BM = 128;
     constexpr int BN = 128;
-    constexpr int BK = 32;
+    constexpr int BK = 64;
 
     // dims for tcgen05.mma
     constexpr int MMA_M = 128;
@@ -511,24 +558,33 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     alignas(64) CUtensorMap a_map = {};
     alignas(64) CUtensorMap b_map = {};
 
-    create_2d_tensor_map(
+
+    // BM, BK
+    // BM, BK/64, 64 -> (64 elems = 128 bytes of bf16)
+    // BK/64, BM, 64 -> BK/64 instances of BM,64 strips
+    uint64_t a_global_dims[3] = {64, (uint64_t)M, (uint64_t)(K / 64)};
+    uint32_t a_smem_dims[3] = {64, BM, BK / 64};
+    uint32_t a_strides[2] = {(uint32_t)(K * sizeof(__nv_bfloat16)), 64 * sizeof(__nv_bfloat16)};
+    create_3d_tensor_map(
         A,
         a_map,
-        M,
-        K,
-        BM,
-        BK,
-        K * sizeof(__nv_bfloat16) // row major stride for (M,K) shape
+        a_global_dims,
+        a_smem_dims,
+        a_strides
     );
 
-    create_2d_tensor_map(
+    // BK, BN
+    // 64, BK/64, BN
+    // 64, BN, BK/64 -> BK/64 instances of BN,64 strips
+    uint64_t b_global_dims[3] = {64, (uint64_t)N, (uint64_t)(K / 64)};
+    uint32_t b_smem_dims[3] = {64, BN, BK / 64};
+    uint32_t b_strides[2] = {(uint32_t)(K * sizeof(__nv_bfloat16)), 64 * sizeof(__nv_bfloat16)};
+    create_3d_tensor_map(
         B,
         b_map,
-        N,
-        K,
-        BN,
-        BK,
-        K * sizeof(__nv_bfloat16) // col major stride for (K,N) shape
+        b_global_dims,
+        b_smem_dims,
+        b_strides
     );
 
     float* c_ptr = reinterpret_cast<float*>(C);
@@ -552,5 +608,17 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     dim3 grid_dim(ceil_div(N, BN), ceil_div(M, BM));
 
     auto kernel = ws_gemm<NUM_THREADS, QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K>;
+
+    // increase max smem
+    constexpr int smem_a_size = QUEUE_SIZE * BM * BK * sizeof(__nv_bfloat16);
+    constexpr int smem_b_size = QUEUE_SIZE * BN * BK * sizeof(__nv_bfloat16);
+    constexpr int smem_mbar_size = (QUEUE_SIZE * 2 + 2) * sizeof(uint64_t);
+    constexpr int total_smem = smem_a_size + smem_b_size + smem_mbar_size;
+    CUDA_CHECK(cudaFuncSetAttribute(
+        kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        total_smem
+    ));
+
     kernel<<<grid_dim, block_dim>>>(a_map, b_map, c_ptr, M, N, K);
 }
