@@ -436,7 +436,7 @@ __global__ void ws_gemm(
                         uint64_t smem_a_desc = make_smem_desc(smem_buff_a + a_k_off);
                         uint64_t smem_b_desc = make_smem_desc(smem_buff_b + b_k_off);
 
-                        int enable_accum = (bk_chunk == 0 && mma_iter == 0) ? 0 : 1;
+                        int enable_accum = (block_k_idx == 0 && bk_chunk == 0 && mma_iter == 0) ? 0 : 1;
                         tcgen05_mma(smem_a_desc, smem_b_desc, tmem_addr_reg, idesc, enable_accum);
                     }
                 }
@@ -487,7 +487,8 @@ __global__ void ws_gemm(
         }
     }
 
-    // tmem deallocation
+    // tmem deallocation after all threads finished
+    __syncthreads();
     if (warp_id == 0) 
     {
         tcgen05_dealloc<BN>(tmem_addr_reg);
