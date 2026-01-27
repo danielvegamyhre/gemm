@@ -5,7 +5,7 @@ from triton.testing import do_bench
 custom_gemm = load(
     name='tcgen05_warp_specialized',
     sources=['tcgen05_warp_specialized.cpp', 'tcgen05_warp_specialized.cu'],
-    extra_cuda_cflags=['-O3', '--use_fast_math', '-gencode=arch=compute_90a,code=sm_90a'],
+    extra_cuda_cflags=['-O3', '--use_fast_math', '-gencode=arch=compute_100a,code=sm_100a'],
     extra_cflags=['-O3'],
     verbose=False
 )

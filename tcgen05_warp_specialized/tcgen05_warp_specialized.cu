@@ -77,22 +77,24 @@ __device__ uint64_t matrix_desc_encode(uint64_t x) {
 }
 
 // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-shared-memory-descriptor
-template <int BK>
 __device__ uint64_t make_smem_desc(uint32_t smem_shared_addr) {
 
     // bits 0-13: matrix_desc_encode(matrix addr)
     uint64_t desc = matrix_desc_encode(smem_shared_addr);
 
     // bits 16-29: matrix_desc_encode(leading dim byte offset)
-    // ignored for swizzled layout
+    // implied to be 1 for swizzled layouts, see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-leading-dimension-byte-offset
 
     // bits 32-45: matrix_desc_encode(stride dim byte offset)
     // SBO (stride byte offset) is stride between rows of swizzle atoms which are (8x64 matrix of bf16 in this 128b swizzle setup)
     uint64_t SBO = 8 * 64 * sizeof(__nv_bfloat16);
     desc |= (matrix_desc_encode(SBO) << 32);
 
+    // bits 46-49: fixed value of 0b001
+    desc |= (1ULL << 46ULL);
+
     // bits 61-63: swizzle mode (2 = 128b swizzle)
-    desc |= (2llu << 61);
+    desc |= (2ULL << 61ULL);
     return desc;
 }
 
@@ -217,7 +219,6 @@ __device__ __forceinline__ void tcgen05_encode_idesc(uint32_t& idesc) {
     idesc |= (1 << 4);              // fp32 output matrix D
     idesc |= (1 << 7);              // bf16 input matrix A
     idesc |= (1 << 10);             // bf16 input matrix B
-    idesc |= (1 << 16);             // B matrix is tranposed (N major)
     idesc |= (MMA_N >> 3) << 17;    // N dim of matrix B
     idesc |= (MMA_M >> 4) << 24;    // M dim of matrix A
 }
@@ -226,18 +227,19 @@ __device__ __forceinline__ void tcgen05_mma(
     uint64_t smem_a_desc,
     uint64_t smem_b_desc,
     int tmem_accum_addr,
-    uint32_t idesc
+    uint32_t idesc,
+    int enable_accum
 ) {
     // tcgen05.mma.cta_group.kind   [d-tmem],  a-desc,  b-desc, idesc, { disable-output-lane }, enable-input-d {, scale-input-d};
     // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-instructions-mma
     asm volatile(
         "{\n\t"
-        ".reg .pred p;\n\t"     // declare predicate register for enable-input-d
-        "mov.pred p, 0;\n\t"    // disable since we are just doing "D=A@B" not "D=A@B+D"
+        ".reg .pred p;\n\t"              // declare predicate register for enable-input-d
+        "setp.ne.s32 p, %4, 0;\n\t"      // p = 0 for mma tile 0, then 1 after
         "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n"
         "}"
         :
-        : "r"(tmem_accum_addr), "l"(smem_a_desc), "l"(smem_b_desc), "r"(idesc)
+        : "r"(tmem_accum_addr), "l"(smem_a_desc), "l"(smem_b_desc), "r"(idesc), "r"(enable_accum)
     );
 }
 
@@ -256,40 +258,26 @@ __device__ __forceinline__ void tcgen05_commit(uint64_t* mbar_ptr) {
 // All the columns of the Tensor Memory can be accessed by all the four warps of a warpgroup."
 // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-tensor-memory-ld-st
 // 
-template <int BN>
-__device__ __forceinline__ void tcgen05_ld(int tmem_base_addr_reg, int ep_warp_id, float c_reg[32]) {
+__device__ __forceinline__ void tcgen05_ld(int tmem_base_addr_reg, int ep_warp_id, float c_reg[4], int base_col) {
     // warp 0 can access lanes 0-31
     // warp 1 can access lanes 32-63
     // warp 2 can access lanes 64-95
     // warp 3 can access lanes 96-128
     int row = ep_warp_id * 32;
-    int col = 0;
 
     // TMEM address is 32bit and composed of 2 components:
     // - bits 0-15: column index
     // - bits 16-31: row index
     // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tensor-memory-addressing
-    int tmem_addr = tmem_base_addr_reg + (row << 16) + col;
+    int tmem_addr = tmem_base_addr_reg + (row << 16) + base_col;
 
-    // - each warp will read 32 rows x 32b (8 bytes, 4 bf16 elem). this is the easiest data movement shape to work with
-    //   given our MMA_M is 128, which evenly divides into 32 rows per warp in the warpgroup.
-    // - BN is 128, so 128 elem / 4 elems per 8b load = 32 loads. We can use .num=x32 to do this with one instruction.
-    // - matrix fragment layout docs: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-matrix-fragments-shape-3232b
+    // with .x4, the warp loads 32 rows × 4 columns, where each lane gets 4 floats in register memory.
+    // see: matrix fragment layout docs: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-matrix-fragments-shape-3232b
     asm volatile(
-        "tcgen05.ld.sync.aligned.32x32b.x32.b32 {"
-        "%0, %1, %2, %3, %4, %5, %6, %7, "
-        "%8, %9, %10, %11, %12, %13, %14, %15, "
-        "%16, %17, %18, %19, %20, %21, %22, %23, "
-        "%24, %25, %26, %27, %28, %29, %30, %31"
-        "}, [%32];"
-        :   "=f"(c_reg[0]), "=f"(c_reg[1]), "=f"(c_reg[2]), "=f"(c_reg[3]),
-            "=f"(c_reg[4]), "=f"(c_reg[5]), "=f"(c_reg[6]), "=f"(c_reg[7]),
-            "=f"(c_reg[8]), "=f"(c_reg[9]), "=f"(c_reg[10]), "=f"(c_reg[11]),
-            "=f"(c_reg[12]), "=f"(c_reg[13]), "=f"(c_reg[14]), "=f"(c_reg[15]),
-            "=f"(c_reg[16]), "=f"(c_reg[17]), "=f"(c_reg[18]), "=f"(c_reg[19]),
-            "=f"(c_reg[20]), "=f"(c_reg[21]), "=f"(c_reg[22]), "=f"(c_reg[23]),
-            "=f"(c_reg[24]), "=f"(c_reg[25]), "=f"(c_reg[26]), "=f"(c_reg[27]),
-            "=f"(c_reg[28]), "=f"(c_reg[29]), "=f"(c_reg[30]), "=f"(c_reg[31])
+        "tcgen05.ld.sync.aligned.32x32b.x4.b32 {"
+        "%0, %1, %2, %3"
+        "}, [%4];"
+        :   "=f"(c_reg[0]), "=f"(c_reg[1]), "=f"(c_reg[2]), "=f"(c_reg[3])
         : "r"(tmem_addr)
     );
     // wait for tmem -> reg load to complete and be visible to thread
@@ -321,6 +309,8 @@ __global__ void ws_gemm(
 
     // init smem buffer, 1024 alignment for 128b swizzle
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
+
+    // convert to shared addr now for easier offset addition with integers, etc
     uint32_t smem = __cvta_generic_to_shared(smem_buffer);
     
     constexpr int SMEM_A_SIZE = BM * BK * sizeof(__nv_bfloat16);
@@ -423,7 +413,6 @@ __global__ void ws_gemm(
             tcgen05_encode_idesc<MMA_M, MMA_N>(idesc);
 
             const int num_blocks_k = (K + BK - 1) / BK;
-            constexpr int mma_tiles_per_block = BK / MMA_K;
             for (int block_k_idx = 0; block_k_idx < num_blocks_k; block_k_idx++) {
 
                 // wait for the tma load to the buffers we are about to read from.
@@ -431,16 +420,25 @@ __global__ void ws_gemm(
                 smem_full_parity[mma_buf_idx] ^= 1;
 
                 // tcgen05 mma for every subtile in the smem.
-                for (int tile_k_idx = 0; tile_k_idx < mma_tiles_per_block; tile_k_idx++) {
-                    const int smem_k_off = tile_k_idx * MMA_K * sizeof(__nv_bfloat16);
+                // 128b swizzle means we iterate through each swizzle atom:
+                // BK/128 byte chunks of (BM,128 bytes) or (BM, 64 elem).
+                // Within each swizzle atom, we iterate through mma tiles
+                for (int bk_chunk = 0; bk_chunk < BK/64; bk_chunk++) {
+                    for (int mma_iter = 0; mma_iter < 64/MMA_K; mma_iter++) {
+                        const int a_chunk_off = bk_chunk * BM * 64 * sizeof(__nv_bfloat16);
+                        const int b_chunk_off = bk_chunk * BN * 64 * sizeof(__nv_bfloat16);
+                        const int a_k_off = a_chunk_off + mma_iter * MMA_K * sizeof(__nv_bfloat16);
+                        const int b_k_off = b_chunk_off + mma_iter * MMA_K * sizeof(__nv_bfloat16);
 
-                    uint32_t smem_buff_a = smem + mma_buf_idx * (SMEM_A_SIZE + SMEM_B_SIZE);
-                    uint32_t smem_buff_b = smem_buff_a + SMEM_A_SIZE;
+                        uint32_t smem_buff_a = smem + mma_buf_idx * (SMEM_A_SIZE + SMEM_B_SIZE);
+                        uint32_t smem_buff_b = smem_buff_a + SMEM_A_SIZE;
 
-                    uint64_t smem_a_desc = make_smem_desc<BK>(smem_buff_a + smem_k_off);
-                    uint64_t smem_b_desc = make_smem_desc<BK>(smem_buff_b + smem_k_off);
+                        uint64_t smem_a_desc = make_smem_desc(smem_buff_a + a_k_off);
+                        uint64_t smem_b_desc = make_smem_desc(smem_buff_b + b_k_off);
 
-                    tcgen05_mma(smem_a_desc, smem_b_desc, tmem_addr_reg, idesc);
+                        int enable_accum = (bk_chunk == 0 && mma_iter == 0) ? 0 : 1;
+                        tcgen05_mma(smem_a_desc, smem_b_desc, tmem_addr_reg, idesc, enable_accum);
+                    }
                 }
 
                 // signal to producer/TMA warp this smem buffer can be re-used
@@ -472,18 +470,20 @@ __global__ void ws_gemm(
 
         asm volatile("tcgen05.fence::after_thread_sync;");
 
-        // now each warp in the epilogue warpgroup reads 32 cols from TMEM to registers,
-        // for a full 128x64 tile of floats. 
-        float c_reg[32];
-        tcgen05_ld<BN>(tmem_addr_reg, ep_warp_id, c_reg);
+        // now each warp in the epilogue warpgroup reads 32 rows of 16 floats per thread. 
+        // these floats are contiguous in the output C.
+        constexpr int COLS_PER_THREAD = 4;
 
-        // vectorized but uncoalesced writes to gmem, improve later.
-        // each thread writes 16 bytes per iteration.
-        int c_row = block_row * BM + ep_warp_id * 32 + lane_id;
-        int c_col = block_col * BN;
-        int num_iters = 32 / 16;
-        for (int iter = 0; iter < num_iters; iter++) {
-            *reinterpret_cast<float4*>(C + c_row * N + c_col + iter * 16) = *reinterpret_cast<float4*>(&c_reg[iter * 16]);
+        #pragma unroll
+        for (int i = 0; i < BN/COLS_PER_THREAD; i++) {
+            float c_reg[COLS_PER_THREAD];
+            const int base_col = i * COLS_PER_THREAD;
+            tcgen05_ld(tmem_addr_reg, ep_warp_id, c_reg, base_col);
+
+            // vectorized but uncoalesced writes to gmem, improve later.
+            const int c_row = block_row * BM + ep_warp_id * 32 + lane_id;
+            const int c_col = block_col * BN + i * COLS_PER_THREAD;
+            *reinterpret_cast<float4*>(C + c_row * N + c_col) = *reinterpret_cast<float4*>(&c_reg);
         }
     }
 
@@ -497,12 +497,12 @@ __global__ void ws_gemm(
 extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     // dims for smem tiles
     constexpr int BM = 128;
-    constexpr int BN = 128;
+    constexpr int BN = 256;
     constexpr int BK = 64;
 
     // dims for tcgen05.mma
     constexpr int MMA_M = 128;
-    constexpr int MMA_N = 128;
+    constexpr int MMA_N = 256;
     constexpr int MMA_K = 16;
 
     assert(BM >= MMA_M && BM % MMA_M == 0);
@@ -547,7 +547,7 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     constexpr int CONSUMER_WARPS = 1;
     constexpr int EPILOGUE_WARPS = 4;
     constexpr int NUM_THREADS = (PRODUCER_WARPS + CONSUMER_WARPS + EPILOGUE_WARPS) * 32;
-    constexpr int QUEUE_SIZE = 2;
+    constexpr int QUEUE_SIZE = 4;
 
     // TMEM is 128x512 cells, each cell is 32 bits / 4 bytes.
     // So check bf16 tmem buffer requirements with 2 bytes per elem is <= tmem col width in bytes.
