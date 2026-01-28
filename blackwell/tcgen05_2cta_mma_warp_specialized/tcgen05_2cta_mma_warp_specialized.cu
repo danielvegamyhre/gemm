@@ -127,7 +127,7 @@ __device__ __forceinline__ bool mbarrier_try_wait_parity(uint32_t mbar_addr, con
   uint32_t wait_complete;
   asm volatile(
     "{\n\t .reg .pred P_OUT; \n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64  P_OUT, [%1], %2; \n\t"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64  P_OUT, [%1], %2; \n\t"
         "selp.b32 %0, 1, 0, P_OUT; \n"
         "}"
         : "=r"(wait_complete)         // outputs
@@ -145,7 +145,7 @@ __device__ __forceinline__ void mbarrier_wait_parity(uint32_t mbar_addr, const u
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-arrive
 __device__ __forceinline__ void mbarrier_arrive(uint32_t mbar_addr) {
   asm volatile(
-        "mbarrier.arrive.release.cluster.b64 _, [%0];"
+        "mbarrier.arrive.release.cluster.shared::cluster.b64 _, [%0];"
         :                   // no outputs
         :"r"(mbar_addr)     // input
         : "memory"
@@ -155,7 +155,7 @@ __device__ __forceinline__ void mbarrier_arrive(uint32_t mbar_addr) {
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-arrive
 __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint32_t mbar_addr, const uint32_t tx_count) {
   asm volatile(
-      "mbarrier.arrive.expect_tx.release.cluster.b64 _, [%0], %1;"
+      "mbarrier.arrive.expect_tx.release.cluster.shared::cluster.b64 _, [%0], %1;"
       :                             // no outputs
       :"r"(mbar_addr), "r"(tx_count) // inputs
       : "memory");
@@ -185,41 +185,40 @@ __device__ __forceinline__ void cp_async_bulk_tensor_3d_global_to_shared(
     );
 }
 
-template <int BN, int CTA_GROUP>
+template <int BN>
 __device__ __forceinline__ void tcgen05_alloc(int* tmem_addr_smem) {
     // convert to shared addr
     const int addr = static_cast<int>(__cvta_generic_to_shared(tmem_addr_smem));
     asm volatile(
-        "tcgen05.alloc.cta_group::%2.sync.aligned.shared::cta.b32 [%0], %1;"
+        "tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;"
         : // no outputs
-        : "r"(addr), "r"(BN), "n"(CTA_GROUP) // inputs
+        : "r"(addr), "r"(BN) // inputs
     );
 }
 
-template <int BN, int CTA_GROUP>
+template <int BN>
 __device__ __forceinline__ void tcgen05_dealloc(int tmem_addr_reg) {
     asm volatile(
-        "tcgen05.dealloc.cta_group::%2.sync.aligned.b32 %0, %1;"
+        "tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;"
         : // no outputs
-        : "r"(tmem_addr_reg), "r"(BN), "n"(CTA_GROUP)
-    );    
+        : "r"(tmem_addr_reg), "r"(BN)
+    );
 }
 
-template <int MMA_M, int MMA_N, int CTA_GROUP>
+template <int MMA_M, int MMA_N>
 __device__ __forceinline__ void tcgen05_encode_idesc(uint32_t& idesc) {
     // create idesc
-    // from PTX docs: "The 32-bit register operand idesc is the instruction descriptor as described in 
-    //   Instruction descriptor, specifies the shapes, exact types, sparsity and other details of the 
+    // from PTX docs: "The 32-bit register operand idesc is the instruction descriptor as described in
+    //   Instruction descriptor, specifies the shapes, exact types, sparsity and other details of the
     //   input matrices, output matrix and the matrix multiply and accumulate operation."
     // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instruction-descriptor
     idesc |= (1 << 4);                          // fp32 output matrix D
     idesc |= (1 << 7);                          // bf16 input matrix A
     idesc |= (1 << 10);                         // bf16 input matrix B
     idesc |= (MMA_N >> 3) << 17;                // N dim of matrix B
-    idesc |= ((CTA_GROUP * MMA_M) >> 4) << 24;  // M dim of matrix A
+    idesc |= ((2 * MMA_M) >> 4) << 24;          // M dim of matrix A (cta_group::2)
 }
 
-template <int CTA_GROUP>
 __device__ __forceinline__ void tcgen05_mma(
     uint64_t smem_a_desc,
     uint64_t smem_b_desc,
@@ -233,22 +232,21 @@ __device__ __forceinline__ void tcgen05_mma(
         "{\n\t"
         ".reg .pred p;\n\t"              // declare predicate register for enable-input-d
         "setp.ne.s32 p, %4, 0;\n\t"      // p = 0 for mma tile 0, then 1 after
-        "tcgen05.mma.cta_group::%5.kind::f16 [%0], %1, %2, %3, p;\n"
+        "tcgen05.mma.cta_group::2.kind::f16 [%0], %1, %2, %3, p;\n"
         "}"
         :
-        : "r"(tmem_accum_addr), "l"(smem_a_desc), "l"(smem_b_desc), "r"(idesc), "r"(enable_accum), "n"(CTA_GROUP)
+        : "r"(tmem_accum_addr), "l"(smem_a_desc), "l"(smem_b_desc), "r"(idesc), "r"(enable_accum)
     );
 }
 
 // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-instructions-mma
-template <int CTA_GROUP>
 __device__ __forceinline__ void tcgen05_commit_multicast(uint32_t mbar_addr, uint16_t cta_mask) {
     asm volatile(
         // tcgen05.commit.cta_group.completion_mechanism{.shared::cluster}{.multicast}.b64
         // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen-async-sync-operations-commit
-        "tcgen05.commit.cta_group::%2.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64 [%0], %1;"
+        "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64 [%0], %1;"
         :
-        : "r"(mbar_addr), "h"(cta_mask), "n"(CTA_GROUP)
+        : "r"(mbar_addr), "h"(cta_mask)
         : "memory"
     );
 }
@@ -301,7 +299,6 @@ __device__ __forceinline__ void cluster_sync() {
 template<
     int NUM_THREADS,
     int QUEUE_SIZE,
-    int CTA_GROUP,
     int BM = 128,
     int BN = 128,
     int BK = 64,
@@ -309,9 +306,9 @@ template<
     int MMA_N = 128,
     int MMA_K = 16
 >
-__global__ 
-__cluster_dims__(2, 1, 1)  // tb cluster for 2 cta mmma
-void ws_gemm(
+__global__
+__cluster_dims__(2, 1, 1)  // tb cluster for 2 cta mma
+void ws_gemm_2cta_mma(
     const __grid_constant__ CUtensorMap a_map,
     const __grid_constant__ CUtensorMap b_map,
     float* C,
@@ -353,18 +350,18 @@ void ws_gemm(
     if (cta_rank == 0)
     {
         // only owner CTA should init mbarriers
-        initialize_barriers<QUEUE_SIZE, 1>(smem_full_mbar, is_master_thread);   // 1 thread issues tma and arrive + expect tx
-        initialize_barriers<QUEUE_SIZE, 1>(smem_empty_mbar, is_master_thread);  // 1 mma-issuing/waiting thread arrives when smem buffer can be re-used
-        initialize_barriers<1, 1>(&mma_mbar, is_master_thread);                 // 1 thread issues mma batch, commit, wait
-        initialize_barriers<1, 1>(&tmem_full_mbar, is_master_thread);           // 1 thread arrives once tmem buff ready
+        initialize_barriers<QUEUE_SIZE, 2>(smem_full_mbar, is_master_thread);   // both CTAs report to CTA 0 mbar
+        initialize_barriers<QUEUE_SIZE, 1>(smem_empty_mbar, is_master_thread);  // each CTA tracks its own "finished using smem buffer" signal
+        initialize_barriers<1, 2>(&mma_mbar, is_master_thread);                 // CTA 0 reports mma completion to both CTAs
+        initialize_barriers<1, 1>(&tmem_full_mbar, is_master_thread);           // each CTA tracks its own tmem buffer ready for storage to gmem
+
+        // CTA 0 maps mma completion mbar to CTA 
+        mma_mbar_addr = map_smem_addr_to_cta_rank(mma_mbar_addr, 0); 
     }
     else
     {
-        // peer CTA (1) maps mbarrier smem base addr to owner CTA (0)
+        // peer CTA (1) maps mbarrier smem_full_mbar base addr to owner CTA (0)
         smem_full_mbar_addr = map_smem_addr_to_cta_rank(smem_full_mbar_addr, 0);
-        smem_empty_mbar_addr = map_smem_addr_to_cta_rank(smem_empty_mbar_addr, 0);
-        mma_mbar_addr = map_smem_addr_to_cta_rank(mma_mbar_addr, 0);
-        tmem_full_mbar_addr = map_smem_addr_to_cta_rank(tmem_full_mbar_addr, 0);
     }
 
     // parity for coordination between tma, mma, epilogue warps
@@ -377,11 +374,11 @@ void ws_gemm(
     // 1 warp must do the allocation, from PTX docs:
     // "When .cta_group::1 is specified, one warp from the CTA must perform the allocation and de-allocation."
     // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-memory-alloc-manage-instructions
-    __shared__ int tmem_addr_smem[1]; 
+    __shared__ int tmem_addr_smem[1];
     if (warp_id == 0)
     {
         // after this call, we can load tmem_addr from smem -> to register to use.
-       tcgen05_alloc<BN, CTA_GROUP>(tmem_addr_smem);
+       tcgen05_alloc<BN>(tmem_addr_smem);
     }
 
     // make sure mbarriers and tmem addr are visible to full cluster
@@ -448,11 +445,11 @@ void ws_gemm(
         // we have: 4 epilogue warps -> producer warp -> consumer warp.
         // choose first thread in consumer warp as master.
         const int is_mma_master_thread = threadIdx.x == (5*32); 
-        if (is_mma_master_thread) 
+        if (is_mma_master_thread)
         {
             // make tcgen05 mma instruction descriptor, to be re-used at every iter of the loop
             uint32_t idesc = 0;
-            tcgen05_encode_idesc<MMA_M, MMA_N, CTA_GROUP>(idesc);
+            tcgen05_encode_idesc<MMA_M, MMA_N>(idesc);
 
             const int num_blocks_k = (K + BK - 1) / BK;
             for (int block_k_idx = 0; block_k_idx < num_blocks_k; block_k_idx++) {
@@ -479,7 +476,7 @@ void ws_gemm(
                         uint64_t smem_b_desc = make_smem_desc(smem_buff_b + b_k_off);
 
                         int enable_accum = (block_k_idx == 0 && bk_chunk == 0 && mma_iter == 0) ? 0 : 1;
-                        tcgen05_mma<CTA_GROUP>(smem_a_desc, smem_b_desc, tmem_addr_reg, idesc, enable_accum);
+                        tcgen05_mma(smem_a_desc, smem_b_desc, tmem_addr_reg, idesc, enable_accum);
                     }
                 }
 
@@ -498,11 +495,11 @@ void ws_gemm(
             //    each bit position in the 16-bit ctaMask operand corresponds to the %ctaid of the destination CTA...
             //    The mbarrier signal is multicasted either to all the odd numbered CTAs or the even numbered CTAs 
             //    within the corresponding CTA-Pair. For each destination CTA specified in the ctaMask, 
-            //    the mbarrier signal is sent either to the destination CTA or its peer-CTA based on 
+            //    the mbarrier signal is sent either to the destination CTA or its peer-CTA based on
             //    CTAs %cluster_ctarank parity of shared memory where the mbarrier object mbar resides."
             // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async-bulk
             uint16_t cta_mask = 0b11; // 1 bit for cta rank 0, 1 bit for cta rank 1
-            tcgen05_commit_multicast<CTA_GROUP>(mma_mbar_addr, cta_mask);
+            tcgen05_commit_multicast(mma_mbar_addr, cta_mask);
 
             // wait for completion of batch of mmas
             mbarrier_wait_parity(mma_mbar_addr, mma_parity);
@@ -543,9 +540,9 @@ void ws_gemm(
     // tmem deallocation after all threads finished using tmem.
     // need cluster wide sync for 2 cta mma
     cluster_sync();
-    if (warp_id == 0) 
+    if (warp_id == 0)
     {
-        tcgen05_dealloc<BN, CTA_GROUP>(tmem_addr_reg);
+        tcgen05_dealloc<BN>(tmem_addr_reg);
     }
 }
 
@@ -603,7 +600,6 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     constexpr int EPILOGUE_WARPS = 4;
     constexpr int NUM_THREADS = (PRODUCER_WARPS + CONSUMER_WARPS + EPILOGUE_WARPS) * 32;
     constexpr int QUEUE_SIZE = 4;
-    constexpr int CTA_GROUP = 2;
 
     // TMEM is 128x512 cells, each cell is 32 bits / 4 bytes.
     // So check bf16 tmem buffer requirements with 2 bytes per elem is <= tmem col width in bytes.
@@ -617,7 +613,7 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     dim3 block_dim(NUM_THREADS);
     dim3 grid_dim(ceil_div(N, BN), ceil_div(M, BM));
 
-    auto kernel = ws_gemm<NUM_THREADS, QUEUE_SIZE, CTA_GROUP, BM, BN, BK, MMA_M, MMA_N, MMA_K>;
+    auto kernel = ws_gemm_2cta_mma<NUM_THREADS, QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K>;
 
     // increase max smem
     constexpr int smem_a_size = QUEUE_SIZE * BM * BK * sizeof(__nv_bfloat16);
