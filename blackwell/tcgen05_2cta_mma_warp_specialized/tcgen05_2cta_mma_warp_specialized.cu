@@ -186,13 +186,12 @@ __device__ __forceinline__ void cp_async_bulk_tensor_3d_global_to_shared(
 }
 
 template <int BN>
-__device__ __forceinline__ void tcgen05_alloc(int* tmem_addr_smem) {
+__device__ __forceinline__ void tcgen05_alloc(uint32_t tmem_addr_smem) {
     // convert to shared addr
-    const int addr = static_cast<int>(__cvta_generic_to_shared(tmem_addr_smem));
     asm volatile(
         "tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;"
         : // no outputs
-        : "r"(addr), "r"(BN) // inputs
+        : "r"(tmem_addr_smem), "r"(BN) // inputs
     );
 }
 
@@ -316,8 +315,23 @@ void ws_gemm_2cta_mma(
     int N,
     int K
 ) {
-    const int block_row = blockIdx.y;
-    const int block_col = blockIdx.x;
+    constexpr int CTA_GROUP_SIZE = 2;
+    const int grid_n = N / BN;
+
+    // thread blocks are arranged in pairs along the M dim (stacked vertically).
+    // first, get our group id
+    const int bid = blockIdx.x;
+    const int group_id = bid / CTA_GROUP_SIZE;
+
+    // group advance along N first (rows of vertically stacked pairs)
+    const int block_col = group_id % grid_n;
+
+    // get M/row coordinate of base block in pair
+    const int base_block_row_bid = (group_id / grid_n) * CTA_GROUP_SIZE;
+
+    // base block row id + (linear block id % BLOCKS PER GROUP) = final block row id
+    const int block_row = base_block_row_bid + (bid % CTA_GROUP_SIZE);
+
     const int is_master_thread = threadIdx.x == 128; // 4 epilogue warps -> 1 producer warp -> 1 consumer warp
     const int warp_id = threadIdx.x / 32;
 
@@ -326,21 +340,31 @@ void ws_gemm_2cta_mma(
 
     // convert to shared addr now for easier offset addition with integers, etc
     uint32_t smem = __cvta_generic_to_shared(smem_buffer);
-    
+   
+    // calculate smem offsets in dynamic shared memory
     constexpr int SMEM_A_SIZE = BM * BK * sizeof(__nv_bfloat16);
-    constexpr int SMEM_B_SIZE = BN * BK * sizeof(__nv_bfloat16);
+    constexpr int SMEM_B_SIZE = (BN / CTA_GROUP_SIZE) * BK * sizeof(__nv_bfloat16);
+    constexpr int SMEM_AB_TOTAL = QUEUE_SIZE * (SMEM_A_SIZE + SMEM_B_SIZE);
+    constexpr int SMEM_FULL_MBAR_OFFSET = SMEM_AB_TOTAL;
+    constexpr int SMEM_EMPTY_MBAR_OFFSET = SMEM_FULL_MBAR_OFFSET + QUEUE_SIZE * sizeof(uint64_t);
+    constexpr int SMEM_MMA_MBAR_OFFSET = SMEM_EMPTY_MBAR_OFFSET + QUEUE_SIZE * sizeof(uint64_t);
+    constexpr int SMEM_TMEM_FULL_MBAR_OFFSET = SMEM_MMA_MBAR_OFFSET + sizeof(uint64_t);
+    constexpr int TMEM_ADDR_OFFSET = SMEM_TMEM_FULL_MBAR_OFFSET + sizeof(uint64_t);
 
-    // init mbarriers
-    __shared__ __align__(8) uint64_t smem_full_mbar[QUEUE_SIZE];    // for signaling buffer in queue is full/ready 
-    __shared__ __align__(8) uint64_t smem_empty_mbar[QUEUE_SIZE];   // for signaling buffer in queue has been read/can be re-used
-    __shared__ __align__(8) uint64_t mma_mbar;                      // for signaling tcgen05.mma batch is done
-    __shared__ __align__(8) uint64_t tmem_full_mbar;                // for mma warp to signal TMEM buffer is ready
+    // get mbar pointers 
+    uint64_t* smem_full_mbar = reinterpret_cast<uint64_t*>(smem_buffer + SMEM_FULL_MBAR_OFFSET);
+    uint64_t* smem_empty_mbar = reinterpret_cast<uint64_t*>(smem_buffer + SMEM_EMPTY_MBAR_OFFSET);
+    uint64_t* mma_mbar = reinterpret_cast<uint64_t*>(smem_buffer + SMEM_MMA_MBAR_OFFSET);
+    uint64_t* tmem_full_mbar = reinterpret_cast<uint64_t*>(smem_buffer + SMEM_TMEM_FULL_MBAR_OFFSET);
 
     // get shared addrs for mbars - used for mapping to peer CTA for DSMEM access
-    int smem_full_mbar_addr = static_cast<int>(__cvta_generic_to_shared((const void*)smem_full_mbar));
-    int smem_empty_mbar_addr = static_cast<int>(__cvta_generic_to_shared((const void*)smem_empty_mbar));
-    int mma_mbar_addr = static_cast<int>(__cvta_generic_to_shared((const void*)mma_mbar));
-    int tmem_full_mbar_addr = static_cast<int>(__cvta_generic_to_shared((const void*)tmem_full_mbar));
+    uint32_t smem_full_mbar_addr = smem + SMEM_FULL_MBAR_OFFSET;
+    uint32_t smem_empty_mbar_addr = smem + SMEM_EMPTY_MBAR_OFFSET;
+    uint32_t mma_mbar_addr = smem + SMEM_MMA_MBAR_OFFSET;
+    uint32_t tmem_full_mbar_addr = smem + SMEM_TMEM_FULL_MBAR_OFFSET;
+
+    // get smem offset for storing the tmem addr
+    uint32_t tmem_addr_smem = smem + TMEM_ADDR_OFFSET;
 
     // get threadblock rank in cluster
     // see: https://github.com/NVIDIA/cutlass/blob/acb45938e9cb3e4db8c1d75155b63d31791e0e5d/include/cute/arch/cluster_sm90.hpp#L158
@@ -352,8 +376,8 @@ void ws_gemm_2cta_mma(
         // only owner CTA should init mbarriers
         initialize_barriers<QUEUE_SIZE, 2>(smem_full_mbar, is_master_thread);   // both CTAs report to CTA 0 mbar
         initialize_barriers<QUEUE_SIZE, 1>(smem_empty_mbar, is_master_thread);  // each CTA tracks its own "finished using smem buffer" signal
-        initialize_barriers<1, 2>(&mma_mbar, is_master_thread);                 // CTA 0 reports mma completion to both CTAs
-        initialize_barriers<1, 1>(&tmem_full_mbar, is_master_thread);           // each CTA tracks its own tmem buffer ready for storage to gmem
+        initialize_barriers<1, 2>(mma_mbar, is_master_thread);                  // CTA 0 reports mma completion to both CTAs
+        initialize_barriers<1, 1>(tmem_full_mbar, is_master_thread);            // each CTA tracks its own tmem buffer ready for storage to gmem
 
         // CTA 0 maps mma completion mbar to CTA 
         mma_mbar_addr = map_smem_addr_to_cta_rank(mma_mbar_addr, 0); 
@@ -374,7 +398,6 @@ void ws_gemm_2cta_mma(
     // 1 warp must do the allocation, from PTX docs:
     // "When .cta_group::1 is specified, one warp from the CTA must perform the allocation and de-allocation."
     // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-memory-alloc-manage-instructions
-    __shared__ int tmem_addr_smem[1];
     if (warp_id == 0)
     {
         // after this call, we can load tmem_addr from smem -> to register to use.
@@ -385,7 +408,7 @@ void ws_gemm_2cta_mma(
     cluster_sync();
 
     // read tmem addr from smem -> register
-    int tmem_addr_reg = tmem_addr_smem[0];
+    int tmem_addr_reg = *reinterpret_cast<int*>(__cvta_shared_to_generic(tmem_addr_smem));
 
     // prologue: prefetch first A/B tiles into first SMEM buffer
     int tma_buf_idx = 0;
@@ -396,8 +419,8 @@ void ws_gemm_2cta_mma(
     // producer 
     if (warp_id == PRODUCER_WARP_ID)
     {
-        int global_m_off = block_row * BM;
-        int global_n_off = block_col * BN;
+        int global_m_off = block_row * BM;                   // for A, each CTA loads BM rows
+        int global_n_off = block_col * BN + cta_rank * BN/2; // for B, each CTA loads BN/2 cols
         constexpr int num_bytes_a = BM * BK * 2; // 2 bytes per bf16
         constexpr int num_bytes_b = BK * BN * 2;
         const int num_blocks_k = (K + BK - 1) / BK;
@@ -415,7 +438,7 @@ void ws_gemm_2cta_mma(
             if (is_master_thread)
             {
                 const uint32_t A_smem = smem + tma_buf_idx * (SMEM_A_SIZE + SMEM_B_SIZE);
-                const uint32_t B_smem = A_smem + SMEM_A_SIZE; 
+                const uint32_t B_smem = A_smem + SMEM_A_SIZE;
                 int global_k_off = block_k_idx * BK;
                 
                 cp_async_bulk_tensor_3d_global_to_shared(
@@ -533,7 +556,11 @@ void ws_gemm_2cta_mma(
             // vectorized but uncoalesced writes to gmem, improve later.
             const int c_row = block_row * BM + ep_warp_id * 32 + lane_id;
             const int c_col = block_col * BN + i * COLS_PER_THREAD;
-            *reinterpret_cast<float4*>(C + c_row * N + c_col) = *reinterpret_cast<float4*>(&c_reg);
+
+            // bounds check for cluster-padded grids
+            if (c_row < M && c_col + 16 < N) {
+                *reinterpret_cast<float4*>(C + c_row * N + c_col) = *reinterpret_cast<float4*>(&c_reg);
+            }
         }
     }
 
@@ -564,12 +591,13 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     alignas(64) CUtensorMap a_map = {};
     alignas(64) CUtensorMap b_map = {};
 
+    constexpr int CTA_GROUP_SIZE = 2;
 
     // BM, BK
     // BM, BK/64, 64 -> (64 elems = 128 bytes of bf16)
     // BK/64, BM, 64 -> BK/64 instances of BM,64 strips
     uint64_t a_global_dims[3] = {64, (uint64_t)M, (uint64_t)(K / 64)};
-    uint32_t a_smem_dims[3] = {64, BM, BK / 64};
+    uint32_t a_smem_dims[3] = {64, BM, BK / 64}; // for 2 CTA mma, each CTA still loads the full BM rows of A into smem
     uint32_t a_strides[2] = {(uint32_t)(K * sizeof(__nv_bfloat16)), 64 * sizeof(__nv_bfloat16)};
     create_3d_tensor_map(
         A,
@@ -583,7 +611,7 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     // 64, BK/64, BN
     // 64, BN, BK/64 -> BK/64 instances of BN,64 strips
     uint64_t b_global_dims[3] = {64, (uint64_t)N, (uint64_t)(K / 64)};
-    uint32_t b_smem_dims[3] = {64, BN, BK / 64};
+    uint32_t b_smem_dims[3] = {64, BN/CTA_GROUP_SIZE, BK / 64}; // for 2 CTA MMA, each CTA loads BN/2 cols of B into smem
     uint32_t b_strides[2] = {(uint32_t)(K * sizeof(__nv_bfloat16)), 64 * sizeof(__nv_bfloat16)};
     create_3d_tensor_map(
         B,
@@ -610,16 +638,23 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
         return (x + y - 1) / y;
     };
 
+    // Round up grid dims to be divisible by cluster dims (2, 1, 1)
+    constexpr int CLUSTER_X = 2, CLUSTER_Y = 1;
+    int grid_x = ceil_div(N, BN);
+    int grid_y = ceil_div(M, BM);
+    int total_blocks = grid_x + grid_y;
+
     dim3 block_dim(NUM_THREADS);
-    dim3 grid_dim(ceil_div(N, BN), ceil_div(M, BM));
+    dim3 grid_dim(total_blocks);
 
     auto kernel = ws_gemm_2cta_mma<NUM_THREADS, QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K>;
 
     // increase max smem
     constexpr int smem_a_size = QUEUE_SIZE * BM * BK * sizeof(__nv_bfloat16);
-    constexpr int smem_b_size = QUEUE_SIZE * BN * BK * sizeof(__nv_bfloat16);
+    constexpr int smem_b_size = QUEUE_SIZE * (BN / CTA_GROUP_SIZE) * BK * sizeof(__nv_bfloat16);
     constexpr int smem_mbar_size = (QUEUE_SIZE * 2 + 2) * sizeof(uint64_t);
-    constexpr int total_smem = smem_a_size + smem_b_size + smem_mbar_size;
+    constexpr int tmem_addr_size = sizeof(int);
+    constexpr int total_smem = smem_a_size + smem_b_size + smem_mbar_size + tmem_addr_size;
     CUDA_CHECK(cudaFuncSetAttribute(
         kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize,

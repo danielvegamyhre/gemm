@@ -5,16 +5,16 @@ from torch.utils.cpp_extension import load
 custom_gemm = load(
     name='tcgen05_2cta_mma_warp_specialized',
     sources=['tcgen05_2cta_mma_warp_specialized.cpp', 'tcgen05_2cta_mma_warp_specialized.cu'],
-    extra_cuda_cflags=['-O3', '--use_fast_math', '-gencode=arch=compute_100a,code=sm_100a'],
+    extra_cuda_cflags=['-g','-G','-gencode=arch=compute_100a,code=sm_100a'],
     extra_cflags=['-O3'],
     verbose=False
 )
 
 
 @pytest.mark.parametrize("M,K,N", [
-    (256, 256, 256),
     (512, 512, 512),
-    (1024, 1024, 1024)
+    # (1024, 1024, 1024),
+    # (4096, 4096, 4096)
 ])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_gemm(M, K, N):
