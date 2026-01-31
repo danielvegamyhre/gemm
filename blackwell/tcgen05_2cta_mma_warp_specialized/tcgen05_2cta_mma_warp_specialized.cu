@@ -215,7 +215,7 @@ __device__ __forceinline__ void tcgen05_encode_idesc(uint32_t& idesc) {
     idesc |= (1 << 7);                          // bf16 input matrix A
     idesc |= (1 << 10);                         // bf16 input matrix B
     idesc |= (MMA_N >> 3) << 17;                // N dim of matrix B
-    idesc |= ((2 * MMA_M) >> 4) << 24;          // M dim of matrix A (cta_group::2)
+    idesc |= (MMA_M >> 4) << 24;                // M dim of matrix A
 }
 
 __device__ __forceinline__ void tcgen05_mma(
@@ -370,6 +370,7 @@ void ws_gemm_2cta_mma(
     initialize_barriers<QUEUE_SIZE, 2>(smem_full_mbar, is_producer_master_thread);   // both CTAs report to CTA 0 mbar
     initialize_barriers<QUEUE_SIZE, 1>(smem_empty_mbar, is_producer_master_thread);  // each CTA tracks its own "finished using smem buffer" signal
     initialize_barriers<1, 1>(mma_mbar, is_producer_master_thread);                  // each CTA has its own mma_mbar for multicast    
+    asm volatile("fence.mbarrier_init.release.cluster;");  
 
     // get threadblock rank in cluster
     // see: https://github.com/NVIDIA/cutlass/blob/acb45938e9cb3e4db8c1d75155b63d31791e0e5d/include/cute/arch/cluster_sm90.hpp#L158
@@ -455,7 +456,7 @@ void ws_gemm_2cta_mma(
     {
         // make tcgen05 mma instruction descriptor, to be re-used at every iter of the loop
         uint32_t idesc = 0;
-        tcgen05_encode_idesc<MMA_M, MMA_N>(idesc);
+        tcgen05_encode_idesc<CTA_GROUP_SIZE * MMA_M, MMA_N>(idesc); // each CTA in pair loads BM rows of A, and BN/2 cols of B
 
         const int num_blocks_k = (K + BK - 1) / BK;
         for (int block_k_idx = 0; block_k_idx < num_blocks_k; block_k_idx++) {
