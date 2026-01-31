@@ -103,7 +103,7 @@ __device__ uint64_t make_smem_desc(uint32_t smem_shared_addr) {
 __device__ __forceinline__ void mbarrier_init(uint64_t *mbar, const uint32_t count) {
   uint32_t mbar_ptr = __cvta_generic_to_shared(mbar);
   asm volatile(
-    "mbarrier.init.shared.b64 [%0], %1;"
+    "mbarrier.init.shared::cta.b64 [%0], %1;"
     : // no outputs
     :"r"(mbar_ptr), "r"(count) // inputs
     : "memory"
@@ -127,7 +127,7 @@ __device__ __forceinline__ bool mbarrier_try_wait_parity(uint32_t mbar_addr, con
   uint32_t wait_complete;
   asm volatile(
     "{\n\t .reg .pred P_OUT; \n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64  P_OUT, [%1], %2; \n\t" 
+        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64  P_OUT, [%1], %2; \n\t" 
         "selp.b32 %0, 1, 0, P_OUT; \n"
         "}"
         : "=r"(wait_complete)         // outputs
@@ -145,7 +145,7 @@ __device__ __forceinline__ void mbarrier_wait_parity(uint32_t mbar_addr, const u
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-arrive
 __device__ __forceinline__ void mbarrier_arrive(uint32_t mbar_addr) {
   asm volatile(
-        "mbarrier.arrive.release.cluster.shared::cluster.b64 _, [%0];"
+        "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
         :                   // no outputs
         :"r"(mbar_addr)     // input
         : "memory"
@@ -155,7 +155,7 @@ __device__ __forceinline__ void mbarrier_arrive(uint32_t mbar_addr) {
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-arrive
 __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint32_t mbar_addr, const uint32_t tx_count) {
   asm volatile(
-      "mbarrier.arrive.expect_tx.release.cluster.shared::cluster.b64 _, [%0], %1;"
+      "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
       :                             // no outputs
       :"r"(mbar_addr), "r"(tx_count) // inputs
       : "memory");
@@ -171,7 +171,7 @@ __device__ __forceinline__ void cp_async_bulk_tensor_3d_global_to_shared(
     uint32_t mbar_addr                  // shared addr
 ) {
     asm volatile(
-        "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes "
+        "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2 "
         "[%0], [%1, {%2, %3, %4}], [%5];"
         :
         :
@@ -377,12 +377,6 @@ void ws_gemm_2cta_mma(
     uint32_t cta_rank;
     asm volatile("mov.u32 %0, %cluster_ctaid.x;" : "=r"(cta_rank));
 
-    // CTA 1 maps to CTA 0's smem_full barrier
-    if (cta_rank == 1)
-    {
-        smem_full_mbar_addr = map_smem_addr_to_cta_rank(smem_full_mbar_addr, 0);
-    }
-
     // parity for coordination between tma, mma, epilogue warps
     int smem_full_parity[QUEUE_SIZE] = {0};
     int smem_empty_parity[QUEUE_SIZE] = {0};
@@ -419,7 +413,8 @@ void ws_gemm_2cta_mma(
 
         for (int block_k_idx = 0; block_k_idx < num_blocks_k; block_k_idx++) {
             // once we loop around to beginning of circular buffer for the first time,
-            // we need to start waiing for consumer to finish reading from target buffer
+            // we need to start waiting for consumer to finish reading from target buffer
+            // Each producer waits on its own local barrier (consumer signals both)
             if (block_k_idx >= QUEUE_SIZE)
             {
                 mbarrier_wait_parity(smem_empty_mbar_addr + producer_next_buf * sizeof(uint64_t), smem_empty_parity[producer_next_buf]);
@@ -430,14 +425,22 @@ void ws_gemm_2cta_mma(
             const uint32_t A_smem = smem + producer_next_buf * (SMEM_A_SIZE + SMEM_B_SIZE);
             const uint32_t B_smem = A_smem + SMEM_A_SIZE;
             int global_k_off = block_k_idx * BK;
-            
+
+            // cta 1 needs to signal shared mbar on cta 0, since cta 0 kicks of the actual mma
+            uint32_t smem_full_mbar_mapped = smem_full_mbar_addr + producer_next_buf * sizeof(uint64_t);
+            if (cta_rank == 1)
+            {
+                smem_full_mbar_mapped = map_smem_addr_to_cta_rank(smem_full_mbar_mapped, 0);
+            }
+            mbarrier_arrive_expect_tx(smem_full_mbar_mapped, SMEM_A_SIZE + SMEM_B_SIZE);            
+
             cp_async_bulk_tensor_3d_global_to_shared(
                 A_smem,
                 reinterpret_cast<const uint64_t*>(&a_map),
                 0,                          // x (64 dim)
                 (uint32_t)global_m_off,     // y (M dim)
                 (uint32_t)global_k_off/64,  // z (K/64 dim)
-                smem_full_mbar_addr + producer_next_buf * sizeof(uint64_t)
+                smem_full_mbar_mapped
             );
             cp_async_bulk_tensor_3d_global_to_shared(
                 B_smem,
@@ -445,10 +448,8 @@ void ws_gemm_2cta_mma(
                 0,                          // x (64 dim)
                 (uint32_t)global_n_off,     // y (N dim)
                 (uint32_t)global_k_off/64,  // z (K/64 dim)
-                smem_full_mbar_addr + producer_next_buf * sizeof(uint64_t)
+                smem_full_mbar_mapped
             );
-
-            mbarrier_arrive_expect_tx(smem_full_mbar_addr + producer_next_buf * sizeof(uint64_t), SMEM_A_SIZE + SMEM_B_SIZE);
             producer_next_buf = (producer_next_buf + 1) % QUEUE_SIZE;
         }
     }
@@ -487,8 +488,16 @@ void ws_gemm_2cta_mma(
                 }
             }
 
-            // signal to producer/TMA warp this smem buffer can be re-used
-            mbarrier_arrive(smem_empty_mbar_addr + consumer_next_buf * sizeof(uint64_t));
+            // signal to producer/TMA warps this smem buffer can be re-used
+            // Consumer runs on CTA 0, needs to signal both CTA 0 and CTA 1 producers
+            uint32_t smem_empty_mbar_local = smem_empty_mbar_addr + consumer_next_buf * sizeof(uint64_t);
+
+            // Signal CTA 0's barrier (local)
+            mbarrier_arrive(smem_empty_mbar_local);
+
+            // Signal CTA 1's barrier (mapped)
+            uint32_t smem_empty_mbar_cta1 = map_smem_addr_to_cta_rank(smem_empty_mbar_local, 1);
+            mbarrier_arrive(smem_empty_mbar_cta1);
 
             // move to next mma buf idx in circular buffer
             consumer_next_buf = (consumer_next_buf + 1) % QUEUE_SIZE;
