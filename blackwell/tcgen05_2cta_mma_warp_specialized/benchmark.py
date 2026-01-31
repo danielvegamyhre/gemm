@@ -21,19 +21,19 @@ def benchmark():
 
         # Create test data
         A = torch.randn(M, K, device='cuda', dtype=torch.bfloat16)
-        B = torch.randn(K, N, device='cuda', dtype=torch.bfloat16)
+        B = torch.randn(N, K, device='cuda', dtype=torch.bfloat16)
         C = torch.zeros(M, N, device='cuda', dtype=torch.float32)
 
         # Warmup
         for _ in range(5):
-            custom_gemm.gemm_cuda(A, B, C)
+            custom_gemm.gemm_cuda(A, B.t(), C)
         torch.cuda.synchronize()
 
         # Benchmark custom kernel
         custom_us = benchmark_cuda_function_in_microseconds(
             custom_gemm.gemm_cuda,
             A,
-            B,
+            B.t(),
             C,
         )
 
@@ -42,7 +42,7 @@ def benchmark():
         torch_us = benchmark_cuda_function_in_microseconds(
             torch.mm,
             A,
-            B,
+            B.t(),
             out_dtype=torch.float32,
             out=out,
         )

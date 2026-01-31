@@ -613,7 +613,7 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     constexpr int CONSUMER_WARPS = 1;
     constexpr int EPILOGUE_WARPS = 4;
     constexpr int NUM_THREADS = (PRODUCER_WARPS + CONSUMER_WARPS + EPILOGUE_WARPS) * 32;
-    constexpr int QUEUE_SIZE = 4;
+    constexpr int QUEUE_SIZE = 6;
 
     // TMEM is 128x512 cells, each cell is 32 bits / 4 bytes.
     // So check bf16 tmem buffer requirements with 2 bytes per elem is <= tmem col width in bytes.
