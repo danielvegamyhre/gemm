@@ -492,10 +492,10 @@ void ws_gemm_2cta_mma(
             // Consumer runs on CTA 0, needs to signal both CTA 0 and CTA 1 producers
             uint32_t smem_empty_mbar_local = smem_empty_mbar_addr + consumer_next_buf * sizeof(uint64_t);
 
-            // Signal CTA 0's barrier (local)
+            // signal CTA 0's barrier (local)
             mbarrier_arrive(smem_empty_mbar_local);
 
-            // Signal CTA 1's barrier (mapped)
+            // signal CTA 1's barrier (mapped)
             uint32_t smem_empty_mbar_cta1 = map_smem_addr_to_cta_rank(smem_empty_mbar_local, 1);
             mbarrier_arrive(smem_empty_mbar_cta1);
 
@@ -545,7 +545,7 @@ void ws_gemm_2cta_mma(
             const int c_row = block_row * BM + ep_warp_id * 32 + lane_id;
             const int c_col = block_col * BN + i * COLS_PER_THREAD;
 
-            if (c_row < M && c_col + 16 < N) {
+            if (c_row < M && c_col + COLS_PER_THREAD <= N) {
                 *reinterpret_cast<float4*>(C + c_row * N + c_col) = *reinterpret_cast<float4*>(&c_reg);
             }
         }
@@ -628,7 +628,7 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     // Round up grid dims to be divisible by cluster dims (2, 1, 1)
     int grid_x = ceil_div(N, BN);
     int grid_y = ceil_div(M, BM);
-    int total_blocks = grid_x + grid_y;
+    int total_blocks = grid_x * grid_y;
     dim3 block_dim(NUM_THREADS);
     dim3 grid_dim(total_blocks);
 
