@@ -488,16 +488,9 @@ void ws_gemm_2cta_mma(
                 }
             }
 
-            // signal to producer/TMA warps this smem buffer can be re-used
-            // Consumer runs on CTA 0, needs to signal both CTA 0 and CTA 1 producers
-            uint32_t smem_empty_mbar_local = smem_empty_mbar_addr + consumer_next_buf * sizeof(uint64_t);
-
-            // signal CTA 0's barrier (local)
-            mbarrier_arrive(smem_empty_mbar_local);
-
-            // signal CTA 1's barrier (mapped)
-            uint32_t smem_empty_mbar_cta1 = map_smem_addr_to_cta_rank(smem_empty_mbar_local, 1);
-            mbarrier_arrive(smem_empty_mbar_cta1);
+            // signal to both cta smem_empty mbar via commit multicast
+            const uint16_t cta_mask = 0b11;
+            tcgen05_commit_multicast(smem_empty_mbar_addr + consumer_next_buf * sizeof(uint64_t), cta_mask);
 
             // move to next mma buf idx in circular buffer
             consumer_next_buf = (consumer_next_buf + 1) % QUEUE_SIZE;
