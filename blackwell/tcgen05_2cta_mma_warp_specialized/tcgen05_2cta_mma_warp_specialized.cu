@@ -552,8 +552,7 @@ void ws_gemm_2cta_mma(
     }
 
     // tmem deallocation after all threads finished using tmem.
-    // need cluster wide sync for 2 cta mma
-    cluster_sync();
+    __syncthreads();
     if (warp_id == 0)
     {
         tcgen05_dealloc<BN>(tmem_addr_reg);
