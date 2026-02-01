@@ -459,6 +459,10 @@ void ws_gemm_2cta_mma(
         uint32_t idesc = 0;
         tcgen05_encode_idesc<CTA_GROUP_SIZE * MMA_M, MMA_N>(idesc); // each CTA in pair loads BM rows of A, and BN/2 cols of B
 
+        // make cta mask used for tcgen05_commit_multicast signaling.
+        // 1 bit for cta rank 0, 1 bit for cta rank 1
+        uint16_t cta_mask = 0b11; 
+        
         const int num_blocks_k = (K + BK - 1) / BK;
         for (int block_k_idx = 0; block_k_idx < num_blocks_k; block_k_idx++) {
 
@@ -487,17 +491,8 @@ void ws_gemm_2cta_mma(
                     tcgen05_mma(smem_a_desc, smem_b_desc, tmem_addr_reg, idesc, enable_accum);
                 }
             }
-
-            // signal to producer/TMA warps this smem buffer can be re-used
-            // Consumer runs on CTA 0, needs to signal both CTA 0 and CTA 1 producers
-            uint32_t smem_empty_mbar_local = smem_empty_mbar_addr + consumer_next_buf * sizeof(uint64_t);
-
-            // signal CTA 0's barrier (local)
-            mbarrier_arrive(smem_empty_mbar_local);
-
-            // signal CTA 1's barrier (mapped)
-            uint32_t smem_empty_mbar_cta1 = map_smem_addr_to_cta_rank(smem_empty_mbar_local, 1);
-            mbarrier_arrive(smem_empty_mbar_cta1);
+            // signal to both CTAs that this smem buffer can be re-used when mma is done (async)
+            tcgen05_commit_multicast(smem_empty_mbar_addr + consumer_next_buf * sizeof(uint64_t), cta_mask);
 
             // move to next mma buf idx in circular buffer
             consumer_next_buf = (consumer_next_buf + 1) % QUEUE_SIZE;
@@ -514,7 +509,6 @@ void ws_gemm_2cta_mma(
         //    the mbarrier signal is sent either to the destination CTA or its peer-CTA based on
         //    CTAs %cluster_ctarank parity of shared memory where the mbarrier object mbar resides."
         // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async-bulk
-        uint16_t cta_mask = 0b11; // 1 bit for cta rank 0, 1 bit for cta rank 1
         tcgen05_commit_multicast(mma_mbar_addr, cta_mask);
     }
     else if (warpgroup_id == EPILOGUE_WARPGRUOP_ID)
