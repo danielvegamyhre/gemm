@@ -618,12 +618,8 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
         return (x + y - 1) / y;
     };
 
-    // Round up grid dims to be divisible by cluster dims (2, 1, 1)
-    int grid_x = ceil_div(N, BN);
-    int grid_y = ceil_div(M, BM);
-    int total_blocks = grid_x * grid_y;
+    dim3 grid_dim(ceil_div(N, BN) * ceil_div(M, BM));
     dim3 block_dim(NUM_THREADS);
-    dim3 grid_dim(total_blocks);
 
     auto kernel = ws_gemm_2cta_mma<NUM_THREADS, QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K>;
 
