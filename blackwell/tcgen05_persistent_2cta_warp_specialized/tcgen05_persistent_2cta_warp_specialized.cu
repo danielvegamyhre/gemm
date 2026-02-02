@@ -553,6 +553,7 @@ void ws_gemm_2cta_mma(
                 : "memory"
             );
         };
+        const uint16_t cta_mask = 0b11;
 
         for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
             // convert group_id to bid for this CTA
@@ -598,28 +599,22 @@ void ws_gemm_2cta_mma(
 
             // signal to mma warp that this output block finished using tmem, and it can be safely re-used.
             // both CTAs signal to CTA 0, which runs the tcgen05.mma op.
-            // use fence to ensure subsequent tcgen05.mma instructions are ordered after this.
-            asm volatile("tcgen05.fence::before_thread_sync;");
+            // use tcgen05 commit multicasta to ensure subsequent tcgen05.mma instructions are ordered after this.
             uint32_t epilogue_mbar_addr_for_tmem_buf = epilogue_mbar_addr + epilogue_tmem_buf * sizeof(uint64_t);
-            if (cta_rank == 1)
-            {
-                epilogue_mbar_addr_for_tmem_buf = map_smem_addr_to_cta_rank(epilogue_mbar_addr_for_tmem_buf, 0);
-            }
-            mbarrier_arrive(epilogue_mbar_addr_for_tmem_buf);
+            tcgen05_commit_multicast(epilogue_mbar_addr_for_tmem_buf, cta_mask);
 
             // move to next tmem buf for next output block
             epilogue_tmem_buf = (epilogue_tmem_buf + 1) % TMEM_BUFFERS;
         }
+    }
 
-        // sync epilogue warpgroup to ensure all threads finished with tmem before deallocating
-        epilogue_sync();
-    
-        // tmem deallocation after all threads finished using tmem.
-        if (warp_id == 0)
-        {
-            int tmem_addr_reg = *reinterpret_cast<int*>(__cvta_shared_to_generic(tmem_addr_smem));
-            tcgen05_dealloc<BN * TMEM_BUFFERS>(tmem_addr_reg);
-        }
+    // tmem deallocation after all threads finished using tmem.
+    // cluster sync to make sure both CTAs stay alive for the duration of the peristent pipeline
+    cluster_sync();
+    if (warp_id == 0)
+    {
+        int tmem_addr_reg = *reinterpret_cast<int*>(__cvta_shared_to_generic(tmem_addr_smem));
+        tcgen05_dealloc<BN * TMEM_BUFFERS>(tmem_addr_reg);
     }
 }
 
