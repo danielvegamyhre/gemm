@@ -627,7 +627,7 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     // dims for smem tiles
     constexpr int BM = 128;
     constexpr int BN = 256;
-    constexpr int BK = 64;
+    constexpr int BK = 128;
 
     // dims for tcgen05.mma
     constexpr int MMA_M = 128;
@@ -681,7 +681,7 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     constexpr int CONSUMER_WARPS = 1;
     constexpr int EPILOGUE_WARPS = 4;
     constexpr int BLOCK_SIZE = (PRODUCER_WARPS + CONSUMER_WARPS + EPILOGUE_WARPS) * 32;
-    constexpr int QUEUE_SIZE = 6;
+    constexpr int QUEUE_SIZE = 3;
     constexpr int TMEM_BUFFERS = 2;
 
     // TMEM is 128x512 cells, each cell is 32 bits / 4 bytes.
@@ -718,6 +718,7 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     constexpr int epilogue_mbar_size = TMEM_BUFFERS * sizeof(uint64_t);
     constexpr int tmem_addr_size = sizeof(int);
     constexpr int total_smem = smem_a_size + smem_b_size + smem_full_mbar_size + smem_empty_mbar_size + mma_mbar_size + epilogue_mbar_size + tmem_addr_size;
+    assert(total_smem <= 228000);
     CUDA_CHECK(cudaFuncSetAttribute(
         kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
