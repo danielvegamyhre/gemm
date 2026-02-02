@@ -681,7 +681,6 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     constexpr int CONSUMER_WARPS = 1;
     constexpr int EPILOGUE_WARPS = 4;
     constexpr int BLOCK_SIZE = (PRODUCER_WARPS + CONSUMER_WARPS + EPILOGUE_WARPS) * 32;
-    constexpr int QUEUE_SIZE = 3;
     constexpr int TMEM_BUFFERS = 2;
 
     // TMEM is 128x512 cells, each cell is 32 bits / 4 bytes.
@@ -689,17 +688,13 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     constexpr int tmem_width_bytes = 512 * 4;
     assert(BN * 2 <= tmem_width_bytes);
 
+    
     // persistent kernel runs 1 threadblock per SM
     int NUM_SMS;
     cudaDeviceGetAttribute(&NUM_SMS, cudaDevAttrMultiProcessorCount, 0);
 
-    const int total_tiles = (M / BM) * (N / BN);
-    const int launch_blocks = min(total_tiles, NUM_SMS);
-
-    dim3 grid_dim(launch_blocks);
-    dim3 block_dim(BLOCK_SIZE);
-
-    auto kernel = ws_gemm_2cta_mma<QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K>;
+    // use max smem per SM on sm100 to determine queue size
+    constexpr int max_smem_per_sm = 227 * 1024;
 
     // increase max smem beyond 48k default limit.
     // smem usage:
@@ -710,15 +705,23 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     // - mma_mbar 
     // - epilogue mbar
     // - tma_addr_in_smem
-    constexpr int smem_a_size = QUEUE_SIZE * BM * BK * sizeof(__nv_bfloat16);
-    constexpr int smem_b_size = QUEUE_SIZE * (BN / CTA_GROUP_SIZE) * BK * sizeof(__nv_bfloat16);
-    constexpr int smem_full_mbar_size = QUEUE_SIZE * sizeof(uint64_t);
-    constexpr int smem_empty_mbar_size = QUEUE_SIZE * sizeof(uint64_t);
+    constexpr int smem_a_size = BM * BK * sizeof(__nv_bfloat16);
+    constexpr int smem_b_size = (BN / CTA_GROUP_SIZE) * BK * sizeof(__nv_bfloat16);
+    constexpr int smem_full_mbar_size = sizeof(uint64_t);
+    constexpr int smem_empty_mbar_size = sizeof(uint64_t);
     constexpr int mma_mbar_size = TMEM_BUFFERS * sizeof(uint64_t);
     constexpr int epilogue_mbar_size = TMEM_BUFFERS * sizeof(uint64_t);
     constexpr int tmem_addr_size = sizeof(int);
-    constexpr int total_smem = smem_a_size + smem_b_size + smem_full_mbar_size + smem_empty_mbar_size + mma_mbar_size + epilogue_mbar_size + tmem_addr_size;
-    assert(total_smem <= 228000);
+    constexpr int total_smem_per_stage = smem_a_size + smem_b_size + smem_full_mbar_size + smem_empty_mbar_size + mma_mbar_size + epilogue_mbar_size + tmem_addr_size;
+    constexpr int QUEUE_SIZE = max_smem_per_sm / total_smem_per_stage;
+    constexpr int total_smem = total_smem_per_stage * QUEUE_SIZE;
+
+    const int total_blocks = (M / BM) * (N / BN);
+    const int launch_blocks = min(NUM_SMS, total_blocks) & ~1; // round down to nearest even
+    dim3 grid_dim(launch_blocks);
+    dim3 block_dim(BLOCK_SIZE);
+    auto kernel = ws_gemm_2cta_mma<QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K>;
+
     CUDA_CHECK(cudaFuncSetAttribute(
         kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
