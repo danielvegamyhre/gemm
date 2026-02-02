@@ -539,6 +539,17 @@ void ws_gemm_2cta_mma(
     }
     else if (warpgroup_id == EPILOGUE_WARPGROUP_ID)
     {
+        // named barrier for warpgroup level synchronization
+        // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-bar
+        // each CTA has 16 named barriers, 0-15
+        auto epilogue_sync = []() {
+            asm volatile("bar.sync %0, %1;" 
+                :
+                : "r"(1), "r"(128)  // barrier number 1, with 128 threads participating
+                : "memory"
+            );
+        };
+
         for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
             // convert group_id to bid for this CTA
             const int bid = group_id * CTA_GROUP_SIZE + (start_bid % CTA_GROUP_SIZE);
@@ -588,13 +599,15 @@ void ws_gemm_2cta_mma(
             }
             mbarrier_arrive(epilogue_mbar_addr);
         }
-    }
+
+        // sync epilogue warpgroup to ensure all threads finished with tmem before deallocating
+        epilogue_sync();
     
-    // tmem deallocation after all threads finished using tmem.
-    __syncthreads();
-    if (warp_id == 0)
-    {
-        tcgen05_dealloc<BN>(tmem_addr_reg);
+        // tmem deallocation after all threads finished using tmem.
+        if (warp_id == 0)
+        {
+            tcgen05_dealloc<BN>(tmem_addr_reg);
+        }
     }
 }
 
