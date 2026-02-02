@@ -185,13 +185,13 @@ __device__ __forceinline__ void cp_async_bulk_tensor_3d_global_to_shared(
     );
 }
 
-template <int BN>
+template <int TMEM_COLS>
 __device__ __forceinline__ void tcgen05_alloc(uint32_t tmem_addr_smem) {
     // convert to shared addr
     asm volatile(
         "tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;"
         : // no outputs
-        : "r"(tmem_addr_smem), "r"(BN) // inputs
+        : "r"(tmem_addr_smem), "r"(TMEM_COLS) // inputs
     );
 }
 
@@ -325,6 +325,7 @@ void ws_gemm_2cta_mma(
     int K
 ) {
     constexpr int CTA_GROUP_SIZE = 2;
+    constexpr int TMEM_BUFFERS = 2;
 
     // get start block and group id for grid strided loop
     const int start_bid = blockIdx.x;
@@ -350,8 +351,8 @@ void ws_gemm_2cta_mma(
     constexpr int SMEM_FULL_MBAR_OFFSET = SMEM_AB_TOTAL;
     constexpr int SMEM_EMPTY_MBAR_OFFSET = SMEM_FULL_MBAR_OFFSET + QUEUE_SIZE * sizeof(uint64_t);
     constexpr int SMEM_MMA_MBAR_OFFSET = SMEM_EMPTY_MBAR_OFFSET + QUEUE_SIZE * sizeof(uint64_t);
-    constexpr int SMEM_EPILOGUE_MBAR_OFFSET = SMEM_MMA_MBAR_OFFSET + sizeof(uint64_t);
-    constexpr int TMEM_ADDR_OFFSET = SMEM_EPILOGUE_MBAR_OFFSET + sizeof(uint64_t);
+    constexpr int SMEM_EPILOGUE_MBAR_OFFSET = SMEM_MMA_MBAR_OFFSET + TMEM_BUFFERS * sizeof(uint64_t);
+    constexpr int TMEM_ADDR_OFFSET = SMEM_EPILOGUE_MBAR_OFFSET + TMEM_BUFFERS * sizeof(uint64_t);
 
     // get shared addrs for mbars - used for mapping to peer CTA for DSMEM access
     uint32_t smem_full_mbar_addr = smem + SMEM_FULL_MBAR_OFFSET;
@@ -365,10 +366,10 @@ void ws_gemm_2cta_mma(
     uint64_t* smem_empty_mbar = reinterpret_cast<uint64_t*>(smem_buffer + SMEM_EMPTY_MBAR_OFFSET);
     uint64_t* mma_mbar = reinterpret_cast<uint64_t*>(smem_buffer + SMEM_MMA_MBAR_OFFSET);
     uint64_t* epilogue_mbar = reinterpret_cast<uint64_t*>(smem_buffer + SMEM_EPILOGUE_MBAR_OFFSET);
-    initialize_barriers<QUEUE_SIZE, 2>(smem_full_mbar, is_producer_master_thread);   // both CTAs report to CTA 0 mbar
-    initialize_barriers<QUEUE_SIZE, 1>(smem_empty_mbar, is_producer_master_thread);  // each CTA tracks its own "finished using smem buffer" signal
-    initialize_barriers<1, 1>(mma_mbar, is_producer_master_thread);                  // each CTA has its own mma_mbar for multicast    
-    initialize_barriers<1, 128 * CTA_GROUP_SIZE>(epilogue_mbar, is_producer_master_thread);             // each CTA has it's own epilogue mbar for tracking when tmem->reg has finished
+    initialize_barriers<QUEUE_SIZE, 2>(smem_full_mbar, is_producer_master_thread);              // both CTAs report to CTA 0 mbar
+    initialize_barriers<QUEUE_SIZE, 1>(smem_empty_mbar, is_producer_master_thread);             // each CTA tracks its own "finished using smem buffer" signal
+    initialize_barriers<TMEM_BUFFERS, 1>(mma_mbar, is_producer_master_thread);                  // one mbar per TMEM buffer for multicast
+    initialize_barriers<TMEM_BUFFERS, 128 * CTA_GROUP_SIZE>(epilogue_mbar, is_producer_master_thread); // one mbar per TMEM buffer for tracking when tmem->reg has finished
     asm volatile("fence.mbarrier_init.release.cluster;");  
 
     // get threadblock rank in cluster
@@ -379,8 +380,8 @@ void ws_gemm_2cta_mma(
     // parity for coordination between tma, mma, epilogue warps
     int smem_full_parity[QUEUE_SIZE] = {0};
     int smem_empty_parity[QUEUE_SIZE] = {0};
-    int mma_parity = 0;
-    int epilogue_parity = 0;
+    int mma_parity[TMEM_BUFFERS] = {0};
+    int epilogue_parity[TMEM_BUFFERS] = {0};
 
     // alloc tmem addr for accumulator. allocates BN columns of TMEM (must always alloc full 128 rows)
     // 1 warp must do the allocation, from PTX docs:
@@ -388,33 +389,30 @@ void ws_gemm_2cta_mma(
     // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-memory-alloc-manage-instructions
     if (warp_id == 0)
     {
-        // after this call, we can load tmem_addr from smem -> to register to use.
-       tcgen05_alloc<BN>(tmem_addr_smem);
+        // allocate 2 temm buffers of BN cols each
+        tcgen05_alloc<BN * TMEM_BUFFERS>(tmem_addr_smem);
     }
 
     // make sure mbarriers and tmem addr are visible to full cluster
     cluster_sync();
 
-    // read tmem addr from smem -> register
-    int tmem_addr_reg = *reinterpret_cast<int*>(__cvta_shared_to_generic(tmem_addr_smem));
-
     // track next buffer index in the queue for tma loads (producer) and mmas (consumer)
-    int producer_next_buf = 0;
-    int consumer_next_buf = 0;
+    int tma_smem_buf = 0;
+    int mma_smem_buf = 0;
+    int mma_tmem_buf = 0;
+    int epilogue_tmem_buf = 0;
     constexpr int PRODUCER_WARP_ID = 4, CONSUMER_WARP_ID = 5;
     constexpr int EPILOGUE_WARPGROUP_ID = 0;
 
-    const int total_blocks = (M/BM)*(N/BN);
-
     // for 2-CTA MMA, iterate at the GROUP level (each group = 2 vertically stacked blocks)
     const int start_group_id = start_bid / CTA_GROUP_SIZE;
-    const int num_groups = (gridDim.x + CTA_GROUP_SIZE - 1) / CTA_GROUP_SIZE;
+    const int num_groups = (blocks_per_grid + CTA_GROUP_SIZE - 1) / CTA_GROUP_SIZE;
+    const int total_blocks = (M / BM) * (N / BN);
     const int total_groups = total_blocks / CTA_GROUP_SIZE;
 
     // producer warp, runs on both CTAs
     if (warp_id == PRODUCER_WARP_ID && is_producer_master_thread)
     {
-
         for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
             // convert group_id to bid for this CTA
             const int bid = group_id * CTA_GROUP_SIZE + (start_bid % CTA_GROUP_SIZE);
@@ -430,17 +428,17 @@ void ws_gemm_2cta_mma(
                 // Each producer waits on its own local barrier (consumer signals both)
                 if (block_k_idx >= QUEUE_SIZE || bid > start_bid)
                 {
-                    mbarrier_wait_parity(smem_empty_mbar_addr + producer_next_buf * sizeof(uint64_t), smem_empty_parity[producer_next_buf]);
-                    smem_empty_parity[producer_next_buf] ^= 1;
+                    mbarrier_wait_parity(smem_empty_mbar_addr + tma_smem_buf * sizeof(uint64_t), smem_empty_parity[tma_smem_buf]);
+                    smem_empty_parity[tma_smem_buf] ^= 1;
                 }
 
                 // tma loads for next A/B tiles
-                const uint32_t A_smem = smem + producer_next_buf * (SMEM_A_SIZE + SMEM_B_SIZE);
+                const uint32_t A_smem = smem + tma_smem_buf * (SMEM_A_SIZE + SMEM_B_SIZE);
                 const uint32_t B_smem = A_smem + SMEM_A_SIZE;
                 int global_k_off = block_k_idx * BK;
 
                 // cta 1 needs to signal shared mbar on cta 0, since cta 0 kicks of the actual mma
-                uint32_t smem_full_mbar_mapped = smem_full_mbar_addr + producer_next_buf * sizeof(uint64_t);
+                uint32_t smem_full_mbar_mapped = smem_full_mbar_addr + tma_smem_buf * sizeof(uint64_t);
                 if (cta_rank == 1)
                 {
                     smem_full_mbar_mapped = map_smem_addr_to_cta_rank(smem_full_mbar_mapped, 0);
@@ -463,37 +461,39 @@ void ws_gemm_2cta_mma(
                     (uint32_t)global_k_off/64,  // z (K/64 dim)
                     smem_full_mbar_mapped
                 );
-                producer_next_buf = (producer_next_buf + 1) % QUEUE_SIZE;
+                tma_smem_buf = (tma_smem_buf + 1) % QUEUE_SIZE;
             }
         }
     }
     else if (cta_rank == 0 && warp_id == CONSUMER_WARP_ID && is_mma_master_thread)
     {
+        // track blocks processed so when it's >= TMEM_BUFFERS we know we need to wait on epilogue mbar before re-using it
+        int blocks_processed = 0;
         for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
-            // convert group_id to bid for this CTA
-            const int bid = group_id * CTA_GROUP_SIZE + (start_bid % CTA_GROUP_SIZE);
-
             // make tcgen05 mma instruction descriptor, to be re-used at every iter of the loop
             uint32_t idesc = 0;
             tcgen05_encode_idesc<CTA_GROUP_SIZE * MMA_M, MMA_N>(idesc); // each CTA in pair loads BM rows of A, and BN/2 cols of B
+
+            // read base tmem addr from smem, then offset to the correct buffer
+            int tmem_addr_reg = *reinterpret_cast<int*>(__cvta_shared_to_generic(tmem_addr_smem)) + mma_tmem_buf * BN;
 
             // make cta mask used for tcgen05_commit_multicast signaling.
             // 1 bit for cta rank 0, 1 bit for cta rank 1
             uint16_t cta_mask = 0b11; 
             const int num_blocks_k = (K + BK - 1) / BK;
 
-            // wait for epilogue of previous output block to finish
-            if (group_id > start_group_id)
+            // wait for epilogue of previous output block to finish using this TMEM buffer
+            if (blocks_processed >= TMEM_BUFFERS)
             {
-                mbarrier_wait_parity(epilogue_mbar_addr, epilogue_parity);
-                epilogue_parity ^= 1;
+                mbarrier_wait_parity(epilogue_mbar_addr + mma_tmem_buf * sizeof(uint64_t), epilogue_parity[mma_tmem_buf]);
+                epilogue_parity[mma_tmem_buf] ^= 1;
             }
 
             for (int block_k_idx = 0; block_k_idx < num_blocks_k; block_k_idx++) {
 
                 // wait for the tma load to the buffers we are about to read from.
-                mbarrier_wait_parity(smem_full_mbar_addr + consumer_next_buf * sizeof(uint64_t), smem_full_parity[consumer_next_buf]);
-                smem_full_parity[consumer_next_buf] ^= 1;
+                mbarrier_wait_parity(smem_full_mbar_addr + mma_smem_buf * sizeof(uint64_t), smem_full_parity[mma_smem_buf]);
+                smem_full_parity[mma_smem_buf] ^= 1;
 
                 // tcgen05 mma for every subtile in the smem.
                 // 128b swizzle means we iterate through each swizzle atom:
@@ -506,7 +506,7 @@ void ws_gemm_2cta_mma(
                         const int a_k_off = a_chunk_off + mma_iter * MMA_K * sizeof(__nv_bfloat16);
                         const int b_k_off = b_chunk_off + mma_iter * MMA_K * sizeof(__nv_bfloat16);
 
-                        uint32_t smem_buff_a = smem + consumer_next_buf * (SMEM_A_SIZE + SMEM_B_SIZE);
+                        uint32_t smem_buff_a = smem + mma_smem_buf * (SMEM_A_SIZE + SMEM_B_SIZE);
                         uint32_t smem_buff_b = smem_buff_a + SMEM_A_SIZE;
 
                         uint64_t smem_a_desc = make_smem_desc(smem_buff_a + a_k_off);
@@ -517,10 +517,10 @@ void ws_gemm_2cta_mma(
                     }
                 }
                 // signal to both CTAs that this smem buffer can be re-used when mma is done (async)
-                tcgen05_commit_multicast(smem_empty_mbar_addr + consumer_next_buf * sizeof(uint64_t), cta_mask);
+                tcgen05_commit_multicast(smem_empty_mbar_addr + mma_smem_buf * sizeof(uint64_t), cta_mask);
 
                 // move to next mma buf idx in circular buffer
-                consumer_next_buf = (consumer_next_buf + 1) % QUEUE_SIZE;
+                mma_smem_buf = (mma_smem_buf + 1) % QUEUE_SIZE;
             }
 
             // commit batch of mmas. this is multicasted to both CTA mbar addr.
@@ -534,7 +534,11 @@ void ws_gemm_2cta_mma(
             //    the mbarrier signal is sent either to the destination CTA or its peer-CTA based on
             //    CTAs %cluster_ctarank parity of shared memory where the mbarrier object mbar resides."
             // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async-bulk
-            tcgen05_commit_multicast(mma_mbar_addr, cta_mask);
+            tcgen05_commit_multicast(mma_mbar_addr + mma_tmem_buf * sizeof(uint64_t), cta_mask);
+
+            // move to next tmem buffer for next output block
+            mma_tmem_buf = (mma_tmem_buf + 1) % TMEM_BUFFERS;
+            blocks_processed += 1;
         }
     }
     else if (warpgroup_id == EPILOGUE_WARPGROUP_ID)
@@ -559,17 +563,20 @@ void ws_gemm_2cta_mma(
             int lane_id = threadIdx.x % 32;
 
             // wait for completion of batch of mmas
-            mbarrier_wait_parity(mma_mbar_addr, mma_parity);
-            mma_parity ^= 1;
+            mbarrier_wait_parity(mma_mbar_addr + epilogue_tmem_buf * sizeof(uint64_t), mma_parity[epilogue_tmem_buf]);
+            mma_parity[epilogue_tmem_buf] ^= 1;
 
             // this fence makes subsequent async tcgen05 instructions (tcgen05.ld in this case) ordered
             // after all prior async tcgen05 instructions (tcgen05.mma in this case).
             // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-memory-consistency-model-inter-thread-sync
             asm volatile("tcgen05.fence::after_thread_sync;");
 
-            // now each warp in the epilogue warpgroup reads 32 rows of 16 floats per thread. 
+            // now each warp in the epilogue warpgroup reads 32 rows of 16 floats per thread.
             // these floats are contiguous in the output C.
             constexpr int COLS_PER_THREAD = 4;
+
+            // read base tmem addr from smem, then offset to the correct buffer
+            int tmem_addr_reg = *reinterpret_cast<int*>(__cvta_shared_to_generic(tmem_addr_smem)) + epilogue_tmem_buf * BN;
 
             #pragma unroll
             for (int i = 0; i < BN/COLS_PER_THREAD; i++) {
@@ -593,11 +600,15 @@ void ws_gemm_2cta_mma(
             // both CTAs signal to CTA 0, which runs the tcgen05.mma op.
             // use fence to ensure subsequent tcgen05.mma instructions are ordered after this.
             asm volatile("tcgen05.fence::before_thread_sync;");
+            uint32_t epilogue_mbar_addr_for_tmem_buf = epilogue_mbar_addr + epilogue_tmem_buf * sizeof(uint64_t);
             if (cta_rank == 1)
             {
-                epilogue_mbar_addr = map_smem_addr_to_cta_rank(epilogue_mbar_addr, 0);
+                epilogue_mbar_addr_for_tmem_buf = map_smem_addr_to_cta_rank(epilogue_mbar_addr_for_tmem_buf, 0);
             }
-            mbarrier_arrive(epilogue_mbar_addr);
+            mbarrier_arrive(epilogue_mbar_addr_for_tmem_buf);
+
+            // move to next tmem buf for next output block
+            epilogue_tmem_buf = (epilogue_tmem_buf + 1) % TMEM_BUFFERS;
         }
 
         // sync epilogue warpgroup to ensure all threads finished with tmem before deallocating
@@ -606,7 +617,8 @@ void ws_gemm_2cta_mma(
         // tmem deallocation after all threads finished using tmem.
         if (warp_id == 0)
         {
-            tcgen05_dealloc<BN>(tmem_addr_reg);
+            int tmem_addr_reg = *reinterpret_cast<int*>(__cvta_shared_to_generic(tmem_addr_smem));
+            tcgen05_dealloc<BN * TMEM_BUFFERS>(tmem_addr_reg);
         }
     }
 }
@@ -670,6 +682,7 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     constexpr int EPILOGUE_WARPS = 4;
     constexpr int BLOCK_SIZE = (PRODUCER_WARPS + CONSUMER_WARPS + EPILOGUE_WARPS) * 32;
     constexpr int QUEUE_SIZE = 6;
+    constexpr int TMEM_BUFFERS = 2;
 
     // TMEM is 128x512 cells, each cell is 32 bits / 4 bytes.
     // So check bf16 tmem buffer requirements with 2 bytes per elem is <= tmem col width in bytes.
@@ -681,7 +694,7 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     cudaDeviceGetAttribute(&NUM_SMS, cudaDevAttrMultiProcessorCount, 0);
 
     const int total_tiles = (M / BM) * (N / BN);
-    const int launch_blocks = min(total_tiles, NUM_SMS & ~1);  // round down to even
+    const int launch_blocks = min(total_tiles, NUM_SMS);
 
     dim3 grid_dim(launch_blocks);
     dim3 block_dim(BLOCK_SIZE);
@@ -699,9 +712,12 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     // - tma_addr_in_smem
     constexpr int smem_a_size = QUEUE_SIZE * BM * BK * sizeof(__nv_bfloat16);
     constexpr int smem_b_size = QUEUE_SIZE * (BN / CTA_GROUP_SIZE) * BK * sizeof(__nv_bfloat16);
-    constexpr int smem_mbar_size = (QUEUE_SIZE * 2 + 2) * sizeof(uint64_t);
+    constexpr int smem_full_mbar_size = QUEUE_SIZE * sizeof(uint64_t);
+    constexpr int smem_empty_mbar_size = QUEUE_SIZE * sizeof(uint64_t);
+    constexpr int mma_mbar_size = TMEM_BUFFERS * sizeof(uint64_t);
+    constexpr int epilogue_mbar_size = TMEM_BUFFERS * sizeof(uint64_t);
     constexpr int tmem_addr_size = sizeof(int);
-    constexpr int total_smem = smem_a_size + smem_b_size + smem_mbar_size + tmem_addr_size;
+    constexpr int total_smem = smem_a_size + smem_b_size + smem_full_mbar_size + smem_empty_mbar_size + mma_mbar_size + epilogue_mbar_size + tmem_addr_size;
     CUDA_CHECK(cudaFuncSetAttribute(
         kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
