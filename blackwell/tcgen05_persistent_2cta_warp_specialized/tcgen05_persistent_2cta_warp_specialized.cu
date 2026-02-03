@@ -543,16 +543,6 @@ void ws_gemm_2cta_mma(
     }
     else if (warpgroup_id == EPILOGUE_WARPGROUP_ID)
     {
-        // named barrier for warpgroup level synchronization
-        // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-bar
-        // each CTA has 16 named barriers, 0-15
-        auto epilogue_sync = []() {
-            asm volatile("bar.sync %0, %1;" 
-                :
-                : "r"(1), "r"(128)  // barrier number 1, with 128 threads participating
-                : "memory"
-            );
-        };
         const uint16_t cta_mask = 0b11;
 
         for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
