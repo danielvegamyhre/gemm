@@ -541,7 +541,7 @@ void ws_gemm_2cta_mma(
     }
 
     // tmem deallocation after all threads finished using tmem.
-    __syncthreads();
+    cluster_sync();
     if (warp_id == 0)
     {
         tcgen05_dealloc<BN>(tmem_addr_reg);

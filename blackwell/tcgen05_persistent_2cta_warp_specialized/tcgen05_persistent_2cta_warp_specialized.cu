@@ -138,8 +138,20 @@ __device__ __forceinline__ bool mbarrier_try_wait_parity(uint32_t mbar_addr, con
 }
 
 __device__ __forceinline__ void mbarrier_wait_parity(uint32_t mbar_addr, const uint32_t parity) {
-  while (!mbarrier_try_wait_parity(mbar_addr, parity)) {
-  }
+//  while (!mbarrier_try_wait_parity(mbar_addr, parity)) {
+//  }
+  uint32_t ticks = 0x989680;  // this is optional
+  asm volatile(
+    "{\n\t"
+    ".reg .pred P1;\n\t"
+    "LAB_WAIT:\n\t"
+    "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1, [%0], %1, %2;\n\t"
+    "@P1 bra.uni DONE;\n\t"
+    "bra.uni LAB_WAIT;\n\t"
+    "DONE:\n\t"
+    "}"
+    :: "r"(mbar_addr), "r"(parity), "r"(ticks)
+  );
 }
 
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-arrive
