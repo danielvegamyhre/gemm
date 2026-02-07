@@ -138,20 +138,8 @@ __device__ __forceinline__ bool mbarrier_try_wait_parity(uint32_t mbar_addr, con
 }
 
 __device__ __forceinline__ void mbarrier_wait_parity(uint32_t mbar_addr, const uint32_t parity) {
-//  while (!mbarrier_try_wait_parity(mbar_addr, parity)) {
-//  }
-  uint32_t ticks = 0x989680;  // this is optional
-  asm volatile(
-    "{\n\t"
-    ".reg .pred P1;\n\t"
-    "LAB_WAIT:\n\t"
-    "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1, [%0], %1, %2;\n\t"
-    "@P1 bra.uni DONE;\n\t"
-    "bra.uni LAB_WAIT;\n\t"
-    "DONE:\n\t"
-    "}"
-    :: "r"(mbar_addr), "r"(parity), "r"(ticks)
-  );
+  while (!mbarrier_try_wait_parity(mbar_addr, parity)) {
+  }
 }
 
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-arrive
@@ -603,7 +591,11 @@ void ws_gemm_2cta_mma(
             // both CTAs signal to CTA 0, which runs the tcgen05.mma op.
             // use tcgen05 commit multicasta to ensure subsequent tcgen05.mma instructions are ordered after this.
             uint32_t epilogue_mbar_addr_for_tmem_buf = epilogue_mbar_addr + epilogue_tmem_buf * sizeof(uint64_t);
-            tcgen05_commit_multicast(epilogue_mbar_addr_for_tmem_buf, cta_mask);
+            if (cta_rank == 1) {
+                // cta 1 needs to map to cta 0's mbar addr since cta 0 runs the tcgen05.mma that needs to wait on this signal
+                epilogue_mbar_addr_for_tmem_buf = map_smem_addr_to_cta_rank(epilogue_mbar_addr_for_tmem_buf, 0);
+            }
+            mbarrier_arrive(epilogue_mbar_addr_for_tmem_buf); // can use arrive since only 1 warp waits on this mbar
 
             // move to next tmem buf for next output block
             epilogue_tmem_buf = (epilogue_tmem_buf + 1) % TMEM_BUFFERS;
