@@ -16,6 +16,7 @@ def benchmark():
 
     sizes = [
         (4096, 4096, 4096),
+        (16384, 16384, 16384),
     ]
 
     for M, K, N in sizes:
