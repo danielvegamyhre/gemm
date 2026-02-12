@@ -1,10 +1,12 @@
 import pytest
 import torch
 from torch.utils.cpp_extension import load
+from torch.nn.functional import scaled_mm, ScalingRecipe, SwizzleType
+from torchao.prototype.mx_formats.kernels import triton_to_mxfp8_dim0, to_blocked
 
 custom_gemm = load(
-    name='tcgen05_hilbert_2cta_warp_specialized',
-    sources=['tcgen05_hilbert_2cta_warp_specialized.cpp', 'tcgen05_hilbert_2cta_warp_specialized.cu'],
+    name='tcgen05_mxfp8_hilbert_2cta_warp_specialized',
+    sources=['tcgen05_mxfp8_hilbert_2cta_warp_specialized.cpp', 'tcgen05_mxfp8_hilbert_2cta_warp_specialized.cu'],
     extra_cuda_cflags=['-g','-G','-gencode=arch=compute_100a,code=sm_100a'],
     extra_cflags=['-O3'],
     verbose=False
@@ -12,9 +14,7 @@ custom_gemm = load(
 
 
 @pytest.mark.parametrize("M,K,N", [
-   (512, 512, 512),
-   (1024, 1024, 1024),
-    (4096, 4096, 4096)
+    (2048, 4096, 8192)
 ])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_gemm(M, K, N):
@@ -23,10 +23,26 @@ def test_gemm(M, K, N):
     B = torch.randn(N, K, device='cuda', dtype=torch.bfloat16)
     C = torch.zeros(M, N, device='cuda', dtype=torch.float32)
 
-    result = custom_gemm.gemm_cuda(A, B.t(), C)
+    A_data, A_scales = triton_to_mxfp8_dim0(A)
+    B_data, B_scales = triton_to_mxfp8_dim0(B)
+    A_scales, B_scales = to_blocked(A_scales), to_blocked(B_scales)
+
+    result = custom_gemm.gemm_cuda(A_data, B_data.t(), A_scales, B_scales, C)
 
     expected = torch.zeros(M, N, device="cuda", dtype=torch.float32)
-    torch.mm(A, B.t(), out_dtype=torch.float32, out=expected)
+
+    scaled_mm(
+        A, 
+        B.t(), 
+        scale_a=A_scales, 
+        scale_recipe_a=ScalingType.BlockWise1x32, 
+        scale_b=B_scales,
+        scale_recipe_b=ScalingType.BlockWise1x32, 
+        swizzle_a=SwizzleType.SWIZZLE_32_4_4,
+        swizzle_b=SwizzleType.SWIZZLE_32_4_4,
+        output_dtype=out_dtype,
+        out=expected,
+    )
 
     # Check for mismatches
     rtol = 1e-2

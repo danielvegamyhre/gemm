@@ -15,7 +15,7 @@ def benchmark():
         return do_bench(lambda: f(*args, **kwargs), return_mode="median") * 1e3
 
     sizes = [
-        (4096, 4096, 4096),
+        # (4096, 4096, 4096),
         (16384, 16384, 16384),
     ]
 

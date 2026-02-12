@@ -3,8 +3,8 @@ from torch.utils.cpp_extension import load
 from triton.testing import do_bench
 
 custom_gemm = load(
-    name='tcgen05_persistent_2cta_warp_specialized',
-    sources=['tcgen05_persistent_2cta_warp_specialized.cpp', 'tcgen05_persistent_2cta_warp_specialized.cu'],
+    name='tcgen05_mxfp8_hilbert_2cta_warp_specialized',
+    sources=['tcgen05_mxfp8_hilbert_2cta_warp_specialized.cpp', 'tcgen05_mxfp8_hilbert_2cta_warp_specialized.cu'],
     extra_cuda_cflags=['-O3', '--use_fast_math', '-gencode=arch=compute_100a,code=sm_100a'],
     extra_cflags=['-O3'],
     verbose=False
@@ -15,7 +15,7 @@ def benchmark():
         return do_bench(lambda: f(*args, **kwargs), return_mode="median") * 1e3
 
     sizes = [
-#        (4096, 4096, 4096),
+        (4096, 4096, 4096),
         (16384, 16384, 16384),
     ]
 
