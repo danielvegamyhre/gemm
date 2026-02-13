@@ -254,20 +254,20 @@ __device__ __forceinline__ void tcgen05_commit_multicast(uint32_t mbar_addr, uin
 // each warp of a warpgroup in the CTA can access a chunk of the Tensor Memory. 
 // All the columns of the Tensor Memory can be accessed by all the four warps of a warpgroup."
 // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-tensor-memory-ld-st
-__device__ __forceinline__ void tcgen05_ld(int tmem_base_addr_reg, int row, int base_col, float c_reg[4]) {
+__device__ __forceinline__ void tcgen05_ld(int tmem_base_addr_reg, int row, int base_col, float c_reg[8]) {
     // TMEM address is 32bit and composed of 2 components:
     // - bits 0-15: column index
     // - bits 16-31: row index
     // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tensor-memory-addressing
     int tmem_addr = tmem_base_addr_reg + (row << 16) + base_col;
 
-    // with .x4, the warp loads 32 rows × 4 columns, where each lane gets 4 floats in register memory.
+    // with .x4, the warp loads 32 rows × 8 columns, where each lane gets 8 floats in register memory.
     // see: matrix fragment layout docs: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-matrix-fragments-shape-3232b
     asm volatile(
-        "tcgen05.ld.sync.aligned.32x32b.x4.b32 {"
-        "%0, %1, %2, %3"
-        "}, [%4];"
-        :   "=f"(c_reg[0]), "=f"(c_reg[1]), "=f"(c_reg[2]), "=f"(c_reg[3])
+        "tcgen05.ld.sync.aligned.32x32b.x8.b32 {"
+        "%0, %1, %2, %3, %4, %5, %6, %7"
+        "}, [%8];"
+        : "=f"(c_reg[0]), "=f"(c_reg[1]), "=f"(c_reg[2]), "=f"(c_reg[3]), "=f"(c_reg[4]), "=f"(c_reg[5]), "=f"(c_reg[6]), "=f"(c_reg[7])
         : "r"(tmem_addr)
     );
 
@@ -513,6 +513,20 @@ void consumer_warp(
     }
 }
 
+__device__ __forceinline__ void store_global_256b_float_array(float* ptr, float const c_reg[8]) {
+    const uint64_t* c_ptr = reinterpret_cast<const uint64_t*>(c_reg);
+    asm volatile (
+        "st.global.v4.u64 [%0], {%1, %2, %3, %4};"
+        : 
+        : "l"(ptr),      
+          "l"(c_ptr[0]), // c_reg[0] and c_reg[1]
+          "l"(c_ptr[1]), // c_reg[2] and c_reg[3]
+          "l"(c_ptr[2]), // c_reg[4] and c_reg[5]
+          "l"(c_ptr[3])  // c_reg[6] and c_reg[7]
+        : "memory"
+    );
+}
+
 template<int BM, int BN>
 __device__ __noinline__
 void epilogue_warpgroup(
@@ -532,7 +546,7 @@ void epilogue_warpgroup(
 ) {
     constexpr int CTA_GROUP_SIZE = 2;
     constexpr int TMEM_BUFFERS = 2;
-    constexpr int COLS_PER_THREAD = 4;
+    constexpr int COLS_PER_THREAD = 8;
 
     int epilogue_tmem_buf = 0;
     int mma_parity[TMEM_BUFFERS] = {0};
@@ -556,12 +570,14 @@ void epilogue_warpgroup(
 
         #pragma unroll
         for (int i = 0; i < BN/COLS_PER_THREAD; i++) {
+            // load from tmem -> reg
             float c_reg[COLS_PER_THREAD];
             const int tmem_base_col = i * COLS_PER_THREAD;
             tcgen05_ld(tmem_addr_reg, tmem_base_row, tmem_base_col, c_reg);
 
+            // reg -> gmem with STG.256 
             const int c_col = block_n * BN + i * COLS_PER_THREAD;
-            *reinterpret_cast<float4*>(C + c_row * N + c_col) = *reinterpret_cast<float4*>(c_reg);
+            store_global_256b_float_array(C + c_row * N + c_col, c_reg);
         }
 
         uint32_t epilogue_mbar_addr_for_tmem_buf = epilogue_mbar_addr + epilogue_tmem_buf * sizeof(uint64_t);
