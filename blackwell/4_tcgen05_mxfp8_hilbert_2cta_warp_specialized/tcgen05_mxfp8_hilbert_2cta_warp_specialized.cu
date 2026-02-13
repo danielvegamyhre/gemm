@@ -37,7 +37,7 @@ inline void* get_driver_ptr() {
 }
 
 
-void create_2d_uint8_tensor_map(
+void create_2d_tensor_map(
     void* tensor_ptr,
     CUtensorMap& tensor_map,
     const uint64_t global_height,
@@ -73,7 +73,7 @@ void create_2d_uint8_tensor_map(
 }
 
 
-void create_3d_bf16_tensor_map(
+void create_3d_tensor_map(
     void* tensor_ptr,
     CUtensorMap& tensor_map,
     const uint64_t global_dims[3],
@@ -274,23 +274,27 @@ __device__ __forceinline__ void tcgen05_encode_idesc(uint32_t& idesc) {
     idesc |= (MMA_M >> 4) << 24;                // M dim of matrix A
 }
 
-__device__ __forceinline__ void tcgen05_mma(
+__device__ __forceinline__ void tcgen05_mma_mxfp8(
     uint64_t smem_a_desc,
     uint64_t smem_b_desc,
+    int tmem_sfa_addr,
+    int tmem_sfb_addr,
     int tmem_accum_addr,
     uint32_t idesc,
     int enable_accum
 ) {
-    // tcgen05.mma.cta_group.kind   [d-tmem],  a-desc,  b-desc, idesc, { disable-output-lane }, enable-input-d {, scale-input-d};
+    // tcgen05.mma.cta_group.kind.block_scale{.scale_vectorsize}
+    //                                    [d-tmem],  a-desc,  b-desc, idesc,
+    //                                    [scale-A-tmem], [scale-B-tmem], enable-input-d;
     // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-instructions-mma
     asm volatile(
         "{\n\t"
         ".reg .pred p;\n\t"              // declare predicate register for enable-input-d
         "setp.ne.s32 p, %4, 0;\n\t"      // p = 0 for mma tile 0, then 1 after
-        "tcgen05.mma.cta_group::2.kind::f16 [%0], %1, %2, %3, p;\n"
+        "tcgen05.mma.cta_group::2.kind::mxf8f6f4 [%0], %1, %2, %3, [%4], [%5] p;\n"
         "}"
         :
-        : "r"(tmem_accum_addr), "l"(smem_a_desc), "l"(smem_b_desc), "r"(idesc), "r"(enable_accum)
+        : "r"(tmem_accum_addr), "l"(smem_a_desc), "l"(smem_b_desc), "r"(idesc), "r"(tmem_sfa_addr), "r"(tmem_sfb_addr), "r"(enable_accum)
     );
 }
 
@@ -531,7 +535,7 @@ void ws_gemm_2cta_mma(
     if (warp_id == 0)
     {
         // allocate 2 temm buffers of BN cols each
-        tcgen05_alloc<(BN + SF_K) * TMEM_BUFFERS>(tmem_addr_smem);
+        tcgen05_alloc<(BN + 2 * SF_K) * TMEM_BUFFERS>(tmem_addr_smem);
     }
 
     // make sure mbarriers and tmem addr are visible to full cluster
@@ -636,6 +640,7 @@ void ws_gemm_2cta_mma(
     else if (cta_rank == 0 && warp_id == CONSUMER_WARP_ID && is_mma_master_thread)
     {
         // track blocks processed so when it's >= TMEM_BUFFERS we know we need to wait on epilogue mbar before re-using it
+        int tmem_base_addr = *reinterpret_cast<int*>(__cvta_shared_to_generic(tmem_addr_smem));
         int blocks_processed = 0;
         for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
             // make tcgen05 mma instruction descriptor, to be re-used at every iter of the loop
@@ -643,7 +648,8 @@ void ws_gemm_2cta_mma(
             tcgen05_encode_idesc<CTA_GROUP_SIZE * MMA_M, MMA_N>(idesc); // each CTA in pair loads BM rows of A, and BN/2 cols of B
 
             // read base tmem addr from smem, then offset to the correct buffer
-            int tmem_addr_reg = *reinterpret_cast<int*>(__cvta_shared_to_generic(tmem_addr_smem)) + mma_tmem_buf * BN;
+            int tmem_accum_addr = tmem_base_addr + mma_tmem_buf * BN;
+            int tmem_sfa_addr = tmem_base_addr + 
 
             // make cta mask used for tcgen05_commit_multicast signaling.
             // 1 bit for cta rank 0, 1 bit for cta rank 1
@@ -684,7 +690,7 @@ void ws_gemm_2cta_mma(
                         uint64_t smem_b_desc = make_smem_desc(smem_buff_b + b_k_off);
 
                         int enable_accum = (block_k_idx == 0 && bk_chunk == 0 && mma_iter == 0) ? 0 : 1;
-                        tcgen05_mma(smem_a_desc, smem_b_desc, tmem_addr_reg, idesc, enable_accum);
+                        tcgen05_mma_mxfp8(smem_a_desc, smem_b_desc, tmem_accum_addr, idesc, enable_accum);
                     }
                 }
                 // signal to both CTAs that this smem buffer can be re-used when mma is done (async)
@@ -779,7 +785,7 @@ void ws_gemm_2cta_mma(
     if (warp_id == 0)
     {
         int tmem_addr_reg = *reinterpret_cast<int*>(__cvta_shared_to_generic(tmem_addr_smem));
-        tcgen05_dealloc<(BN + SF_K) * TMEM_BUFFERS>(tmem_addr_reg);
+        tcgen05_dealloc<(BN + 2 * SF_K) * TMEM_BUFFERS>(tmem_addr_reg);
     }
 }
 
@@ -813,7 +819,7 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     uint64_t a_global_dims[3] = {64, (uint64_t)M, (uint64_t)(K / 64)};
     uint32_t a_smem_dims[3] = {64, BM, BK / 64}; // for 2 CTA mma, each CTA still loads the full BM rows of A into smem
     uint32_t a_strides[2] = {(uint32_t)(K * sizeof(uint8_t)), 64 * sizeof(uint8_t)};
-    create_3d_bf16_tensor_map(
+    create_3d_tensor_map(
         A,
         a_map,
         a_global_dims,
@@ -827,7 +833,7 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     uint64_t b_global_dims[3] = {64, (uint64_t)N, (uint64_t)(K / 64)};
     uint32_t b_smem_dims[3] = {64, BN/CTA_GROUP_SIZE, BK / 64}; // for 2 CTA MMA, each CTA loads BN/2 cols of B into smem
     uint32_t b_strides[2] = {(uint32_t)(K * sizeof(uint8_t)), 64 * sizeof(uint8_t)};
-    create_3d_bf16_tensor_map(
+    create_3d_tensor_map(
         B,
         b_map,
         b_global_dims,
@@ -835,10 +841,9 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
         b_strides
     );
 
-
     alignas(64) CUtensorMap sfa_map = {};
     alignas(64) CUtensorMap sfb_map = {};    
-    create_2d_uint8_tensor_map(
+    create_2d_tensor_map(
         SFA,
         sfa_map,
         M,          // gmem height
@@ -847,7 +852,7 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
         BK/32,      // smem width
         K/32        // global stride bytes
     );
-    create_2d_uint8_tensor_map(
+    create_2d_tensor_map(
         SFB,
         sfb_map,
         N,          // gmem height
