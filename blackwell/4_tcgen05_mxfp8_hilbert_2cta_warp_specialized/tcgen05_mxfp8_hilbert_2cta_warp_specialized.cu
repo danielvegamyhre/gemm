@@ -529,13 +529,13 @@ void ws_gemm_2cta_mma(
     int epilogue_parity[TMEM_BUFFERS] = {0};
 
     // alloc tmem addr for accumulator. allocates BN columns of TMEM (must always alloc full 128 rows)
-    // 1 warp must do the allocation, from PTX docs:
-    // "When .cta_group::1 is specified, one warp from the CTA must perform the allocation and de-allocation."
+    // 1 warp must do the allocation
     // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-memory-alloc-manage-instructions
+    constexpr int TMEM_WIDTH = BN + SF_K * 2;
     if (warp_id == 0)
     {
         // allocate 2 temm buffers of BN cols each
-        tcgen05_alloc<(BN + 2 * SF_K) * TMEM_BUFFERS>(tmem_addr_smem);
+        tcgen05_alloc<TMEM_WIDTH * TMEM_BUFFERS>(tmem_addr_smem);
     }
 
     // make sure mbarriers and tmem addr are visible to full cluster
@@ -785,7 +785,7 @@ void ws_gemm_2cta_mma(
     if (warp_id == 0)
     {
         int tmem_addr_reg = *reinterpret_cast<int*>(__cvta_shared_to_generic(tmem_addr_smem));
-        tcgen05_dealloc<(BN + 2 * SF_K) * TMEM_BUFFERS>(tmem_addr_reg);
+        tcgen05_dealloc<TMEM_WIDTH * TMEM_BUFFERS>(tmem_addr_reg);
     }
 }
 
@@ -814,11 +814,12 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     constexpr int CTA_GROUP_SIZE = 2;
 
     // BM, BK
-    // BM, BK/64, 64 -> (64 elems = 128 bytes of bf16)
-    // BK/64, BM, 64 -> BK/64 instances of BM,64 strips
-    uint64_t a_global_dims[3] = {64, (uint64_t)M, (uint64_t)(K / 64)};
-    uint32_t a_smem_dims[3] = {64, BM, BK / 64}; // for 2 CTA mma, each CTA still loads the full BM rows of A into smem
-    uint32_t a_strides[2] = {(uint32_t)(K * sizeof(uint8_t)), 64 * sizeof(uint8_t)};
+    // BM, BK/128, 128 -> (128 elems = 128 bytes of fp8)
+    // BK/128, BM, 128 -> BK/128 instances of BM,128 strips
+    constexpr int SWIZZLE_ATOM_K = 128;
+    uint64_t a_global_dims[3] = {SWIZZLE_ATOM_K, (uint64_t)M, (uint64_t)(K / SWIZZLE_ATOM_K)};
+    uint32_t a_smem_dims[3] = {SWIZZLE_ATOM_K, BM, BK / SWIZZLE_ATOM_K}; // for 2 CTA mma, each CTA still loads the full BM rows of A into smem
+    uint32_t a_strides[2] = {(uint32_t)(K * sizeof(uint8_t)), SWIZZLE_ATOM_K * sizeof(uint8_t)};
     create_3d_tensor_map(
         A,
         a_map,
@@ -828,11 +829,11 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     );
 
     // BK, BN
-    // 64, BK/64, BN
-    // 64, BN, BK/64 -> BK/64 instances of BN,64 strips
-    uint64_t b_global_dims[3] = {64, (uint64_t)N, (uint64_t)(K / 64)};
-    uint32_t b_smem_dims[3] = {64, BN/CTA_GROUP_SIZE, BK / 64}; // for 2 CTA MMA, each CTA loads BN/2 cols of B into smem
-    uint32_t b_strides[2] = {(uint32_t)(K * sizeof(uint8_t)), 64 * sizeof(uint8_t)};
+    // 128, BK/128, BN
+    // 128, BN, BK/128-> BK/128instances of BN,128 strips
+    uint64_t b_global_dims[3] = {SWIZZLE_ATOM_K, (uint64_t)N, (uint64_t)(K / SWIZZLE_ATOM_K)};
+    uint32_t b_smem_dims[3] = {SWIZZLE_ATOM_K, BN/CTA_GROUP_SIZE, BK / SWIZZLE_ATOM_K}; // for 2 CTA MMA, each CTA loads BN/2 cols of B into smem
+    uint32_t b_strides[2] = {(uint32_t)(K * sizeof(uint8_t)), SWIZZLE_ATOM_K * sizeof(uint8_t)};
     create_3d_tensor_map(
         B,
         b_map,

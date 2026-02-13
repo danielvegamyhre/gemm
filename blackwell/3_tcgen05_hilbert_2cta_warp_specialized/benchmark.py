@@ -5,9 +5,9 @@ from triton.testing import do_bench
 custom_gemm = load(
     name='tcgen05_hilbert_2cta_warp_specialized',
     sources=['tcgen05_hilbert_2cta_warp_specialized.cpp', 'tcgen05_hilbert_2cta_warp_specialized.cu'],
-    extra_cuda_cflags=['-O3', '--use_fast_math', '-gencode=arch=compute_100a,code=sm_100a'],
+    extra_cuda_cflags=['-O3', '--use_fast_math', '-gencode=arch=compute_100a,code=sm_100a', '--ptxas-options=-v'],
     extra_cflags=['-O3'],
-    verbose=False
+    verbose=True
 )
 
 def benchmark():
@@ -15,7 +15,7 @@ def benchmark():
         return do_bench(lambda: f(*args, **kwargs), return_mode="median") * 1e3
 
     sizes = [
-        # (4096, 4096, 4096),
+        (4096, 4096, 4096),
         (16384, 16384, 16384),
     ]
 
@@ -39,6 +39,7 @@ def benchmark():
             B.t(),
             C,
         )
+        torch.cuda.synchronize()
 
         # Benchmark PyTorch
         out = torch.zeros(M, N, device="cuda", dtype=torch.float32)
@@ -49,6 +50,7 @@ def benchmark():
             out_dtype=torch.float32,
             out=out,
         )
+        torch.cuda.synchronize()
 
         # Calculate tflops
         flops = 2.0 * M * N * K
