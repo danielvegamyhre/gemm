@@ -457,18 +457,22 @@ void consumer_warp(
     constexpr int TMEM_BUFFERS = 2;
     constexpr int SMEM_A_SIZE = BM * BK * sizeof(__nv_bfloat16);
     constexpr int SMEM_B_SIZE = (BN / CTA_GROUP_SIZE) * BK * sizeof(__nv_bfloat16);
+    constexpr int SWIZZLE_ATOM_K = 64;
+    constexpr int SWIZZLE_ATOM_K_BYTES = SWIZZLE_ATOM_K * sizeof(__nv_bfloat16);
+    constexpr int MMA_K_BYTES = MMA_K * sizeof(__nv_bfloat16);
 
     int mma_smem_buf = 0;
     int mma_tmem_buf = 0;
     int smem_full_parity[QUEUE_SIZE] = {0};
     int epilogue_parity[TMEM_BUFFERS] = {0};
     int blocks_processed = 0;
+    int tmem_base_addr = *reinterpret_cast<int*>(__cvta_shared_to_generic(tmem_addr_smem));
 
     for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
         uint32_t idesc = 0;
         tcgen05_encode_idesc<CTA_GROUP_SIZE * MMA_M, MMA_N>(idesc);
 
-        int tmem_addr_reg = *reinterpret_cast<int*>(__cvta_shared_to_generic(tmem_addr_smem)) + mma_tmem_buf * BN;
+        int tmem_addr_reg = tmem_base_addr + mma_tmem_buf * BN;
 
         uint16_t cta_mask = 0b11;
         const int num_blocks_k = (K + BK - 1) / BK;
@@ -479,26 +483,27 @@ void consumer_warp(
             epilogue_parity[mma_tmem_buf] ^= 1;
         }
 
+        bool enable_accum = false;
         for (int block_k_idx = 0; block_k_idx < num_blocks_k; block_k_idx++) {
-
             mbarrier_wait_parity(smem_full_mbar_addr + mma_smem_buf * sizeof(uint64_t), smem_full_parity[mma_smem_buf]);
             smem_full_parity[mma_smem_buf] ^= 1;
 
-            for (int bk_chunk = 0; bk_chunk < BK / 64; bk_chunk++) {
-                for (int mma_iter = 0; mma_iter < 64 / MMA_K; mma_iter++) {
-                    const int a_chunk_off = bk_chunk * BM * 64 * sizeof(__nv_bfloat16);
-                    const int b_chunk_off = bk_chunk * (BN / CTA_GROUP_SIZE) * 64 * sizeof(__nv_bfloat16);
-                    const int a_k_off = a_chunk_off + mma_iter * MMA_K * sizeof(__nv_bfloat16);
-                    const int b_k_off = b_chunk_off + mma_iter * MMA_K * sizeof(__nv_bfloat16);
+            uint32_t smem_buff_a = smem + mma_smem_buf * (SMEM_A_SIZE + SMEM_B_SIZE);
+            uint32_t smem_buff_b = smem_buff_a + SMEM_A_SIZE;
+            for (int bk_chunk = 0; bk_chunk < BK / SWIZZLE_ATOM_K; bk_chunk++) {
+                const int a_chunk_off = bk_chunk * BM * SWIZZLE_ATOM_K_BYTES;
+                const int b_chunk_off = bk_chunk * (BN / CTA_GROUP_SIZE) * SWIZZLE_ATOM_K_BYTES;
 
-                    uint32_t smem_buff_a = smem + mma_smem_buf * (SMEM_A_SIZE + SMEM_B_SIZE);
-                    uint32_t smem_buff_b = smem_buff_a + SMEM_A_SIZE;
+                for (int mma_iter = 0; mma_iter < SWIZZLE_ATOM_K / MMA_K; mma_iter++) {
+                    const int a_k_off = a_chunk_off + mma_iter * MMA_K_BYTES;
+                    const int b_k_off = b_chunk_off + mma_iter * MMA_K_BYTES;
 
                     uint64_t smem_a_desc = make_smem_desc(smem_buff_a + a_k_off);
                     uint64_t smem_b_desc = make_smem_desc(smem_buff_b + b_k_off);
 
-                    int enable_accum = (block_k_idx == 0 && bk_chunk == 0 && mma_iter == 0) ? 0 : 1;
                     tcgen05_mma(smem_a_desc, smem_b_desc, tmem_addr_reg, idesc, enable_accum);
+                     if (block_k_idx == 0 && bk_chunk == 0 && mma_iter == 0)
+                        enable_accum = true;
                 }
             }
             tcgen05_commit_multicast(smem_empty_mbar_addr + mma_smem_buf * sizeof(uint64_t), cta_mask);
@@ -550,6 +555,7 @@ void epilogue_warpgroup(
 
     int epilogue_tmem_buf = 0;
     int mma_parity[TMEM_BUFFERS] = {0};
+    int tmem_base_addr = *reinterpret_cast<int*>(__cvta_shared_to_generic(tmem_addr_smem));
 
     for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
         const int bid = group_id * CTA_GROUP_SIZE + (start_bid % CTA_GROUP_SIZE);
@@ -563,7 +569,7 @@ void epilogue_warpgroup(
 
         asm volatile("tcgen05.fence::after_thread_sync;");
 
-        int tmem_addr_reg = *reinterpret_cast<int*>(__cvta_shared_to_generic(tmem_addr_smem)) + epilogue_tmem_buf * BN;
+        int tmem_addr_reg = tmem_base_addr + epilogue_tmem_buf * BN;
 
         const int c_row = block_m * BM + ep_warp_id * 32 + lane_id;
         const int tmem_base_row = ep_warp_id * 32;
@@ -799,9 +805,9 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     constexpr int mma_mbar_size = TMEM_BUFFERS * sizeof(uint64_t);
     constexpr int epilogue_mbar_size = TMEM_BUFFERS * sizeof(uint64_t);
     constexpr int tmem_addr_size = sizeof(int);
-    constexpr int total_smem_per_stage = smem_a_size + smem_b_size + smem_full_mbar_size + smem_empty_mbar_size + mma_mbar_size + epilogue_mbar_size + tmem_addr_size;
+    constexpr int total_smem_per_stage = smem_a_size + smem_b_size + smem_full_mbar_size + smem_empty_mbar_size;
     constexpr int QUEUE_SIZE = max_smem_per_sm / total_smem_per_stage;
-    constexpr int total_smem = total_smem_per_stage * QUEUE_SIZE;
+    constexpr int total_smem = total_smem_per_stage * QUEUE_SIZE +  mma_mbar_size + epilogue_mbar_size + tmem_addr_size;
 
     const int launch_blocks = min(NUM_SMS, (M/BM)*(N/BN)) & ~1; // round down to nearest even
     dim3 grid_dim(launch_blocks);

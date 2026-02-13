@@ -30,7 +30,6 @@ def benchmark():
         # Warmup
         for _ in range(5):
             custom_gemm.gemm_cuda(A, B.t(), C)
-        torch.cuda.synchronize()
 
         # Benchmark custom kernel
         custom_us = benchmark_cuda_function_in_microseconds(
@@ -39,10 +38,12 @@ def benchmark():
             B.t(),
             C,
         )
-        torch.cuda.synchronize()
 
         # Benchmark PyTorch
         out = torch.zeros(M, N, device="cuda", dtype=torch.float32)
+        for _ in range(5):
+            torch.mm(A, B.t(), out_dtype=torch.float32, out=out)
+
         torch_us = benchmark_cuda_function_in_microseconds(
             torch.mm,
             A,
