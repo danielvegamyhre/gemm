@@ -392,6 +392,15 @@ void producer_warp(
     int tma_smem_buf = 0;
     int smem_empty_parity[QUEUE_SIZE] = {0};
 
+    // pre-compute mapped barrier addresses to avoid repeated arithmetic and mapping in loop
+    uint32_t smem_full_mbar_addrs[QUEUE_SIZE];
+    for (int i = 0; i < QUEUE_SIZE; i++) {
+        smem_full_mbar_addrs[i] = smem_full_mbar_addr + i * sizeof(uint64_t);
+        if (cta_rank == 1) {
+            smem_full_mbar_addrs[i] = map_smem_addr_to_cta_rank(smem_full_mbar_addrs[i], 0);
+        }
+    }
+
     for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
         const int bid = group_id * CTA_GROUP_SIZE + (start_bid % CTA_GROUP_SIZE);
         auto [block_m, block_n] = compute_bid_hilbert(bid, grid_m, grid_n);
@@ -411,12 +420,7 @@ void producer_warp(
             const uint32_t B_smem = A_smem + SMEM_A_SIZE;
             int global_k_off = block_k_idx * BK;
 
-            uint32_t smem_full_mbar_mapped = smem_full_mbar_addr + tma_smem_buf * sizeof(uint64_t);
-            if (cta_rank == 1)
-            {
-                smem_full_mbar_mapped = map_smem_addr_to_cta_rank(smem_full_mbar_mapped, 0);
-            }
-            mbarrier_arrive_expect_tx(smem_full_mbar_mapped, SMEM_A_SIZE + SMEM_B_SIZE);
+            mbarrier_arrive_expect_tx(smem_full_mbar_addrs[tma_smem_buf], SMEM_A_SIZE + SMEM_B_SIZE);
 
             cp_async_bulk_tensor_3d_global_to_shared(
                 A_smem,
@@ -424,7 +428,7 @@ void producer_warp(
                 0,
                 (uint32_t)global_m_off,
                 (uint32_t)global_k_off/64,
-                smem_full_mbar_mapped
+                smem_full_mbar_addrs[tma_smem_buf]
             );
             cp_async_bulk_tensor_3d_global_to_shared(
                 B_smem,
@@ -432,7 +436,7 @@ void producer_warp(
                 0,
                 (uint32_t)global_n_off,
                 (uint32_t)global_k_off/64,
-                smem_full_mbar_mapped
+                smem_full_mbar_addrs[tma_smem_buf]
             );
             tma_smem_buf = (tma_smem_buf + 1) % QUEUE_SIZE;
         }
@@ -518,7 +522,7 @@ void consumer_warp(
     }
 }
 
-__device__ __forceinline__ void store_global_256b_float_array(float* ptr, float const c_reg[8]) {
+__device__ __forceinline__ void st_global_256b(float* ptr, float const c_reg[8]) {
     const uint64_t* c_ptr = reinterpret_cast<const uint64_t*>(c_reg);
     asm volatile (
         "st.global.v4.u64 [%0], {%1, %2, %3, %4};"
@@ -557,6 +561,15 @@ void epilogue_warpgroup(
     int mma_parity[TMEM_BUFFERS] = {0};
     int tmem_base_addr = *reinterpret_cast<int*>(__cvta_shared_to_generic(tmem_addr_smem));
 
+    // pre-compute mapped barrier addresses to avoid repeated arithmetic and mapping in loop
+    uint32_t epilogue_mbar_addrs[TMEM_BUFFERS];
+    for (int i = 0; i < TMEM_BUFFERS; i++) {
+        epilogue_mbar_addrs[i] = epilogue_mbar_addr + i * sizeof(uint64_t);
+        if (cta_rank == 1) {
+            epilogue_mbar_addrs[i] = map_smem_addr_to_cta_rank(epilogue_mbar_addrs[i], 0);
+        }
+    }
+
     for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
         const int bid = group_id * CTA_GROUP_SIZE + (start_bid % CTA_GROUP_SIZE);
         auto [block_m, block_n] = compute_bid_hilbert(bid, grid_m, grid_n);
@@ -573,26 +586,33 @@ void epilogue_warpgroup(
 
         const int c_row = block_m * BM + ep_warp_id * 32 + lane_id;
         const int tmem_base_row = ep_warp_id * 32;
+        constexpr int store_iters = BN / COLS_PER_THREAD;
 
+        float c_reg[COLS_PER_THREAD];
         #pragma unroll
-        for (int i = 0; i < BN/COLS_PER_THREAD; i++) {
+        for (int i = 0; i < store_iters; i++) {
             // load from tmem -> reg
-            float c_reg[COLS_PER_THREAD];
+
             const int tmem_base_col = i * COLS_PER_THREAD;
             tcgen05_ld(tmem_addr_reg, tmem_base_row, tmem_base_col, c_reg);
 
+            // break after last tmem load but before load gmem store, so we can signal mbar first
+            if (i == store_iters-1) break;
+
             // reg -> gmem with STG.256 
             const int c_col = block_n * BN + i * COLS_PER_THREAD;
-            store_global_256b_float_array(C + c_row * N + c_col, c_reg);
+            st_global_256b(C + c_row * N + c_col, c_reg);
         }
 
-        uint32_t epilogue_mbar_addr_for_tmem_buf = epilogue_mbar_addr + epilogue_tmem_buf * sizeof(uint64_t);
-        if (cta_rank == 1) {
-            epilogue_mbar_addr_for_tmem_buf = map_smem_addr_to_cta_rank(epilogue_mbar_addr_for_tmem_buf, 0);
-        }
-        mbarrier_arrive(epilogue_mbar_addr_for_tmem_buf);
+        // signal mma warp that tmem buffer is consumed and can be re-used
+        mbarrier_arrive(epilogue_mbar_addrs[epilogue_tmem_buf]);
+
+        // do final store
+        const int c_col = block_n * BN + (store_iters - 1) * COLS_PER_THREAD;
+        st_global_256b(C + c_row * N + c_col, c_reg);
 
         epilogue_tmem_buf = (epilogue_tmem_buf + 1) % TMEM_BUFFERS;
+
     }
 }
 
@@ -664,9 +684,12 @@ void ws_gemm_2cta_mma(
     initialize_barriers<TMEM_BUFFERS, 128 * CTA_GROUP_SIZE>(epilogue_mbar, is_producer_master_thread); // one mbar per TMEM buffer for tracking when tmem->reg has finished
     asm volatile("fence.mbarrier_init.release.cluster;");  
 
+    // get cluster rank in this 2 CTA group
     uint32_t cta_rank;
     asm volatile("mov.u32 %0, %cluster_ctaid.x;" : "=r"(cta_rank));
-
+    
+    // only one warp allocactes tmem 
+    // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instructions-tcgen05-alloc-dealloc-relinquish-alloc-permit
     if (warp_id == 0)
     {
         tcgen05_alloc<BN * TMEM_BUFFERS>(tmem_addr_smem);
@@ -713,6 +736,29 @@ void ws_gemm_2cta_mma(
     {
         int tmem_addr_reg = *reinterpret_cast<int*>(__cvta_shared_to_generic(tmem_addr_smem));
         tcgen05_dealloc<BN * TMEM_BUFFERS>(tmem_addr_reg);
+    }
+}
+
+// cache SM count
+inline int get_num_sms() {
+    static int num_sms = []() {
+        int sms;
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+        return sms;
+    }();
+    return num_sms;
+}
+
+// set kernel max shared memory once only
+inline void set_kernel_max_smem_once(const void* kernel, int total_smem) {
+    static bool initialized = false;
+    if (!initialized) {
+        CUDA_CHECK(cudaFuncSetAttribute(
+            kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            total_smem
+        ));
+        initialized = true;
     }
 }
 
@@ -781,10 +827,9 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     constexpr int tmem_width_bytes = 512 * 4;
     assert(BN * 2 <= tmem_width_bytes);
 
-    
+
     // persistent kernel runs 1 threadblock per SM
-    int NUM_SMS;
-    cudaDeviceGetAttribute(&NUM_SMS, cudaDevAttrMultiProcessorCount, 0);
+    const int NUM_SMS = get_num_sms();
 
     // use max smem per SM on sm100 to determine queue size
     constexpr int max_smem_per_sm = 227 * 1024;
@@ -814,11 +859,7 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     dim3 block_dim(BLOCK_SIZE);
     auto kernel = ws_gemm_2cta_mma<QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K>;
 
-    CUDA_CHECK(cudaFuncSetAttribute(
-        kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        total_smem
-    ));
+    set_kernel_max_smem_once((const void*)kernel, total_smem);
 
     kernel<<<grid_dim, block_dim, total_smem>>>(a_map, b_map, c_ptr, M, N, K);
 }
