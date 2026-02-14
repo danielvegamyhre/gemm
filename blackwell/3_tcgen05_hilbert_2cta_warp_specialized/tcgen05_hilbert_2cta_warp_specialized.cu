@@ -254,20 +254,41 @@ __device__ __forceinline__ void tcgen05_commit_multicast(uint32_t mbar_addr, uin
 // each warp of a warpgroup in the CTA can access a chunk of the Tensor Memory. 
 // All the columns of the Tensor Memory can be accessed by all the four warps of a warpgroup."
 // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-tensor-memory-ld-st
-__device__ __forceinline__ void tcgen05_ld(int tmem_base_addr_reg, int row, int base_col, float c_reg[8]) {
+__device__ __forceinline__ void tcgen05_ld_32x32b_x8(int tmem_base_addr_reg, int row, int base_col, float c_reg[8]) {
     // TMEM address is 32bit and composed of 2 components:
     // - bits 0-15: column index
     // - bits 16-31: row index
     // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tensor-memory-addressing
     int tmem_addr = tmem_base_addr_reg + (row << 16) + base_col;
 
-    // with .x4, the warp loads 32 rows × 8 columns, where each lane gets 8 floats in register memory.
+    // with .x8, the warp loads 32 rows × 8 columns, where each lane gets 8 floats in register memory.
     // see: matrix fragment layout docs: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-matrix-fragments-shape-3232b
     asm volatile(
         "tcgen05.ld.sync.aligned.32x32b.x8.b32 {"
         "%0, %1, %2, %3, %4, %5, %6, %7"
         "}, [%8];"
         : "=f"(c_reg[0]), "=f"(c_reg[1]), "=f"(c_reg[2]), "=f"(c_reg[3]), "=f"(c_reg[4]), "=f"(c_reg[5]), "=f"(c_reg[6]), "=f"(c_reg[7])
+        : "r"(tmem_addr)
+    );
+
+    // from PTX docs: "Prevents subsequent tcgen05.mma from racing ahead of the tcgen05.ld"
+    asm volatile("tcgen05.wait::ld.sync.aligned;");
+}
+
+__device__ __forceinline__ void tcgen05_ld_16x256b(int tmem_base_addr_reg, int row, int base_col, float c_reg[2][2]) {
+    // TMEM address is 32bit and composed of 2 components:
+    // - bits 0-15: column index
+    // - bits 16-31: row index
+    // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tensor-memory-addressing
+    int tmem_addr = tmem_base_addr_reg + (row << 16) + base_col;
+
+    // with .x8, the warp loads 32 rows × 8 columns, where each lane gets 8 floats in register memory.
+    // see: matrix fragment layout docs: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-matrix-fragments-shape-3232b
+    asm volatile(
+        "tcgen05.ld.sync.aligned.16x256b.x1.b32 {"
+        "%0, %1, %2, %3"
+        "}, [%4];"
+        : "=f"(c_reg[0][0]), "=f"(c_reg[0][1]), "=f"(c_reg[1][0]), "=f"(c_reg[1][1])
         : "r"(tmem_addr)
     );
 
@@ -570,7 +591,8 @@ void epilogue_warpgroup(
 ) {
     constexpr int CTA_GROUP_SIZE = 2;
     constexpr int TMEM_BUFFERS = 2;
-    constexpr int COLS_PER_THREAD = 8;
+    constexpr int COLS_PER_TMEM_LOAD = 256 / 8; // each thread loads 256b = 8 floats per iteration
+    constexpr int store_iters = BN / COLS_PER_TMEM_LOAD;
 
     int epilogue_tmem_buf = 0;
     int mma_parity[TMEM_BUFFERS] = {0};
@@ -599,34 +621,47 @@ void epilogue_warpgroup(
         asm volatile("tcgen05.fence::after_thread_sync;");
 
         int tmem_addr_reg = tmem_base_addr + epilogue_tmem_buf * BN;
-
-        const int c_row = block_m * BM + ep_warp_id * 32 + lane_id;
         const int tmem_base_row = ep_warp_id * 32;
-        constexpr int store_iters = BN / COLS_PER_THREAD;
 
-        float c_reg[COLS_PER_THREAD];
+        float c_reg[2][2]; // register to hold output tile from tmem, 16x256b each thread holds 4 floats
         #pragma unroll
-        for (int i = 0; i < store_iters; i++) {
-            // load from tmem -> reg
-
-            const int tmem_base_col = i * COLS_PER_THREAD;
-            tcgen05_ld(tmem_addr_reg, tmem_base_row, tmem_base_col, c_reg);
+        for (int i= 0; i < store_iters; i++) {
+            const int tmem_base_col = i * COLS_PER_TMEM_LOAD;
 
             // break after last tmem load but before load gmem store, so we can signal mbar first
             if (i == store_iters-1) break;
 
-            // reg -> gmem with STG.256 
-            const int c_col = block_n * BN + i * COLS_PER_THREAD;
-            st_global_256b(C + c_row * N + c_col, c_reg);
+            // see diagram here: https://x.com/nrehiew_/status/2019422200894505086?s=20
+            #pragma unroll
+            for (int batch = 0; batch < 2; batch++) {
+                // load from tmem to reg - loads into BOTH c_reg[0] and c_reg[1]
+                tcgen05_ld_16x256b(tmem_addr_reg, tmem_base_row + batch * 16, tmem_base_col, c_reg);
+
+                const int c_row_base = block_m * BM + ep_warp_id * 32 + batch * 16 + (lane_id / 4);
+                const int c_col = block_n * BN + i * COLS_PER_TMEM_LOAD + (lane_id % 4) * 2;
+
+                // Store both c_reg[0] and c_reg[1] that were loaded
+                *reinterpret_cast<float2*>(C + c_row_base * N + c_col) = *reinterpret_cast<float2*>(c_reg[0]);
+                *reinterpret_cast<float2*>(C + (c_row_base + 8) * N + c_col) = *reinterpret_cast<float2*>(c_reg[1]);
+            }
         }
 
         // signal mma warp that tmem buffer is consumed and can be re-used
         mbarrier_arrive(epilogue_mbar_addrs[epilogue_tmem_buf]);
 
         // do final store
-        const int c_col = block_n * BN + (store_iters - 1) * COLS_PER_THREAD;
-        st_global_256b(C + c_row * N + c_col, c_reg);
+        #pragma unroll
+        for (int batch = 0; batch < 2; batch++) {
+            // load the last column chunk
+            tcgen05_ld_16x256b(tmem_addr_reg, tmem_base_row + batch * 16, (store_iters - 1) * COLS_PER_TMEM_LOAD, c_reg);
 
+            const int c_row_base = block_m * BM + ep_warp_id * 32 + batch * 16 + (lane_id / 4);
+            const int c_col = block_n * BN + (store_iters - 1) * COLS_PER_TMEM_LOAD + (lane_id % 4) * 2;
+
+            // Store both c_reg[0] and c_reg[1]
+            *reinterpret_cast<float2*>(C + c_row_base * N + c_col) = *reinterpret_cast<float2*>(c_reg[0]);
+            *reinterpret_cast<float2*>(C + (c_row_base + 8) * N + c_col) = *reinterpret_cast<float2*>(c_reg[1]);
+        }
         epilogue_tmem_buf = (epilogue_tmem_buf + 1) % TMEM_BUFFERS;
 
     }
