@@ -394,8 +394,10 @@ void producer_warp(
 
     // pre-compute mapped barrier addresses to avoid repeated arithmetic and mapping in loop
     uint32_t smem_full_mbar_addrs[QUEUE_SIZE];
+    uint32_t smem_empty_mbar_addrs[QUEUE_SIZE];
     for (int i = 0; i < QUEUE_SIZE; i++) {
         smem_full_mbar_addrs[i] = smem_full_mbar_addr + i * sizeof(uint64_t);
+        smem_empty_mbar_addrs[i] = smem_empty_mbar_addr + i * sizeof(uint64_t);
         if (cta_rank == 1) {
             smem_full_mbar_addrs[i] = map_smem_addr_to_cta_rank(smem_full_mbar_addrs[i], 0);
         }
@@ -412,7 +414,7 @@ void producer_warp(
         for (int block_k_idx = 0; block_k_idx < num_blocks_k; block_k_idx++) {
             if (block_k_idx >= QUEUE_SIZE || bid > start_bid)
             {
-                mbarrier_wait_parity(smem_empty_mbar_addr + tma_smem_buf * sizeof(uint64_t), smem_empty_parity[tma_smem_buf]);
+                mbarrier_wait_parity(smem_empty_mbar_addrs[tma_smem_buf], smem_empty_parity[tma_smem_buf]);
                 smem_empty_parity[tma_smem_buf] ^= 1;
             }
 
@@ -472,24 +474,37 @@ void consumer_warp(
     int blocks_processed = 0;
     int tmem_base_addr = *reinterpret_cast<int*>(__cvta_shared_to_generic(tmem_addr_smem));
 
+    // encode tcgen05.mma instruction descriptor
+    uint32_t idesc = 0;
+    tcgen05_encode_idesc<CTA_GROUP_SIZE * MMA_M, MMA_N>(idesc);
+
+    uint16_t cta_mask = 0b11;
+    const int num_blocks_k = (K + BK - 1) / BK;
+
+    // pre-compute barrier addresses to avoid repeated arithmetic in loops
+    uint32_t epilogue_mbar_addrs[TMEM_BUFFERS];
+    uint32_t smem_full_mbar_addrs[QUEUE_SIZE];
+    uint32_t smem_empty_mbar_addrs[QUEUE_SIZE];
+    uint32_t mma_mbar_addrs[TMEM_BUFFERS];
+    for (int i = 0; i < TMEM_BUFFERS; i++) {
+        epilogue_mbar_addrs[i] = epilogue_mbar_addr + i * sizeof(uint64_t);
+        mma_mbar_addrs[i] = mma_mbar_addr + i * sizeof(uint64_t);
+    }
+    for (int i = 0; i < QUEUE_SIZE; i++) {
+        smem_full_mbar_addrs[i] = smem_full_mbar_addr + i * sizeof(uint64_t);
+        smem_empty_mbar_addrs[i] = smem_empty_mbar_addr + i * sizeof(uint64_t);
+    }
+
     for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
-        uint32_t idesc = 0;
-        tcgen05_encode_idesc<CTA_GROUP_SIZE * MMA_M, MMA_N>(idesc);
-
-        int tmem_addr_reg = tmem_base_addr + mma_tmem_buf * BN;
-
-        uint16_t cta_mask = 0b11;
-        const int num_blocks_k = (K + BK - 1) / BK;
-
         if (blocks_processed >= TMEM_BUFFERS)
         {
-            mbarrier_wait_parity(epilogue_mbar_addr + mma_tmem_buf * sizeof(uint64_t), epilogue_parity[mma_tmem_buf]);
+            mbarrier_wait_parity(epilogue_mbar_addrs[mma_tmem_buf], epilogue_parity[mma_tmem_buf]);
             epilogue_parity[mma_tmem_buf] ^= 1;
         }
-
+        int tmem_addr_reg = tmem_base_addr + mma_tmem_buf * BN;
         bool enable_accum = false;
         for (int block_k_idx = 0; block_k_idx < num_blocks_k; block_k_idx++) {
-            mbarrier_wait_parity(smem_full_mbar_addr + mma_smem_buf * sizeof(uint64_t), smem_full_parity[mma_smem_buf]);
+            mbarrier_wait_parity(smem_full_mbar_addrs[mma_smem_buf], smem_full_parity[mma_smem_buf]);
             smem_full_parity[mma_smem_buf] ^= 1;
 
             uint32_t smem_buff_a = smem + mma_smem_buf * (SMEM_A_SIZE + SMEM_B_SIZE);
@@ -510,12 +525,12 @@ void consumer_warp(
                         enable_accum = true;
                 }
             }
-            tcgen05_commit_multicast(smem_empty_mbar_addr + mma_smem_buf * sizeof(uint64_t), cta_mask);
+            tcgen05_commit_multicast(smem_empty_mbar_addrs[mma_smem_buf], cta_mask);
 
             mma_smem_buf = (mma_smem_buf + 1) % QUEUE_SIZE;
         }
 
-        tcgen05_commit_multicast(mma_mbar_addr + mma_tmem_buf * sizeof(uint64_t), cta_mask);
+        tcgen05_commit_multicast(mma_mbar_addrs[mma_tmem_buf], cta_mask);
 
         mma_tmem_buf = (mma_tmem_buf + 1) % TMEM_BUFFERS;
         blocks_processed += 1;
@@ -563,21 +578,22 @@ void epilogue_warpgroup(
 
     // pre-compute mapped barrier addresses to avoid repeated arithmetic and mapping in loop
     uint32_t epilogue_mbar_addrs[TMEM_BUFFERS];
+    uint32_t mma_mbar_addrs[TMEM_BUFFERS];
     for (int i = 0; i < TMEM_BUFFERS; i++) {
         epilogue_mbar_addrs[i] = epilogue_mbar_addr + i * sizeof(uint64_t);
+        mma_mbar_addrs[i] = mma_mbar_addr + i * sizeof(uint64_t);
         if (cta_rank == 1) {
             epilogue_mbar_addrs[i] = map_smem_addr_to_cta_rank(epilogue_mbar_addrs[i], 0);
         }
     }
 
+    int ep_warp_id = (threadIdx_x / 32);
+    int lane_id = threadIdx_x % 32;
     for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
         const int bid = group_id * CTA_GROUP_SIZE + (start_bid % CTA_GROUP_SIZE);
         auto [block_m, block_n] = compute_bid_hilbert(bid, grid_m, grid_n);
 
-        int ep_warp_id = (threadIdx_x / 32);
-        int lane_id = threadIdx_x % 32;
-
-        mbarrier_wait_parity(mma_mbar_addr + epilogue_tmem_buf * sizeof(uint64_t), mma_parity[epilogue_tmem_buf]);
+        mbarrier_wait_parity(mma_mbar_addrs[epilogue_tmem_buf], mma_parity[epilogue_tmem_buf]);
         mma_parity[epilogue_tmem_buf] ^= 1;
 
         asm volatile("tcgen05.fence::after_thread_sync;");
