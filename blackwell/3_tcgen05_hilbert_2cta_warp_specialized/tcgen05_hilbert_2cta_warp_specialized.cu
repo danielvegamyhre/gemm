@@ -254,20 +254,77 @@ __device__ __forceinline__ void tcgen05_commit_multicast(uint32_t mbar_addr, uin
 // each warp of a warpgroup in the CTA can access a chunk of the Tensor Memory. 
 // All the columns of the Tensor Memory can be accessed by all the four warps of a warpgroup."
 // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-tensor-memory-ld-st
-__device__ __forceinline__ void tcgen05_ld(int tmem_base_addr_reg, int row, int base_col, float c_reg[8]) {
+__device__ __forceinline__ void tcgen05_ld_32x32bx8(int tmem_base_addr_reg, int row, int base_col, float c_reg[8]) {
     // TMEM address is 32bit and composed of 2 components:
     // - bits 0-15: column index
     // - bits 16-31: row index
     // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tensor-memory-addressing
     int tmem_addr = tmem_base_addr_reg + (row << 16) + base_col;
 
-    // with .x4, the warp loads 32 rows × 8 columns, where each lane gets 8 floats in register memory.
+    // with .x8, the warp loads 32 rows × 8 columns, where each lane gets 8 floats in register memory.
     // see: matrix fragment layout docs: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-matrix-fragments-shape-3232b
     asm volatile(
         "tcgen05.ld.sync.aligned.32x32b.x8.b32 {"
         "%0, %1, %2, %3, %4, %5, %6, %7"
         "}, [%8];"
         : "=f"(c_reg[0]), "=f"(c_reg[1]), "=f"(c_reg[2]), "=f"(c_reg[3]), "=f"(c_reg[4]), "=f"(c_reg[5]), "=f"(c_reg[6]), "=f"(c_reg[7])
+        : "r"(tmem_addr)
+    );
+
+    // from PTX docs: "Prevents subsequent tcgen05.mma from racing ahead of the tcgen05.ld"
+    asm volatile("tcgen05.wait::ld.sync.aligned;");
+}
+
+__device__ __forceinline__ void tcgen05_ld_32x32bx128(int tmem_base_addr_reg, int row, int base_col, float c_reg[128]) {
+    // TMEM address is 32bit and composed of 2 components:
+    // - bits 0-15: column index
+    // - bits 16-31: row index
+    int tmem_addr = tmem_base_addr_reg + (row << 16) + base_col;
+
+    // with .x128, the warp loads 32 rows × 128 columns, where each lane gets 128 floats in register memory.
+    asm volatile(
+        "tcgen05.ld.sync.aligned.32x32b.x128.b32 {"
+        "%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, "
+        "%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, "
+        "%32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, "
+        "%48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63, "
+        "%64, %65, %66, %67, %68, %69, %70, %71, %72, %73, %74, %75, %76, %77, %78, %79, "
+        "%80, %81, %82, %83, %84, %85, %86, %87, %88, %89, %90, %91, %92, %93, %94, %95, "
+        "%96, %97, %98, %99, %100, %101, %102, %103, %104, %105, %106, %107, %108, %109, %110, %111, "
+        "%112, %113, %114, %115, %116, %117, %118, %119, %120, %121, %122, %123, %124, %125, %126, %127"
+        "}, [%128];"
+        : "=f"(c_reg[0]), "=f"(c_reg[1]), "=f"(c_reg[2]), "=f"(c_reg[3]),
+          "=f"(c_reg[4]), "=f"(c_reg[5]), "=f"(c_reg[6]), "=f"(c_reg[7]),
+          "=f"(c_reg[8]), "=f"(c_reg[9]), "=f"(c_reg[10]), "=f"(c_reg[11]),
+          "=f"(c_reg[12]), "=f"(c_reg[13]), "=f"(c_reg[14]), "=f"(c_reg[15]),
+          "=f"(c_reg[16]), "=f"(c_reg[17]), "=f"(c_reg[18]), "=f"(c_reg[19]),
+          "=f"(c_reg[20]), "=f"(c_reg[21]), "=f"(c_reg[22]), "=f"(c_reg[23]),
+          "=f"(c_reg[24]), "=f"(c_reg[25]), "=f"(c_reg[26]), "=f"(c_reg[27]),
+          "=f"(c_reg[28]), "=f"(c_reg[29]), "=f"(c_reg[30]), "=f"(c_reg[31]),
+          "=f"(c_reg[32]), "=f"(c_reg[33]), "=f"(c_reg[34]), "=f"(c_reg[35]),
+          "=f"(c_reg[36]), "=f"(c_reg[37]), "=f"(c_reg[38]), "=f"(c_reg[39]),
+          "=f"(c_reg[40]), "=f"(c_reg[41]), "=f"(c_reg[42]), "=f"(c_reg[43]),
+          "=f"(c_reg[44]), "=f"(c_reg[45]), "=f"(c_reg[46]), "=f"(c_reg[47]),
+          "=f"(c_reg[48]), "=f"(c_reg[49]), "=f"(c_reg[50]), "=f"(c_reg[51]),
+          "=f"(c_reg[52]), "=f"(c_reg[53]), "=f"(c_reg[54]), "=f"(c_reg[55]),
+          "=f"(c_reg[56]), "=f"(c_reg[57]), "=f"(c_reg[58]), "=f"(c_reg[59]),
+          "=f"(c_reg[60]), "=f"(c_reg[61]), "=f"(c_reg[62]), "=f"(c_reg[63]),
+          "=f"(c_reg[64]), "=f"(c_reg[65]), "=f"(c_reg[66]), "=f"(c_reg[67]),
+          "=f"(c_reg[68]), "=f"(c_reg[69]), "=f"(c_reg[70]), "=f"(c_reg[71]),
+          "=f"(c_reg[72]), "=f"(c_reg[73]), "=f"(c_reg[74]), "=f"(c_reg[75]),
+          "=f"(c_reg[76]), "=f"(c_reg[77]), "=f"(c_reg[78]), "=f"(c_reg[79]),
+          "=f"(c_reg[80]), "=f"(c_reg[81]), "=f"(c_reg[82]), "=f"(c_reg[83]),
+          "=f"(c_reg[84]), "=f"(c_reg[85]), "=f"(c_reg[86]), "=f"(c_reg[87]),
+          "=f"(c_reg[88]), "=f"(c_reg[89]), "=f"(c_reg[90]), "=f"(c_reg[91]),
+          "=f"(c_reg[92]), "=f"(c_reg[93]), "=f"(c_reg[94]), "=f"(c_reg[95]),
+          "=f"(c_reg[96]), "=f"(c_reg[97]), "=f"(c_reg[98]), "=f"(c_reg[99]),
+          "=f"(c_reg[100]), "=f"(c_reg[101]), "=f"(c_reg[102]), "=f"(c_reg[103]),
+          "=f"(c_reg[104]), "=f"(c_reg[105]), "=f"(c_reg[106]), "=f"(c_reg[107]),
+          "=f"(c_reg[108]), "=f"(c_reg[109]), "=f"(c_reg[110]), "=f"(c_reg[111]),
+          "=f"(c_reg[112]), "=f"(c_reg[113]), "=f"(c_reg[114]), "=f"(c_reg[115]),
+          "=f"(c_reg[116]), "=f"(c_reg[117]), "=f"(c_reg[118]), "=f"(c_reg[119]),
+          "=f"(c_reg[120]), "=f"(c_reg[121]), "=f"(c_reg[122]), "=f"(c_reg[123]),
+          "=f"(c_reg[124]), "=f"(c_reg[125]), "=f"(c_reg[126]), "=f"(c_reg[127])
         : "r"(tmem_addr)
     );
 
@@ -570,7 +627,7 @@ void epilogue_warpgroup(
 ) {
     constexpr int CTA_GROUP_SIZE = 2;
     constexpr int TMEM_BUFFERS = 2;
-    constexpr int COLS_PER_THREAD = 8;
+    constexpr int COLS_PER_THREAD = 128;  // Try .x8 instead of .x128
 
     int epilogue_tmem_buf = 0;
     int mma_parity[TMEM_BUFFERS] = {0};
@@ -579,6 +636,7 @@ void epilogue_warpgroup(
     // pre-compute mapped barrier addresses to avoid repeated arithmetic and mapping in loop
     uint32_t epilogue_mbar_addrs[TMEM_BUFFERS];
     uint32_t mma_mbar_addrs[TMEM_BUFFERS];
+    #pragma unroll
     for (int i = 0; i < TMEM_BUFFERS; i++) {
         epilogue_mbar_addrs[i] = epilogue_mbar_addr + i * sizeof(uint64_t);
         mma_mbar_addrs[i] = mma_mbar_addr + i * sizeof(uint64_t);
@@ -607,28 +665,23 @@ void epilogue_warpgroup(
         float c_reg[COLS_PER_THREAD];
         #pragma unroll
         for (int i = 0; i < store_iters; i++) {
-            // load from tmem -> reg
-
             const int tmem_base_col = i * COLS_PER_THREAD;
-            tcgen05_ld(tmem_addr_reg, tmem_base_row, tmem_base_col, c_reg);
-
-            // break after last tmem load but before load gmem store, so we can signal mbar first
-            if (i == store_iters-1) break;
+            if constexpr (COLS_PER_THREAD == 128)
+                tcgen05_ld_32x32bx128(tmem_addr_reg, tmem_base_row, tmem_base_col, c_reg);
+            else
+                tcgen05_ld_32x32bx8(tmem_addr_reg, tmem_base_row, tmem_base_col, c_reg);
 
             // reg -> gmem with STG.256 
-            const int c_col = block_n * BN + i * COLS_PER_THREAD;
-            st_global_256b(C + c_row * N + c_col, c_reg);
+            #pragma unroll 
+            for (int j = 0; j < COLS_PER_THREAD / 8; j++) {
+                const int c_col = block_n * BN + i * COLS_PER_THREAD + j * 8;
+                st_global_256b(C + c_row * N + c_col, &c_reg[j * 8]);
+            }
         }
 
         // signal mma warp that tmem buffer is consumed and can be re-used
         mbarrier_arrive(epilogue_mbar_addrs[epilogue_tmem_buf]);
-
-        // do final store
-        const int c_col = block_n * BN + (store_iters - 1) * COLS_PER_THREAD;
-        st_global_256b(C + c_row * N + c_col, c_reg);
-
         epilogue_tmem_buf = (epilogue_tmem_buf + 1) % TMEM_BUFFERS;
-
     }
 }
 
