@@ -28,7 +28,7 @@ def benchmark():
         B = torch.randn(N, K, device='cuda', dtype=torch.bfloat16)
         C = torch.zeros(M, N, device='cuda', dtype=torch.float32)
 
-        # Benchmark custom kernel with percentiles
+        # Benchmark custom kernel
         torch.cuda.synchronize()
         custom_us = do_bench(lambda: custom_gemm.gemm_cuda(A, B.t(), C), warmup=WARMUP, rep=REP, return_mode="median") * 1e3
 
