@@ -41,7 +41,8 @@ void create_3d_tensor_map(
     CUtensorMap& tensor_map,
     const uint64_t global_dims[3],
     const uint32_t smem_dims[3],
-    const uint32_t stride_bytes[2]
+    const uint32_t stride_bytes[2],
+    CUtensorMapSwizzle swizzle = CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B
 ) {
     constexpr uint32_t rank = 3;
     uint64_t size[rank] = {global_dims[0], global_dims[1], global_dims[2]};
@@ -62,12 +63,47 @@ void create_3d_tensor_map(
         box_size,
         elem_stride,
         CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+        swizzle,
         CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
         CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
     );
     CUDA_CHECK(res);
 }
+
+void create_4d_tensor_map(
+    void* tensor_ptr,
+    CUtensorMap& tensor_map,
+    const uint64_t global_dims[4],
+    const uint32_t smem_dims[4],
+    const uint32_t stride_bytes[3],
+    CUtensorMapSwizzle swizzle = CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE
+) {
+    constexpr uint32_t rank = 4;
+    uint64_t size[rank] = {global_dims[0], global_dims[1], global_dims[2], global_dims[3]};
+    uint64_t stride[rank - 1] = {stride_bytes[0], stride_bytes[1], stride_bytes[2]};
+    uint32_t box_size[rank] = {smem_dims[0], smem_dims[1], smem_dims[2], smem_dims[3]};
+    uint32_t elem_stride[rank] = {1, 1, 1, 1};
+
+    void *driver_ptr = get_driver_ptr();
+    auto cuTensorMapEncodeTiled = reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(driver_ptr);
+
+    CUresult res = cuTensorMapEncodeTiled(
+        &tensor_map,
+        CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
+        rank,
+        tensor_ptr,
+        size,
+        stride,
+        box_size,
+        elem_stride,
+        CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+        swizzle,
+        CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    );
+    CUDA_CHECK(res);
+}
+
 
 // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-shared-memory-descriptor
 __device__ uint64_t matrix_desc_encode(uint64_t x) {
@@ -178,18 +214,6 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint32_t mbar_addr, co
       : "memory");
 }
 
-__device__ __forceinline__ void cp_async_bulk_tensor_1d_global_to_shared(
-    uint32_t dst_shmem_addr,        // shared addr 
-    const uint64_t *src_global_ptr,
-    const uint32_t size, 
-    uint32_t mbar_addr
-) {
-    asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" 
-               :
-               :"r"(dst_shmem_addr), "l"(src_global_ptr), "r"(size), "r"(mbar_addr)
-               : "memory");
-}
-
 __device__ __forceinline__ void cp_async_bulk_tensor_3d_global_to_shared(
     const uint32_t dst_shmem,           // shared addr
     const uint64_t *tensor_map_ptr,
@@ -208,6 +232,31 @@ __device__ __forceinline__ void cp_async_bulk_tensor_3d_global_to_shared(
         "r"(offset_x),
         "r"(offset_y),
         "r"(offset_z),
+        "r"(mbar_addr)
+        : "memory"
+    );
+}
+
+__device__ __forceinline__ void cp_async_bulk_tensor_4d_global_to_shared(
+    const uint32_t dst_shmem,           // shared addr
+    const uint64_t *tensor_map_ptr,
+    const uint32_t offset_x,
+    const uint32_t offset_y,
+    const uint32_t offset_z,
+    const uint32_t offset_w,
+    uint32_t mbar_addr                  // shared addr
+) {
+    asm volatile(
+        "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2 "
+        "[%0], [%1, {%2, %3, %4, %5}], [%6];"
+        :
+        :
+        "r"(dst_shmem),
+        "l"(tensor_map_ptr),
+        "r"(offset_x),
+        "r"(offset_y),
+        "r"(offset_z),
+        "r"(offset_w),
         "r"(mbar_addr)
         : "memory"
     );
@@ -263,8 +312,8 @@ __device__ __forceinline__ void tcgen05_mma_mxfp8(
     asm volatile(
         "{\n\t"
         ".reg .pred p;\n\t"              // declare predicate register for enable-input-d
-        "setp.ne.s32 p, %4, 0;\n\t"      // p = 0 for mma tile 0, then 1 after
-        "tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale [%0], %1, %2, %3, [%4], [%5], p;\n"
+        "setp.ne.s32 p, %6, 0;\n\t"      // p = 0 for mma tile 0, then 1 after
+        "tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale.block32 [%0], %1, %2, %3, [%4], [%5], p;\n"
         "}"
         :
         : "r"(tmem_accum_addr), "l"(smem_a_desc), "l"(smem_b_desc), "r"(idesc), "r"(tmem_sfa_addr), "r"(tmem_sfb_addr), "r"(enable_accum)
@@ -429,8 +478,8 @@ __cluster_dims__(2, 1, 1)  // threadblock cluster for 2 cta mma
 void ws_gemm_2cta_mma(
     const __grid_constant__ CUtensorMap a_map,
     const __grid_constant__ CUtensorMap b_map,
-    const uint8_t* sfa_ptr,
-    const uint8_t* sfb_ptr,
+    const __grid_constant__ CUtensorMap sfa_map,
+    const __grid_constant__ CUtensorMap sfb_map,
     float* C,
     int M,
     int N,
@@ -508,8 +557,8 @@ void ws_gemm_2cta_mma(
     // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-memory-alloc-manage-instructions
     // Per-buffer TMEM layout: [BN cols accum | SFA_COLS | SFB_COLS]
     // Each ((32,4),4) tile occupies 16 TMEM columns
-    constexpr int SFA_TILES = (BM * BK / 32) / 512;  
-    constexpr int SFB_TILES = (BN * BK / 32) / 512; 
+    constexpr int SFA_TILES = (BM * SF_BK) / 512;
+    constexpr int SFB_TILES = (BN * SF_BK) / 512; 
     constexpr int SFA_COLS = SFA_TILES * 16;  // ((32,4),4) layout -> 16 cols per sf til
     constexpr int SFB_COLS = SFB_TILES * 16; 
     constexpr int TMEM_WIDTH_PER_BUFFER = BN + SFA_COLS + SFB_COLS;
@@ -577,7 +626,11 @@ void ws_gemm_2cta_mma(
                 {
                     smem_full_mbar_mapped = map_smem_addr_to_cta_rank(smem_full_mbar_mapped, 0);
                 }
-                mbarrier_arrive_expect_tx(smem_full_mbar_mapped, SMEM_A_SIZE + SMEM_B_SIZE + SMEM_SFA_SIZE + SMEM_SFB_SIZE);            
+                mbarrier_arrive_expect_tx(smem_full_mbar_mapped, SMEM_A_SIZE + SMEM_B_SIZE + SMEM_SFA_SIZE + SMEM_SFB_SIZE);
+                if (tma_smem_buf == 0 && block_k_idx == 0) {
+                    printf("CTA %d: Called mbarrier_arrive_expect_tx, bytes=%d\n", cta_rank,
+                           SMEM_A_SIZE + SMEM_B_SIZE + SMEM_SFA_SIZE + SMEM_SFB_SIZE);
+                }
 
                 // load A tile
                 int global_k_off = block_k_idx * BK;
@@ -601,34 +654,26 @@ void ws_gemm_2cta_mma(
                 );
 
                 // SFA/SFB in ((32,4),4) layout after quantization kernel.
-                // so we have contiguous chunks of 512 byte scale factors.
-                const int sf_tiles_per_bk_cols = (K/32)/4; // 1x32 scaling factors, divied into 128x4 tiles in ((32,4),4) layout
-                const int sf_stride_per_row_of_blocks = sf_tiles_per_bk_cols * 512;
-                const int sfa_block_base_off = (global_m_off / 128) * sf_stride_per_row_of_blocks;
-                #pragma unroll
-                for (int sf_k_off = 0; sf_k_off < BM * SF_BK; sf_k_off += 512) {
-                    // load SFA tile
-                    cp_async_bulk_tensor_1d_global_to_shared(
-                        SFA_smem + sf_k_off,
-                        reinterpret_cast<const uint64_t*>(sfa_ptr + sfa_block_base_off + sf_k_off),
-                        SF_BYTES,
-                        smem_full_mbar_mapped
-                    );
-                }
+                // 4D tensor map: {128 bytes, 4 blocks, tile_cols, tile_rows}
+                cp_async_bulk_tensor_4d_global_to_shared(
+                    SFA_smem,
+                    reinterpret_cast<const uint64_t*>(&sfa_map),
+                    0,                              // x: load all 128 bytes
+                    0,                              // y: load all 4 blocks
+                    (uint32_t)(global_k_off/32/4),  // z: tile column (K/128)
+                    (uint32_t)(global_m_off/128),   // w: tile row (M/128)
+                    smem_full_mbar_mapped
+                );
+                cp_async_bulk_tensor_4d_global_to_shared(
+                    SFB_smem,
+                    reinterpret_cast<const uint64_t*>(&sfb_map),
+                    0,                              // x: load all 128 bytes
+                    0,                              // y: load all 4 blocks
+                    (uint32_t)(global_k_off/32/4),  // z: tile column (K/128)
+                    (uint32_t)(global_n_off/128),   // w: tile row (N/128)
+                    smem_full_mbar_mapped
+                );
 
-                // for SFB, both CTAs need the full BN columns (not offset by cta_rank)
-                const int sfb_base_row = block_n * BN;
-                const int sfb_block_base_off = (sfb_base_row / 128) * sf_stride_per_row_of_blocks;
-                #pragma unroll
-                for (int sf_k_off = 0; sf_k_off < BN * SF_BK; sf_k_off += 512) {
-                    // load full BN columns of SFB for 2cta mma 
-                    cp_async_bulk_tensor_1d_global_to_shared(
-                        SFB_smem + sf_k_off,
-                        reinterpret_cast<const uint64_t*>(sfb_ptr + sfb_block_base_off + sf_k_off),
-                        SF_BYTES,
-                        smem_full_mbar_mapped
-                    );
-                }
                 tma_smem_buf = (tma_smem_buf + 1) % QUEUE_SIZE;
             }
         }
@@ -646,11 +691,11 @@ void ws_gemm_2cta_mma(
             // calculate tmem addresses for accumulator and scale factors.
             // each base addr starts at row 0 of the tmem buffer, so we only add col offset to get start addr
             // Per-buffer TMEM layout: [BN cols accum | SFA_COLS | SFB_COLS]
-            constexpr int SFA_TILES = BM / 32;  // 4 tiles covering BM rows
-            constexpr int SFB_TILES = (BN / CTA_GROUP_SIZE) / 32;  // 2 tiles covering BN/2 cols
-            constexpr int SFA_COLS = SFA_TILES * 16;  // 64 cols
-            constexpr int SFB_COLS = SFB_TILES * 16;  // 32 cols
-            constexpr int TMEM_WIDTH = BN + SFA_COLS + SFB_COLS;  // 224 cols per buffer
+            constexpr int SFA_TILES = (BM * SF_BK) / 512; 
+            constexpr int SFB_TILES = (BN * SF_BK) / 512; 
+            constexpr int SFA_COLS = SFA_TILES * 16; // 16 because ((32,4),4) layout means each 512 byte tile occupies 16 columns of TMEM
+            constexpr int SFB_COLS = SFB_TILES * 16;  
+            constexpr int TMEM_WIDTH = BN + SFA_COLS + SFB_COLS;  
             int buffer_offset = mma_tmem_buf * TMEM_WIDTH;
             int tmem_accum_addr = tmem_base_addr + buffer_offset;
             int tmem_sfa_base_addr = tmem_base_addr + buffer_offset + BN;
@@ -669,10 +714,8 @@ void ws_gemm_2cta_mma(
             }
 
             for (int block_k_idx = 0; block_k_idx < num_blocks_k; block_k_idx++) {
-
-                // wait for the tma load to the buffers we are about to read from.
+                // wait for producer to fill smem buffer with next A/B/SFA/SFB tiles. both CTAs signal mbar on CTA 0
                 mbarrier_wait_parity(smem_full_mbar_addr + mma_smem_buf * sizeof(uint64_t), smem_full_parity[mma_smem_buf]);
-                smem_full_parity[mma_smem_buf] ^= 1;
 
                 // move sfa/sfb tiles from SMEM -> TMEM
                 // tcgen05.cp and tcgen05.mma issued from same thread with same cta_group::N will be pipelined in order:
@@ -686,14 +729,14 @@ void ws_gemm_2cta_mma(
                 #pragma unroll
                 for (int sf_k_off = 0; sf_k_off < SMEM_SFA_SIZE; sf_k_off += 512) {
                     uint64_t sfa_desc = make_sf_smem_desc(smem + smem_sfa_base + sf_k_off);
-                    tcgen05_cp_smem_to_tmem(sfa_desc, tmem_sfa_base_addr, 0, sf_k_off / 16);
+                    tcgen05_cp_smem_to_tmem(sfa_desc, tmem_sfa_base_addr, 0, sf_k_off / 32); // col = sf_k_off / 32 because we load 512 byte chunk in (32x16) shape in TMEM
                 }
 
-                // Copy SFB tiles ((BN/2) * SF_BK bytes in 512-byte chunks)
+                // Copy SFB tiles (BN * SF_BK bytes in 512-byte chunks)
                 #pragma unroll
                 for (int sf_k_off = 0; sf_k_off < SMEM_SFB_SIZE; sf_k_off += 512) {
                     uint64_t sfb_desc = make_sf_smem_desc(smem + smem_sfb_base + sf_k_off);
-                    tcgen05_cp_smem_to_tmem(sfb_desc, tmem_sfb_base_addr, 0, sf_k_off / 16);
+                    tcgen05_cp_smem_to_tmem(sfb_desc, tmem_sfb_base_addr, 0, sf_k_off / 32);
                 }
 
                 // tcgen05 mma for every subtile in the smem.
@@ -732,7 +775,6 @@ void ws_gemm_2cta_mma(
             // cta 0 -> commit using it's own mbar
             // cta 1 -> commit using cta 0's mbar
             tcgen05_commit_multicast(mma_mbar_addr + mma_tmem_buf * sizeof(uint64_t), cta_mask);
-
 
             // move to next tmem buffer for next output block
             mma_tmem_buf = (mma_tmem_buf + 1) % TMEM_BUFFERS;
@@ -817,6 +859,8 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     constexpr int BM = 128;
     constexpr int BN = 128;
     constexpr int BK = 128;
+    const int SF_K = K / 32;
+    constexpr int SF_BK = BK / 32;
 
     // dims for tcgen05.mma
     constexpr int MMA_M = 128;
@@ -831,8 +875,8 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     assert(M % (2 * MMA_M) == 0);
     assert(N % MMA_N == 0);
 
-    alignas(64) CUtensorMap a_map = {};
-    alignas(64) CUtensorMap b_map = {};
+    alignas(128) CUtensorMap a_map = {};
+    alignas(128) CUtensorMap b_map = {};
 
     constexpr int CTA_GROUP_SIZE = 2;
 
@@ -848,7 +892,8 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
         a_map,
         a_global_dims,
         a_smem_dims,
-        a_strides
+        a_strides,
+        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B
     );
 
     // BK, BN
@@ -862,7 +907,84 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
         b_map,
         b_global_dims,
         b_smem_dims,
-        b_strides
+        b_strides,
+        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B
+    );
+
+    alignas(128) CUtensorMap sfa_map = {};
+    alignas(128) CUtensorMap sfb_map = {};
+
+    // sfa has shape (M, K/32) with layout ((32,4),4) for 512 byte tile granularity)
+    // Each 512-byte tile = 4 blocks × 128 bytes/block
+    // Use 4D: {128 bytes per block, 4 blocks per tile, SF_K/4 tile cols, M/128 tile rows}
+    uint64_t sfa_global_dims[4] = {
+        128,                       // bytes per block (within 256 limit)
+        4,                         // blocks per tile
+        (uint64_t)(SF_K / 4),      // tile columns
+        (uint64_t)(M / 128)        // tile rows
+    };
+    uint32_t sfa_smem_dims[4] = {
+        128,                       // load full block
+        4,                         // load all 4 blocks (full tile)
+        (uint32_t)(SF_BK / 4),     // tile columns to load
+        (uint32_t)(BM / 128)       // tile rows to load
+    };
+    uint32_t sfa_strides[3] = {
+        128,                                    // stride to next block
+        512,                                    // stride to next tile column
+        (uint32_t)((SF_K / 4) * 512)           // stride to next tile row
+    };
+
+    // Debug: print tensor map parameters
+    printf("SFA tensor map params (4D):\n");
+    printf("  global_dims: [%lu, %lu, %lu, %lu]\n", sfa_global_dims[0], sfa_global_dims[1], sfa_global_dims[2], sfa_global_dims[3]);
+    printf("  smem_dims: [%u, %u, %u, %u]\n", sfa_smem_dims[0], sfa_smem_dims[1], sfa_smem_dims[2], sfa_smem_dims[3]);
+    printf("  strides: [%u, %u, %u]\n", sfa_strides[0], sfa_strides[1], sfa_strides[2]);
+    printf("  SF_K=%d, SF_BK=%d, M=%d, BM=%d\n", SF_K, SF_BK, M, BM);
+
+    // Use create_4d_tensor_map (need to add this function)
+    create_4d_tensor_map(
+        SFA,
+        sfa_map,
+        sfa_global_dims,
+        sfa_smem_dims,
+        sfa_strides,
+        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE
+    );
+
+    // sfb has shape (N, K/32) with layout ((32,4),4) for 512 byte tile granularity)
+    // Each 512-byte tile = 4 blocks × 128 bytes/block
+    // Use 4D: {128 bytes per block, 4 blocks per tile, SF_K/4 tile cols, N/128 tile rows}
+    uint64_t sfb_global_dims[4] = {
+        128,                       // bytes per block
+        4,                         // blocks per tile
+        (uint64_t)(SF_K / 4),      // tile columns
+        (uint64_t)(N / 128)        // tile rows
+    };
+    uint32_t sfb_smem_dims[4] = {
+        128,                       // load full block
+        4,                         // load all 4 blocks
+        (uint32_t)(SF_BK / 4),     // tile columns to load
+        (uint32_t)(BN / 128)       // tile rows to load
+    };
+    uint32_t sfb_strides[3] = {
+        128,                                    // stride to next block
+        512,                                    // stride to next tile column
+        (uint32_t)((SF_K / 4) * 512)           // stride to next tile row
+    };
+    // Debug: print tensor map parameters
+    printf("SFB tensor map params (4D):\n");
+    printf("  global_dims: [%lu, %lu, %lu, %lu]\n", sfb_global_dims[0], sfb_global_dims[1], sfb_global_dims[2], sfb_global_dims[3]);
+    printf("  smem_dims: [%u, %u, %u, %u]\n", sfb_smem_dims[0], sfb_smem_dims[1], sfb_smem_dims[2], sfb_smem_dims[3]);
+    printf("  strides: [%u, %u, %u]\n", sfb_strides[0], sfb_strides[1], sfb_strides[2]);
+
+    create_4d_tensor_map(
+        SFB,
+        sfb_map,
+        sfb_global_dims,
+        sfb_smem_dims,
+        sfb_strides,
+        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE
     );
 
     float* c_ptr = reinterpret_cast<float*>(C);
@@ -904,7 +1026,6 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     // - tma_addr_in_smem
     constexpr int smem_a_size = BM * BK;
     constexpr int smem_b_size = (BN / CTA_GROUP_SIZE) * BK;
-    constexpr int SF_BK = BK / 32;
     constexpr int smem_sfa_size = ((BM * SF_BK + 511) / 512) * 512;  // round up to nearest full 512 byte SF tile
     constexpr int smem_sfb_size = (((BN / CTA_GROUP_SIZE) * SF_BK + 511) / 512) * 512;
     constexpr int smem_full_mbar_size = sizeof(uint64_t);
@@ -926,7 +1047,5 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         total_smem
     ));
-    kernel<<<grid_dim, block_dim, total_smem>>>(a_map, b_map, sfa_ptr, sfb_ptr, c_ptr, M, N, K);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    kernel<<<grid_dim, block_dim, total_smem>>>(a_map, b_map, sfa_map, sfb_map, c_ptr, M, N, K);
 }

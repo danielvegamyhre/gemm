@@ -1,0 +1,7 @@
+============================= test session starts ==============================
+platform linux -- Python 3.13.12, pytest-7.3.2, pluggy-1.6.0
+rootdir: /home/dev/gemm/blackwell/4_tcgen05_mxfp8_hilbert_2cta_warp_specialized
+plugins: anyio-4.12.1, hypothesis-6.151.5, cov-7.0.0, typeguard-4.4.4
+collected 1 item
+
+test.py CUDA Driver Error at /home/dev/gemm/blackwell/4_tcgen05_mxfp8_hilbert_2cta_warp_specialized/tcgen05_mxfp8_hilbert_2cta_warp_specialized.cu:102 - Error code: 1
