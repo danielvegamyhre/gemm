@@ -463,8 +463,8 @@ void ws_gemm_2cta_mma(
     constexpr int SMEM_A_SIZE = BM * BK;                    // for 2cta mma, each cta loads BM rows
     constexpr int SMEM_B_SIZE = (BN / CTA_GROUP_SIZE) * BK; // for 2cta mma, each cta loads BN/2 cols
     // Scale factor tiles are ((32,4),4) layout with 512-byte granularity (128 rows/cols × 4 SF_BK)
-    constexpr int SMEM_SFA_SIZE = ((BM * SF_BK + 511) / 512) * 512;  // round up to 512-byte tile boundary
-    constexpr int SMEM_SFB_SIZE = (((BN / CTA_GROUP_SIZE) * SF_BK + 511) / 512) * 512;  // round up to 512-byte tile boundary
+    constexpr int SMEM_SFA_SIZE = ((BM * SF_BK + 511) / 512) * 512;  // for SFA each CTA gets BM rows (so 2 BMxSF_BK tiles stacked vertically)
+    constexpr int SMEM_SFB_SIZE = ((BN * SF_BK + 511) / 512) * 512;  // for SFB, full BN cols must be duplicated on both CTAs
     constexpr int SMEM_QUEUE_SIZE = QUEUE_SIZE * (SMEM_A_SIZE + SMEM_B_SIZE + SMEM_SFA_SIZE + SMEM_SFB_SIZE);
 
     // calculate start offset for each smem buffer
@@ -509,12 +509,13 @@ void ws_gemm_2cta_mma(
     // Per-buffer TMEM layout: [BN cols accum | SFA_COLS | SFB_COLS]
     // Each ((32,4),4) tile occupies 16 TMEM columns
     constexpr int SFA_TILES = (BM * BK / 32) / 512;  
-    constexpr int SFB_TILES = ((BN / CTA_GROUP_SIZE) * BK / 32) / 512; 
+    constexpr int SFB_TILES = (BN * BK / 32) / 512; 
     constexpr int SFA_COLS = SFA_TILES * 16;  // ((32,4),4) layout -> 16 cols per sf til
     constexpr int SFB_COLS = SFB_TILES * 16; 
     constexpr int TMEM_WIDTH_PER_BUFFER = BN + SFA_COLS + SFB_COLS;
     constexpr int TMEM_TOTAL_WIDTH = TMEM_BUFFERS * TMEM_WIDTH_PER_BUFFER;
-    // TMEM allocation must be power of 2. Round up to next power of 2.
+
+    // round up to nearest power of 2
     constexpr int TMEM_WIDTH_ROUNDED = 1 << (32 - __builtin_clz(TMEM_TOTAL_WIDTH - 1));
     if (warp_id == 0)
     {
@@ -615,12 +616,14 @@ void ws_gemm_2cta_mma(
                     );
                 }
 
-                const int sfb_block_base_off = (global_n_off / 128) * sf_stride_per_row_of_blocks;;
+                // for SFB, both CTAs need the full BN columns (not offset by cta_rank)
+                const int sfb_base_row = block_n * BN;
+                const int sfb_block_base_off = (sfb_base_row / 128) * sf_stride_per_row_of_blocks;
                 #pragma unroll
-                for (int sf_k_off = 0; sf_k_off < (BN/CTA_GROUP_SIZE) * SF_BK; sf_k_off += 512) {
-                    // load SFB tile (always 512 bytes for ((32,4),4) layout)
+                for (int sf_k_off = 0; sf_k_off < BN * SF_BK; sf_k_off += 512) {
+                    // load full BN columns of SFB for 2cta mma 
                     cp_async_bulk_tensor_1d_global_to_shared(
-                        SFB_smem,
+                        SFB_smem + sf_k_off,
                         reinterpret_cast<const uint64_t*>(sfb_ptr + sfb_block_base_off + sf_k_off),
                         SF_BYTES,
                         smem_full_mbar_mapped
