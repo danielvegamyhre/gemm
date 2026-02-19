@@ -923,7 +923,7 @@ extern "C" void launch_gemm(void* A, void* B, void* C, int M, int N, int K) {
     constexpr int QUEUE_SIZE = max_smem_per_sm / total_smem_per_stage;
     constexpr int total_smem = total_smem_per_stage * QUEUE_SIZE +  mma_mbar_size + epilogue_mbar_size + tmem_addr_size;
 
-    const int launch_blocks = min(NUM_SMS, (M/BM)*(N/BN)) & ~1; // round down to nearest even
+    const int launch_blocks = 128; // min(NUM_SMS, (M/BM)*(N/BN)) & ~1; // round down to nearest even
     dim3 grid_dim(launch_blocks);
     dim3 block_dim(BLOCK_SIZE);
     auto kernel = ws_gemm_2cta_mma<QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K>;

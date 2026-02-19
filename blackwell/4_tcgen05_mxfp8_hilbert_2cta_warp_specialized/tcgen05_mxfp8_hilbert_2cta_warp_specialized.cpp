@@ -15,18 +15,17 @@ torch::Tensor gemm_cuda(
     const int M = A.size(0);
     const int K = A.size(1);
     const int N = B.size(1);
-    assert(A_scales.size(0) % 128 == 0);
-    assert(A_scales.size(1) % 4 == 0);
-    assert(B_scales.size(0) % 128 == 0);
-    assert(B_scales.size(1) % 4 == 0);
+    assert(A_scales.size(0) % 512 == 0);
+    assert(B_scales.size(0) % 512 == 0);
 
     launch_gemm(
-        A.data_ptr<at::BFloat16>(), 
-        B.data_ptr<at::BFloat16>(), 
-        A_scales.data_ptr<at::kFloat8_e8m0fnu>,
-        B_scales.data_ptr<at::kFloat8_e8m0fnu>,
+        A.data_ptr<uint8_t>(), 
+        B.data_ptr<uint8_t>(), 
+        A_scales.data_ptr<uint8_t>(),
+        B_scales.data_ptr<uint8_t>(),
         C.data_ptr<float>(), 
-        M, N, K);
+        M, N, K
+    );
 
     return C;
 }

@@ -1,8 +1,9 @@
 import pytest
 import torch
 from torch.utils.cpp_extension import load
-from torch.nn.functional import scaled_mm, ScalingRecipe, SwizzleType
-from torchao.prototype.mx_formats.kernels import triton_to_mxfp8_dim0, to_blocked
+from torch.nn.functional import scaled_mm, ScalingType, SwizzleType
+from torchao.prototype.mx_formats.kernels import triton_to_mxfp8_dim0
+from torchao.prototype.mx_formats.utils import to_blocked
 
 custom_gemm = load(
     name='tcgen05_mxfp8_hilbert_2cta_warp_specialized',
@@ -25,24 +26,34 @@ def test_gemm(M, K, N):
 
     A_data, A_scales = triton_to_mxfp8_dim0(A)
     B_data, B_scales = triton_to_mxfp8_dim0(B)
-    A_scales, B_scales = to_blocked(A_scales), to_blocked(B_scales)
+    A_scales_blocked, B_scales_blocked = to_blocked(A_scales), to_blocked(B_scales)
 
-    result = custom_gemm.gemm_cuda(A_data, B_data.t(), A_scales, B_scales, C)
-
-    expected = torch.zeros(M, N, device="cuda", dtype=torch.float32)
-
-    scaled_mm(
-        A, 
-        B.t(), 
-        scale_a=A_scales, 
-        scale_recipe_a=ScalingType.BlockWise1x32, 
-        scale_b=B_scales,
-        scale_recipe_b=ScalingType.BlockWise1x32, 
-        swizzle_a=SwizzleType.SWIZZLE_32_4_4,
-        swizzle_b=SwizzleType.SWIZZLE_32_4_4,
-        output_dtype=out_dtype,
-        out=expected,
+    result = custom_gemm.gemm_cuda(
+        A_data.view(torch.uint8), 
+        B_data.t().view(torch.uint8), 
+        A_scales_blocked.view(torch.uint8), 
+        B_scales_blocked.view(torch.uint8), 
+        C
     )
+    
+    expected = torch._scaled_mm(
+        A_data, 
+        B_data.t(), 
+        A_scales_blocked, 
+        B_scales_blocked,
+        out_dtype=torch.float32,
+    )
+    # expected = scaled_mm(
+    #     A_data, 
+    #     B_data.t(), 
+    #     scale_a=A_scales_blocked, 
+    #     scale_recipe_a=ScalingType.BlockWise1x32, 
+    #     scale_b=B_scales_blocked,
+    #     scale_recipe_b=ScalingType.BlockWise1x32, 
+    #     swizzle_a=SwizzleType.SWIZZLE_32_4_4,
+    #     swizzle_b=SwizzleType.SWIZZLE_32_4_4,
+    #     output_dtype=torch.float32,
+    # )
 
     # Check for mismatches
     rtol = 1e-2
