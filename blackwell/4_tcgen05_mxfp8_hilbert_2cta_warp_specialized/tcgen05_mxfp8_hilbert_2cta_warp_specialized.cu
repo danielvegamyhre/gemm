@@ -86,7 +86,7 @@ __device__ uint64_t make_smem_desc(uint32_t smem_shared_addr) {
 
     // bits 32-45: matrix_desc_encode(stride dim byte offset)
     // SBO (stride byte offset) is stride between rows of swizzle atoms which are (8x64 matrix of e4m3 in this 128b swizzle setup)
-    uint64_t SBO = 8 * 64 * sizeof(uint8_t);
+    uint64_t SBO = 8 * 64;
     desc |= (matrix_desc_encode(SBO) << 32);
 
     // bits 46-49: fixed value of 0b001
@@ -106,7 +106,7 @@ __device__ uint64_t make_sf_smem_desc(uint32_t smem_shared_addr) {
 
     // bits 32-45: matrix_desc_encode(stride dim byte offset)
     // SBO (stride byte offset) is size of core matrix (8x16 bytes) for no swizzle mode
-    uint64_t SBO = 8 * 16 * sizeof(uint8_t);
+    uint64_t SBO = 8 * 16;
     desc |= (matrix_desc_encode(SBO) << 32);
 
     // bits 46-49: fixed value of 0b001
@@ -460,14 +460,15 @@ void ws_gemm_2cta_mma(
     uint32_t smem = __cvta_generic_to_shared(smem_buffer);
    
     // calculate smem allocation sizes
-    constexpr int SMEM_A_SIZE = BM * BK * sizeof(uint8_t);                    // for 2cta mma, each cta loads BM rows
-    constexpr int SMEM_B_SIZE = (BN / CTA_GROUP_SIZE) * BK * sizeof(uint8_t); // for 2cta mma, each cta loads BN/2 cols
-    constexpr int SMEM_SFA_SIZE = BM * SF_BK * sizeof(uint8_t);
-    constexpr int SMEM_SFB_SIZE = SF_BYTES; // ((32,4),4) tile is always 512 bytes
-    constexpr int SMEM_AB_TILES_PLUS_SF_TILES = QUEUE_SIZE * (SMEM_A_SIZE + SMEM_B_SIZE + SMEM_SFA_SIZE + SMEM_SFB_SIZE);
+    constexpr int SMEM_A_SIZE = BM * BK;                    // for 2cta mma, each cta loads BM rows
+    constexpr int SMEM_B_SIZE = (BN / CTA_GROUP_SIZE) * BK; // for 2cta mma, each cta loads BN/2 cols
+    // Scale factor tiles are ((32,4),4) layout with 512-byte granularity (128 rows/cols × 4 SF_BK)
+    constexpr int SMEM_SFA_SIZE = ((BM * SF_BK + 511) / 512) * 512;  // round up to 512-byte tile boundary
+    constexpr int SMEM_SFB_SIZE = (((BN / CTA_GROUP_SIZE) * SF_BK + 511) / 512) * 512;  // round up to 512-byte tile boundary
+    constexpr int SMEM_QUEUE_SIZE = QUEUE_SIZE * (SMEM_A_SIZE + SMEM_B_SIZE + SMEM_SFA_SIZE + SMEM_SFB_SIZE);
 
     // calculate start offset for each smem buffer
-    constexpr int SMEM_FULL_MBAR_OFFSET = SMEM_AB_TILES_PLUS_SF_TILES;
+    constexpr int SMEM_FULL_MBAR_OFFSET = SMEM_QUEUE_SIZE;
     constexpr int SMEM_EMPTY_MBAR_OFFSET = SMEM_FULL_MBAR_OFFSET + QUEUE_SIZE * sizeof(uint64_t);
     constexpr int SMEM_MMA_MBAR_OFFSET = SMEM_EMPTY_MBAR_OFFSET + QUEUE_SIZE * sizeof(uint64_t);
     constexpr int SMEM_EPILOGUE_MBAR_OFFSET = SMEM_MMA_MBAR_OFFSET + TMEM_BUFFERS * sizeof(uint64_t);
@@ -562,13 +563,12 @@ void ws_gemm_2cta_mma(
                     smem_empty_parity[tma_smem_buf] ^= 1;
                 }
 
-                // smem offsets for next A/B tiles
-                const uint32_t A_smem = smem + tma_smem_buf * (SMEM_A_SIZE + SMEM_SFA_SIZE + SMEM_B_SIZE + SMEM_SFB_SIZE);
-                const uint32_t B_smem = A_smem + (SMEM_A_SIZE + SMEM_SFA_SIZE);
-
-                // smem offsets for next SFA/SFB tiles
-                const uint32_t SFA_smem = A_smem + SMEM_A_SIZE;
-                const uint32_t SFB_smem = B_smem + SMEM_B_SIZE;
+                // smem offsets for next A/B tiles - layout: [A, B, SFA, SFB]
+                constexpr int BUFF_SIZE = SMEM_A_SIZE + SMEM_B_SIZE + SMEM_SFA_SIZE + SMEM_SFB_SIZE;
+                const uint32_t A_smem = smem + tma_smem_buf * BUFF_SIZE;
+                const uint32_t B_smem = A_smem + SMEM_A_SIZE;
+                const uint32_t SFA_smem = B_smem + SMEM_B_SIZE;
+                const uint32_t SFB_smem = SFA_smem + SMEM_SFA_SIZE;
 
                 // cta 1 needs to signal shared mbar on cta 0, since cta 0 kicks of the actual mma
                 uint32_t smem_full_mbar_mapped = smem_full_mbar_addr + tma_smem_buf * sizeof(uint64_t);
@@ -576,7 +576,7 @@ void ws_gemm_2cta_mma(
                 {
                     smem_full_mbar_mapped = map_smem_addr_to_cta_rank(smem_full_mbar_mapped, 0);
                 }
-                mbarrier_arrive_expect_tx(smem_full_mbar_mapped, SMEM_A_SIZE + SMEM_SFA_SIZE + SMEM_B_SIZE + SMEM_SFB_SIZE);            
+                mbarrier_arrive_expect_tx(smem_full_mbar_mapped, SMEM_A_SIZE + SMEM_B_SIZE + SMEM_SFA_SIZE + SMEM_SFB_SIZE);            
 
                 // load A tile
                 int global_k_off = block_k_idx * BK;
@@ -585,7 +585,7 @@ void ws_gemm_2cta_mma(
                     reinterpret_cast<const uint64_t*>(&a_map),
                     0,                          // x (128 dim)
                     (uint32_t)global_m_off,     // y (M dim)
-                    (uint32_t)global_k_off/128,  // z (K/128 dim)
+                    (uint32_t)global_k_off/128, // z (K/128 dim)
                     smem_full_mbar_mapped
                 );
 
@@ -595,7 +595,7 @@ void ws_gemm_2cta_mma(
                     reinterpret_cast<const uint64_t*>(&b_map),
                     0,                          // x (128 dim)
                     (uint32_t)global_n_off,     // y (N dim)
-                    (uint32_t)global_k_off/128,  // z (K/128 dim)
+                    (uint32_t)global_k_off/128, // z (K/128 dim)
                     smem_full_mbar_mapped
                 );
 
@@ -820,11 +820,6 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     constexpr int MMA_N = 128;
     constexpr int MMA_K = 32;
 
-    // dims for sfa/sfb tiles
-    constexpr int SF_BK = BK / 32;
-    constexpr int SFA_SIZE = BM * SF_BK; // uint8 data
-    constexpr int SFB_SIZE = BN * SF_BK;
-
     assert(BM == MMA_M);
     assert(BN == MMA_N);
     assert(BK >= MMA_K && BK % MMA_K == 0);
@@ -844,7 +839,7 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     constexpr int SWIZZLE_ATOM_K = 128;
     uint64_t a_global_dims[3] = {SWIZZLE_ATOM_K, (uint64_t)M, (uint64_t)(K / SWIZZLE_ATOM_K)};
     uint32_t a_smem_dims[3] = {SWIZZLE_ATOM_K, BM, BK / SWIZZLE_ATOM_K}; // for 2 CTA mma, each CTA still loads the full BM rows of A into smem
-    uint32_t a_strides[2] = {(uint32_t)(K * sizeof(uint8_t)), SWIZZLE_ATOM_K * sizeof(uint8_t)};
+    uint32_t a_strides[2] = {(uint32_t)(K), SWIZZLE_ATOM_K};
     create_3d_tensor_map(
         A,
         a_map,
@@ -858,7 +853,7 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     // 128, BN, BK/128-> BK/128instances of BN,128 strips
     uint64_t b_global_dims[3] = {SWIZZLE_ATOM_K, (uint64_t)N, (uint64_t)(K / SWIZZLE_ATOM_K)};
     uint32_t b_smem_dims[3] = {SWIZZLE_ATOM_K, BN/CTA_GROUP_SIZE, BK / SWIZZLE_ATOM_K}; // for 2 CTA MMA, each CTA loads BN/2 cols of B into smem
-    uint32_t b_strides[2] = {(uint32_t)(K * sizeof(uint8_t)), SWIZZLE_ATOM_K * sizeof(uint8_t)};
+    uint32_t b_strides[2] = {(uint32_t)(K), SWIZZLE_ATOM_K};
     create_3d_tensor_map(
         B,
         b_map,
@@ -904,10 +899,11 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     // - mma_mbar 
     // - epilogue mbar
     // - tma_addr_in_smem
-    constexpr int smem_a_size = BM * BK * sizeof(uint8_t);
-    constexpr int smem_sfa_size = BM * (BK/32) * sizeof(uint8_t);
-    constexpr int smem_b_size = (BN / CTA_GROUP_SIZE) * BK * sizeof(uint8_t);
-    constexpr int smem_sfb_size = 512; // ((32,4),4) tile is always 512 bytes
+    constexpr int smem_a_size = BM * BK;
+    constexpr int smem_b_size = (BN / CTA_GROUP_SIZE) * BK;
+    constexpr int SF_BK = BK / 32;
+    constexpr int smem_sfa_size = ((BM * SF_BK + 511) / 512) * 512;  // round up to nearest full 512 byte SF tile
+    constexpr int smem_sfb_size = (((BN / CTA_GROUP_SIZE) * SF_BK + 511) / 512) * 512;
     constexpr int smem_full_mbar_size = sizeof(uint64_t);
     constexpr int smem_empty_mbar_size = sizeof(uint64_t);
     constexpr int mma_mbar_size = TMEM_BUFFERS * sizeof(uint64_t);

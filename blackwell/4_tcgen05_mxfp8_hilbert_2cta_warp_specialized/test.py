@@ -8,7 +8,7 @@ from torchao.prototype.mx_formats.utils import to_blocked
 custom_gemm = load(
     name='tcgen05_mxfp8_hilbert_2cta_warp_specialized',
     sources=['tcgen05_mxfp8_hilbert_2cta_warp_specialized.cpp', 'tcgen05_mxfp8_hilbert_2cta_warp_specialized.cu'],
-    extra_cuda_cflags=['-g','-G','-gencode=arch=compute_100a,code=sm_100a'],
+    extra_cuda_cflags=['-g','-G','--generate-line-info','-gencode=arch=compute_100a,code=sm_100a'],
     extra_cflags=['-O3'],
     verbose=False
 )
