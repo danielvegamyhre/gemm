@@ -505,11 +505,20 @@ void ws_gemm_2cta_mma(
     // alloc tmem addr for accumulator. allocates BN columns of TMEM (must always alloc full 128 rows)
     // 1 warp must do the allocation
     // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-memory-alloc-manage-instructions
-    constexpr int TMEM_WIDTH = BN + SF_BK * 2;
+    // Per-buffer TMEM layout: [BN cols accum | SFA_COLS | SFB_COLS]
+    // Each ((32,4),4) tile occupies 16 TMEM columns
+    constexpr int SFA_TILES = (BM * BK / 32) / 512;  
+    constexpr int SFB_TILES = ((BN / CTA_GROUP_SIZE) * BK / 32) / 512; 
+    constexpr int SFA_COLS = SFA_TILES * 16;  // ((32,4),4) layout -> 16 cols per sf til
+    constexpr int SFB_COLS = SFB_TILES * 16; 
+    constexpr int TMEM_WIDTH_PER_BUFFER = BN + SFA_COLS + SFB_COLS;
+    constexpr int TMEM_TOTAL_WIDTH = TMEM_BUFFERS * TMEM_WIDTH_PER_BUFFER;
+    // TMEM allocation must be power of 2. Round up to next power of 2.
+    constexpr int TMEM_WIDTH_ROUNDED = 1 << (32 - __builtin_clz(TMEM_TOTAL_WIDTH - 1));
     if (warp_id == 0)
     {
-        // allocate 2 temm buffers of BN cols each
-        tcgen05_alloc<TMEM_WIDTH * TMEM_BUFFERS>(tmem_addr_smem);
+        // allocate tmem buffers (must be power of 2)
+        tcgen05_alloc<TMEM_WIDTH_ROUNDED>(tmem_addr_smem);
     }
 
     // make sure mbarriers and tmem addr are visible to full cluster
@@ -592,24 +601,31 @@ void ws_gemm_2cta_mma(
 
                 // SFA/SFB in ((32,4),4) layout after quantization kernel.
                 // so we have contiguous chunks of 512 byte scale factors.
-                // SF_BK = 128x(K/32), and we need to load in (128x4)=512 byte chunks, so divide by SF_BK/4 to get number of iterations
+                const int sf_tiles_per_bk_cols = (K/32)/4; // 1x32 scaling factors, divied into 128x4 tiles in ((32,4),4) layout
+                const int sf_stride_per_row_of_blocks = sf_tiles_per_bk_cols * 512;
+                const int sfa_block_base_off = (global_m_off / 128) * sf_stride_per_row_of_blocks;
                 #pragma unroll
                 for (int sf_k_off = 0; sf_k_off < BM * SF_BK; sf_k_off += 512) {
                     // load SFA tile
                     cp_async_bulk_tensor_1d_global_to_shared(
                         SFA_smem + sf_k_off,
-                        reinterpret_cast<const uint64_t*>(sfa_ptr + (global_m_off + block_k_idx * SF_BK + sf_k_off)),
+                        reinterpret_cast<const uint64_t*>(sfa_ptr + sfa_block_base_off + sf_k_off),
                         SF_BYTES,
                         smem_full_mbar_mapped
                     );
                 }
-                // load SFB tile (always 512 bytes for ((32,4),4) layout)
-                cp_async_bulk_tensor_1d_global_to_shared(
-                    SFB_smem,
-                    reinterpret_cast<const uint64_t*>(sfb_ptr + (global_n_off + block_k_idx * SF_BK)),
-                    SF_BYTES,
-                    smem_full_mbar_mapped
-                );
+
+                const int sfb_block_base_off = (global_n_off / 128) * sf_stride_per_row_of_blocks;;
+                #pragma unroll
+                for (int sf_k_off = 0; sf_k_off < (BN/CTA_GROUP_SIZE) * SF_BK; sf_k_off += 512) {
+                    // load SFB tile (always 512 bytes for ((32,4),4) layout)
+                    cp_async_bulk_tensor_1d_global_to_shared(
+                        SFB_smem,
+                        reinterpret_cast<const uint64_t*>(sfb_ptr + sfb_block_base_off + sf_k_off),
+                        SF_BYTES,
+                        smem_full_mbar_mapped
+                    );
+                }
                 tma_smem_buf = (tma_smem_buf + 1) % QUEUE_SIZE;
             }
         }
@@ -626,12 +642,16 @@ void ws_gemm_2cta_mma(
 
             // calculate tmem addresses for accumulator and scale factors.
             // each base addr starts at row 0 of the tmem buffer, so we only add col offset to get start addr
-            // TMEM layout = [BN cols for accum..., SF_BK cols for SFA..., SF_BK cols for SFB...]
-            constexpr int TMEM_WIDTH = BN + SF_BK * 2;
+            // Per-buffer TMEM layout: [BN cols accum | SFA_COLS | SFB_COLS]
+            constexpr int SFA_TILES = BM / 32;  // 4 tiles covering BM rows
+            constexpr int SFB_TILES = (BN / CTA_GROUP_SIZE) / 32;  // 2 tiles covering BN/2 cols
+            constexpr int SFA_COLS = SFA_TILES * 16;  // 64 cols
+            constexpr int SFB_COLS = SFB_TILES * 16;  // 32 cols
+            constexpr int TMEM_WIDTH = BN + SFA_COLS + SFB_COLS;  // 224 cols per buffer
             int buffer_offset = mma_tmem_buf * TMEM_WIDTH;
             int tmem_accum_addr = tmem_base_addr + buffer_offset;
             int tmem_sfa_base_addr = tmem_base_addr + buffer_offset + BN;
-            int tmem_sfb_base_addr = tmem_base_addr + buffer_offset + BN + SF_BK;
+            int tmem_sfb_base_addr = tmem_base_addr + buffer_offset + BN + SFA_COLS;
 
             // make cta mask used for tcgen05_commit_multicast signaling.
             // bit 0 for cta rank 0, bit 1 for cta rank 1
@@ -776,13 +796,13 @@ void ws_gemm_2cta_mma(
         }
     }
 
-    // tmem deallocation after all threads finished using tmem.
+    // tmem location after all threads finished using tmem.
     // cluster sync to make sure both CTAs stay alive for the duration of the peristent pipeline
     cluster_sync();
     if (warp_id == 0)
     {
         int tmem_addr_reg = *reinterpret_cast<int*>(__cvta_shared_to_generic(tmem_addr_smem));
-        tcgen05_dealloc<TMEM_WIDTH * TMEM_BUFFERS>(tmem_addr_reg);
+        tcgen05_dealloc<TMEM_WIDTH_ROUNDED>(tmem_addr_reg);
     }
 }
 
@@ -855,10 +875,17 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     constexpr int BLOCK_SIZE = (PRODUCER_WARPS + CONSUMER_WARPS + EPILOGUE_WARPS) * 32;
     constexpr int TMEM_BUFFERS = 2;
 
-    // TMEM is 128x512 cells, each cell is 32 bits / 4 bytes.
-    // So check tmem buffer requirements with 1 byte per elem is <= tmem col width in bytes.
-    constexpr int tmem_width_bytes = 512 * 4;
-    assert(BN + SFA_SIZE + SFB_SIZE <= tmem_width_bytes);
+    // validate TMEM allocation fits in hardware limits
+    constexpr int tmem_width_cells = 512;
+    constexpr int SFA_TILES = (BM * BK / 32) / 512;
+    constexpr int SFB_TILES = ((BN / CTA_GROUP_SIZE) * BK / 32) / 512;
+    constexpr int SFA_COLS = SFA_TILES * 16;  // 16 TMEM cols per ((32,4),4) tile
+    constexpr int SFB_COLS = SFB_TILES * 16;
+    constexpr int TMEM_WIDTH_PER_BUFFER = BN + SFA_COLS + SFB_COLS;
+    constexpr int TMEM_TOTAL_WIDTH = TMEM_BUFFERS * TMEM_WIDTH_PER_BUFFER;
+    // TMEM allocation must be power of 2
+    constexpr int TMEM_WIDTH_ROUNDED = 1 << (32 - __builtin_clz(TMEM_TOTAL_WIDTH - 1));
+    assert(TMEM_WIDTH_ROUNDED <= tmem_width_cells);
 
     
     // persistent kernel runs 1 threadblock per SM
