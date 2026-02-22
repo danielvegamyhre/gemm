@@ -138,18 +138,20 @@ __device__ uint64_t make_sf_smem_desc(uint32_t smem_shared_addr) {
     uint64_t desc = matrix_desc_encode(smem_shared_addr);
 
     // bits 16-29: matrix_desc_encode(leading dim byte offset)
-    // LBO implied to be 1
+    // LBO: stride between rows of core matrices (vertical) = 8 rows × 4 bytes/row within a block
+    // uint64_t LBO = 32;
+    // desc |= (matrix_desc_encode(LBO) << 16);
 
     // bits 32-45: matrix_desc_encode(stride dim byte offset)
-    // SBO (stride byte offset) is size of core matrix (8x16 bytes) for no swizzle mode
-    uint64_t SBO = 8 * 16;
+    // SBO: stride horizontally between blocks = 128 bytes to next block
+    uint64_t SBO = 128;
     desc |= (matrix_desc_encode(SBO) << 32);
 
     // bits 46-49: fixed value of 0b001
     desc |= (1ULL << 46ULL);
 
     // bits 61-63: swizzle mode (0 = no swizzle)
-    return desc;    
+    return desc;
 }
 
 // init mbar for sync between tma and regular
@@ -282,7 +284,7 @@ __device__ __forceinline__ void tcgen05_dealloc(int tmem_addr_reg) {
 }
 
 template <int MMA_M, int MMA_N>
-__device__ __forceinline__ void tcgen05_encode_idesc(uint32_t& idesc) {
+__device__ __forceinline__ void tcgen05_encode_idesc(uint32_t& idesc, int sfa_id) {
     // create idesc
     // from PTX docs: "The 32-bit register operand idesc is the instruction descriptor as described in
     //   Instruction descriptor, specifies the shapes, exact types, sparsity and other details of the
@@ -292,8 +294,10 @@ __device__ __forceinline__ void tcgen05_encode_idesc(uint32_t& idesc) {
     // e4m3 input matrix A and B => encode 0 for bits 7-9 and bits 10-12 (so no-op here).
     // then:
     idesc |= (1 << 4);                          // fp32 output matrix D
-    idesc |= (MMA_N >> 3) << 17;                // N dim of matrix B
-    idesc |= (MMA_M >> 4) << 24;                // M dim of matrix A
+    idesc |= (MMA_N >> 3) << 17;                // N dim of matrix B (without 3 LSBs) for bits 17-22
+    idesc |= (1 << 23);                         // scale dtype for both scale_A / scale_B (bit 23). 1=e8m0
+    idesc |= (MMA_M >> 7) << 27;                // M dim of matrix A (without 7 LSBs) for bits 27-28
+    idesc |= (sfa_id << 29);                    // matrix A scale factor ID (https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-scale-factor-a)
 }
 
 __device__ __forceinline__ void tcgen05_mma_mxfp8(
@@ -487,8 +491,8 @@ void producer_warp(
     constexpr int SF_BK = BK / 32;
     constexpr int SMEM_A_SIZE = BM * BK;
     constexpr int SMEM_B_SIZE = (BN / CTA_GROUP_SIZE) * BK;
-    constexpr int SMEM_SFA_SIZE = ((BM * SF_BK + 511) / 512) * 512;
-    constexpr int SMEM_SFB_SIZE = ((BN * SF_BK + 511) / 512) * 512;
+    constexpr int SMEM_SFA_SIZE = BM * SF_BK;
+    constexpr int SMEM_SFB_SIZE = BN * SF_BK;
 
     int tma_smem_buf = 0;
     int smem_empty_parity[QUEUE_SIZE] = {0};
@@ -513,7 +517,7 @@ void producer_warp(
         const int num_blocks_k = (K + BK - 1) / BK;
 
         for (int block_k_idx = 0; block_k_idx < num_blocks_k; block_k_idx++) {
-            if (block_k_idx >= QUEUE_SIZE || bid > start_bid)
+            if (block_k_idx >= QUEUE_SIZE || group_id > start_group_id)
             {
                 mbarrier_wait_parity(smem_empty_mbar_addrs[tma_smem_buf], smem_empty_parity[tma_smem_buf]);
                 smem_empty_parity[tma_smem_buf] ^= 1;
@@ -593,9 +597,8 @@ void consumer_warp(
     constexpr int SF_BK = BK / 32;
     constexpr int SMEM_A_SIZE = BM * BK;
     constexpr int SMEM_B_SIZE = (BN / CTA_GROUP_SIZE) * BK;
-    constexpr int SMEM_SFA_SIZE = ((BM * SF_BK + 511) / 512) * 512;
-    constexpr int SMEM_SFB_SIZE = ((BN * SF_BK + 511) / 512) * 512;
-    constexpr int SWIZZLE_ATOM_K = 128;
+    constexpr int SMEM_SFA_SIZE = BM * SF_BK;
+    constexpr int SMEM_SFB_SIZE = BN * SF_BK;
 
     int mma_smem_buf = 0;
     int mma_tmem_buf = 0;
@@ -603,10 +606,6 @@ void consumer_warp(
     int epilogue_parity[TMEM_BUFFERS] = {0};
     int blocks_processed = 0;
     int tmem_base_addr = *reinterpret_cast<int*>(__cvta_shared_to_generic(tmem_addr_smem));
-
-    // encode tcgen05.mma instruction descriptor
-    uint32_t idesc = 0;
-    tcgen05_encode_idesc<CTA_GROUP_SIZE * MMA_M, MMA_N>(idesc);
 
     uint16_t cta_mask = 0b11;
     const int num_blocks_k = (K + BK - 1) / BK;
@@ -625,13 +624,15 @@ void consumer_warp(
         smem_empty_mbar_addrs[i] = smem_empty_mbar_addr + i * sizeof(uint64_t);
     }
 
+    // calculate tmem addresses
+    constexpr int SFA_TILES = (BM * SF_BK) / 512;
+    constexpr int SFB_TILES = (BN * SF_BK) / 512;
+    constexpr int SFA_COLS = SFA_TILES * 16;
+    constexpr int SFB_COLS = SFB_TILES * 16;
+    constexpr int TMEM_WIDTH = BN + SFA_COLS + SFB_COLS;
+
     for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
-        // calculate tmem addresses
-        constexpr int SFA_TILES = (BM * SF_BK) / 512;
-        constexpr int SFB_TILES = (BN * SF_BK) / 512;
-        constexpr int SFA_COLS = SFA_TILES * 16;
-        constexpr int SFB_COLS = SFB_TILES * 16;
-        constexpr int TMEM_WIDTH = BN + SFA_COLS + SFB_COLS;
+
         int buffer_offset = mma_tmem_buf * TMEM_WIDTH;
         int tmem_accum_addr = tmem_base_addr + buffer_offset;
         int tmem_sfa_base_addr = tmem_base_addr + buffer_offset + BN;
@@ -652,18 +653,21 @@ void consumer_warp(
             const int smem_sfb_base = smem_sfa_base + SMEM_SFA_SIZE;
 
             #pragma unroll
-            for (int sf_k_off = 0; sf_k_off < SMEM_SFA_SIZE; sf_k_off += 512) {
-                uint64_t sfa_desc = make_sf_smem_desc(smem + smem_sfa_base + sf_k_off);
-                tcgen05_cp_smem_to_tmem(sfa_desc, tmem_sfa_base_addr, 0, sf_k_off / 32);
+            for (int sfa_off = 0; sfa_off < SMEM_SFA_SIZE; sfa_off += 512) {
+                uint64_t sfa_desc = make_sf_smem_desc(smem + smem_sfa_base + sfa_off);
+
+                // 32x16 load broadcasted to all 4 warp zones of TMEM (32 rows each -> 128 rows)
+                tcgen05_cp_smem_to_tmem(sfa_desc, tmem_sfa_base_addr, 0, sfa_off / 32); // 512/32= 16 cols per ((32,4),4) SF tile
             }
 
             #pragma unroll
-            for (int sf_k_off = 0; sf_k_off < SMEM_SFB_SIZE; sf_k_off += 512) {
-                uint64_t sfb_desc = make_sf_smem_desc(smem + smem_sfb_base + sf_k_off);
-                tcgen05_cp_smem_to_tmem(sfb_desc, tmem_sfb_base_addr, 0, sf_k_off / 32);
+            for (int sfb_off = 0; sfb_off < SMEM_SFB_SIZE; sfb_off += 512) {
+                uint64_t sfb_desc = make_sf_smem_desc(smem + smem_sfb_base + sfb_off);
+                tcgen05_cp_smem_to_tmem(sfb_desc, tmem_sfb_base_addr, 0, sfb_off / 32);
             }
 
             // tcgen05 mma
+            constexpr int SWIZZLE_ATOM_K = 128;
             for (int bk_chunk = 0; bk_chunk < BK / SWIZZLE_ATOM_K; bk_chunk++) {
                 for (int mma_iter = 0; mma_iter < SWIZZLE_ATOM_K / MMA_K; mma_iter++) {
                     const int a_chunk_off = bk_chunk * BM * SWIZZLE_ATOM_K;
@@ -677,10 +681,23 @@ void consumer_warp(
                     uint64_t smem_a_desc = make_smem_desc(smem_buff_a + a_k_off);
                     uint64_t smem_b_desc = make_smem_desc(smem_buff_b + b_k_off);
 
-                    int tmem_sfa_addr = tmem_sfa_base_addr + (a_k_off / 32) * 16;
-                    int tmem_sfb_addr = tmem_sfb_base_addr + (b_k_off / 32) * 16;
+                    
+                    // encode tcgen05.mma instruction descriptor.
+                    // SFA_ID is odd. for .block_32 mma scaling, it basically selects what *was* as 128x1 sf column 
+                    // before the transform to ((32,4),4) blocked layout. therefore, this 128x1 sf column corresponds exactly to a 128x32 chunk of A tile,
+                    // which matches our MMA_M=128, MMA_K=32.
+                    uint32_t idesc = 0;
+                    tcgen05_encode_idesc<CTA_GROUP_SIZE * MMA_M, MMA_N>(idesc, mma_iter);
+
+                    // only disable accumo on the first mma of each block
                     int enable_accum = (block_k_idx == 0 && bk_chunk == 0 && mma_iter == 0) ? 0 : 1;
-                    tcgen05_mma_mxfp8(smem_a_desc, smem_b_desc, tmem_sfa_addr, tmem_sfb_addr, tmem_accum_addr, idesc, enable_accum);
+
+                    // i *think* that the `tmem_base_addr` of SFA and SFB should stay constant 
+                    // while we are using the same 512b scale factor tile for four MMAs, 
+                    // which use one 128x1 (or four 32x1) sf cols.
+                    // we use same tmem base address and increment `sfa_id` to communicate 
+                    // which sf cols to select for that MMA. 
+                    tcgen05_mma_mxfp8(smem_a_desc, smem_b_desc, tmem_sfa_base_addr, tmem_sfb_base_addr, tmem_accum_addr, idesc, enable_accum);
                 }
             }
 
@@ -743,6 +760,8 @@ void epilogue_warpgroup(
         mbarrier_wait_parity(mma_mbar_addrs[epilogue_tmem_buf], mma_parity[epilogue_tmem_buf]);
         mma_parity[epilogue_tmem_buf] ^= 1;
 
+        // fence that ensures all previously committed
+        // tcgen05.mma operations are complete with results visible in tmem to this thread
         asm volatile("tcgen05.fence::after_thread_sync;");
 
         int tmem_addr_reg = tmem_base_addr + epilogue_tmem_buf * BN;
@@ -797,7 +816,7 @@ void ws_gemm_2cta_mma(
     const int grid_n = N / BN;
     const int grid_m = M / (CTA_GROUP_SIZE * BM);  // number of groups in M dimension
 
-    // 4 epilogue warps -> 1 producer warp -> 1 consumer warp
+    // epilogue warps = (0,1,2,3), producer = 4, consumer = 5
     const int is_producer_master_thread = threadIdx.x == 4 * 32;             
     const int is_mma_master_thread = threadIdx.x ==  5 * 32;
     const int warp_id = threadIdx.x / 32;
@@ -813,8 +832,8 @@ void ws_gemm_2cta_mma(
     constexpr int SMEM_A_SIZE = BM * BK;                    // for 2cta mma, each cta loads BM rows
     constexpr int SMEM_B_SIZE = (BN / CTA_GROUP_SIZE) * BK; // for 2cta mma, each cta loads BN/2 cols
     // Scale factor tiles are ((32,4),4) layout with 512-byte granularity (128 rows/cols × 4 SF_BK)
-    constexpr int SMEM_SFA_SIZE = ((BM * SF_BK + 511) / 512) * 512;  // for SFA each CTA gets BM rows (so 2 BMxSF_BK tiles stacked vertically)
-    constexpr int SMEM_SFB_SIZE = ((BN * SF_BK + 511) / 512) * 512;  // for SFB, full BN cols must be duplicated on both CTAs
+    constexpr int SMEM_SFA_SIZE = BM * SF_BK;               // for SFA each CTA gets BM rows (so 2 BMxSF_BK tiles stacked vertically)
+    constexpr int SMEM_SFB_SIZE = BN * SF_BK;               // for SFB, full BN cols must be duplicated on both CTAs
     constexpr int SMEM_QUEUE_SIZE = QUEUE_SIZE * (SMEM_A_SIZE + SMEM_B_SIZE + SMEM_SFA_SIZE + SMEM_SFB_SIZE);
 
     // calculate start offset for each smem buffer
@@ -836,10 +855,21 @@ void ws_gemm_2cta_mma(
     uint64_t* smem_empty_mbar = reinterpret_cast<uint64_t*>(smem_buffer + SMEM_EMPTY_MBAR_OFFSET);
     uint64_t* mma_mbar = reinterpret_cast<uint64_t*>(smem_buffer + SMEM_MMA_MBAR_OFFSET);
     uint64_t* epilogue_mbar = reinterpret_cast<uint64_t*>(smem_buffer + SMEM_EPILOGUE_MBAR_OFFSET);
-    initialize_barriers<QUEUE_SIZE, 2>(smem_full_mbar, is_producer_master_thread);              // both CTAs report to CTA 0 mbar
-    initialize_barriers<QUEUE_SIZE, 1>(smem_empty_mbar, is_producer_master_thread);             // each CTA tracks its own "finished using smem buffer" signal
-    initialize_barriers<TMEM_BUFFERS, 1>(mma_mbar, is_producer_master_thread);                  // one mbar per TMEM buffer for multicast
-    initialize_barriers<TMEM_BUFFERS, 128 * CTA_GROUP_SIZE>(epilogue_mbar, is_producer_master_thread); // one mbar per TMEM buffer for tracking when tmem->reg has finished
+
+    // both CTAs report to CTA 0 mbar
+    initialize_barriers<QUEUE_SIZE, 2>(smem_full_mbar, is_producer_master_thread);                     
+
+    // cta 0 signals both ctas when smem buffer can be re-used
+    initialize_barriers<QUEUE_SIZE, 1>(smem_empty_mbar, is_producer_master_thread);                     
+
+    // cta 0 signals both ctas when tmem buffer is ready for epilogue
+    initialize_barriers<TMEM_BUFFERS, 1>(mma_mbar, is_producer_master_thread);                          
+
+    // epilogue warpgroup signals mma warp when tmem->reg read is done
+    initialize_barriers<TMEM_BUFFERS, 128 * CTA_GROUP_SIZE>(epilogue_mbar, is_producer_master_thread);  
+
+    // ensure mbarrier initialization is visible to both ctas in the cluster.
+    // mbar smem state init before "release" will be visible to other threads after they "acquire" it
     asm volatile("fence.mbarrier_init.release.cluster;");  
 
     // get threadblock rank in cluster
@@ -926,7 +956,6 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     constexpr int BM = 128;
     constexpr int BN = 128;
     constexpr int BK = 128;
-    const int SF_K = K / 32;
     constexpr int SF_BK = BK / 32;
 
     // dims for tcgen05.mma
@@ -984,10 +1013,11 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     // sfa has shape (M, K/32) with layout ((32,4),4) for 512 byte tile granularity)
     // Each 512-byte tile = 4 blocks × 128 bytes/block
     // Use 4D: {128 bytes per block, 4 blocks per tile, SF_K/4 tile cols, M/128 tile rows}
+    const int SF_K = K / 32;
     uint64_t sfa_global_dims[4] = {
         128,                       // bytes per block (within 256 limit)
         4,                         // blocks per tile
-        (uint64_t)(SF_K / 4),      // tile columns
+        (uint64_t)(K / 32/ 4),     // tile columns
         (uint64_t)(M / 128)        // tile rows
     };
     uint32_t sfa_smem_dims[4] = {
@@ -1080,15 +1110,15 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     // - tma_addr_in_smem
     constexpr int smem_a_size = BM * BK;
     constexpr int smem_b_size = (BN / CTA_GROUP_SIZE) * BK;
-    constexpr int smem_sfa_size = ((BM * SF_BK + 511) / 512) * 512;  // round up to nearest full 512 byte SF tile
-    constexpr int smem_sfb_size = (((BN / CTA_GROUP_SIZE) * SF_BK + 511) / 512) * 512;
+    constexpr int smem_sfa_size = BM * SF_BK;  // each CTA has BMxSF_K *separate* sfa tiles (ctas are 'stacked vertically')
+    constexpr int smem_sfb_size = BN * SF_BK;  // each CTA has *same* BNxSF_K sfb tile
     constexpr int smem_full_mbar_size = sizeof(uint64_t);
     constexpr int smem_empty_mbar_size = sizeof(uint64_t);
+    constexpr int total_smem_per_stage = smem_a_size + smem_sfa_size + smem_b_size + smem_sfb_size + smem_full_mbar_size + smem_empty_mbar_size;
     constexpr int mma_mbar_size = TMEM_BUFFERS * sizeof(uint64_t);
     constexpr int epilogue_mbar_size = TMEM_BUFFERS * sizeof(uint64_t);
     constexpr int tmem_addr_size = sizeof(int);
-    constexpr int total_smem_per_stage = smem_a_size + smem_sfa_size + smem_b_size + smem_sfb_size + smem_full_mbar_size + smem_empty_mbar_size + mma_mbar_size + epilogue_mbar_size + tmem_addr_size;
-    constexpr int QUEUE_SIZE = max_smem_per_sm / total_smem_per_stage;
+    constexpr int QUEUE_SIZE = max_smem_per_sm / (total_smem_per_stage + tmem_addr_size + mma_mbar_size + epilogue_mbar_size);
     constexpr int total_smem = total_smem_per_stage * QUEUE_SIZE;
 
     const int launch_blocks = 128; 

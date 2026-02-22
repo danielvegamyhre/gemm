@@ -54,7 +54,10 @@ def test_gemm(M, K, N):
     #     swizzle_b=SwizzleType.SWIZZLE_32_4_4,
     #     output_dtype=torch.float32,
     # )
-
+    
+    print(result)
+    print()
+    print(expected)
     # Check for mismatches
     rtol = 1e-2
     atol = 1e-2
