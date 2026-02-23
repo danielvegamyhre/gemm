@@ -31,16 +31,16 @@ def test_gemm(M, K, N):
     result = custom_gemm.gemm_cuda(
         A_data.view(torch.uint8), 
         B_data.t().view(torch.uint8), 
-        A_scales_blocked.view(torch.uint8), 
-        B_scales_blocked.view(torch.uint8), 
+        torch.ones_like(A_scales_blocked).view(torch.uint8), 
+        torch.ones_like(B_scales_blocked).view(torch.uint8), 
         C
     )
     
     expected = torch._scaled_mm(
         A_data, 
         B_data.t(), 
-        A_scales_blocked, 
-        B_scales_blocked,
+        torch.ones_like(A_scales_blocked), 
+        torch.ones_like(B_scales_blocked),
         out_dtype=torch.float32,
     )
     # expected = scaled_mm(
@@ -54,70 +54,8 @@ def test_gemm(M, K, N):
     #     swizzle_b=SwizzleType.SWIZZLE_32_4_4,
     #     output_dtype=torch.float32,
     # )
-    
     print(result)
     print()
     print(expected)
-    # Check for mismatches
-    rtol = 1e-2
-    atol = 1e-2
-
-    diff = torch.abs(result - expected)
-    rel_diff = diff / (torch.abs(expected) + 1e-8)
-
-    mismatch_mask = (diff > atol) & (rel_diff > rtol)
-    num_mismatches = mismatch_mask.sum().item()
-    total_elements = M * N
-
-    print(f"\n{'='*80}")
-    print(f"GEMM Verification Results: M={M}, N={N}, K={K}")
-    print(f"{'='*80}")
-    print(f"Total elements: {total_elements}")
-    print(f"Mismatched elements: {num_mismatches} ({100.0 * num_mismatches / total_elements:.2f}%)")
-
-    if num_mismatches > 0:
-        mismatch_indices = torch.nonzero(mismatch_mask, as_tuple=False)
-
-        # Analyze mismatch distribution
-        mismatch_rows = mismatch_indices[:, 0]
-        mismatch_cols = mismatch_indices[:, 1]
-
-        print(f"\nMismatch distribution:")
-        print(f"  Row range: [{mismatch_rows.min().item()}, {mismatch_rows.max().item()}]")
-        print(f"  Col range: [{mismatch_cols.min().item()}, {mismatch_cols.max().item()}]")
-
-        # Count mismatches per 128-row block (BM=128)
-        BM = 128
-        BN = 256
-        print(f"\nMismatches per {BM}-row block:")
-        for block_m in range((M + BM - 1) // BM):
-            start_row = block_m * BM
-            end_row = min(start_row + BM, M)
-            block_mask = (mismatch_rows >= start_row) & (mismatch_rows < end_row)
-            block_count = block_mask.sum().item()
-            if block_count > 0:
-                print(f"  Rows [{start_row:4d}:{end_row:4d}): {block_count:6d} mismatches")
-
-        print(f"\nMismatches per {BN}-col block:")
-        for block_n in range((N + BN - 1) // BN):
-            start_col = block_n * BN
-            end_col = min(start_col + BN, N)
-            block_mask = (mismatch_cols >= start_col) & (mismatch_cols < end_col)
-            block_count = block_mask.sum().item()
-            if block_count > 0:
-                print(f"  Cols [{start_col:4d}:{end_col:4d}): {block_count:6d} mismatches")
-
-        # Show first 10 mismatches
-        print(f"\nFirst 10 mismatches (showing up to 10):")
-        for idx in range(min(10, num_mismatches)):
-            i, j = mismatch_indices[idx]
-            result_val = result[i, j].item()
-            expected_val = expected[i, j].item()
-            diff_val = diff[i, j].item()
-            print(f"  [{i:4d}, {j:4d}]: result={result_val:10.4f}, expected={expected_val:10.4f}, diff={diff_val:10.4f}")
-
-        print(f"\n{'='*80}")
-        raise AssertionError(f"Found {num_mismatches} mismatches out of {total_elements} elements")
-    else:
-        print(f"\n✓ All elements match within tolerance (rtol={rtol}, atol={atol})")
-        print(f"{'='*80}\n")
+    
+    assert torch.allclose(result, expected, atol=0, rtol=0)

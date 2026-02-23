@@ -173,12 +173,10 @@ __device__ uint64_t make_sf_smem_desc(uint32_t smem_shared_addr) {
 
     // bits 16-29: matrix_desc_encode(leading dim byte offset)
     // LBO: stride between rows of core matrices (vertical) = 8 rows × 4 bytes/row within a block
-    // uint64_t LBO = 32;
-    // desc |= (matrix_desc_encode(LBO) << 16);
 
     // bits 32-45: matrix_desc_encode(stride dim byte offset)
-    // SBO: stride horizontally between blocks = 128 bytes to next block
-    uint64_t SBO = 128;
+    // SBO: stride horizontally between blocks = 8x16b
+    uint64_t SBO = 8*16;
     desc |= (matrix_desc_encode(SBO) << 32);
 
     // bits 46-49: fixed value of 0b001
@@ -604,7 +602,7 @@ void producer_warp(
                 B_smem,
                 reinterpret_cast<const uint64_t*>(b_map),
                 0,
-                (uint32_t)global_n_off_sfb,
+                (uint32_t)global_n_off,
                 (uint32_t)global_k_off/128,
                 smem_full_mbar_addrs[tma_smem_buf]
             );
@@ -625,7 +623,7 @@ void producer_warp(
                 0,
                 0,
                 (uint32_t)(global_k_off/32/4),
-                (uint32_t)(global_n_off/128),
+                (uint32_t)(global_n_off_sfb/128),
                 smem_full_mbar_addrs[tma_smem_buf]
             );
 
@@ -704,7 +702,6 @@ void consumer_warp(
             #pragma unroll
             for (int sfa_off = 0; sfa_off < SMEM_SFA_SIZE; sfa_off += 512) {
                 uint64_t sfa_desc = make_sf_smem_desc(smem + smem_sfa_base + sfa_off);
-
                 // 32x16 load broadcasted to all 4 warp zones of TMEM (32 rows each -> 128 rows)
                 tcgen05_cp_smem_to_tmem(sfa_desc, tmem_sfa_base_addr, 0, sfa_off / 32); // 512/32= 16 cols per ((32,4),4) SF tile
             }
@@ -880,7 +877,6 @@ void ws_gemm_2cta_mma(
     // calculate smem allocation sizes
     constexpr int SMEM_A_SIZE = BM * BK;                    // for 2cta mma, each cta loads BM rows
     constexpr int SMEM_B_SIZE = (BN / CTA_GROUP_SIZE) * BK; // for 2cta mma, each cta loads BN/2 cols
-    // Scale factor tiles are ((32,4),4) layout with 512-byte granularity (128 rows/cols × 4 SF_BK)
     constexpr int SMEM_SFA_SIZE = BM * SF_BK;               // for SFA each CTA gets BM rows (so 2 BMxSF_BK tiles stacked vertically)
     constexpr int SMEM_SFB_SIZE = BN * SF_BK;               // for SFB, full BN cols must be duplicated on both CTAs
     constexpr int SMEM_QUEUE_SIZE = QUEUE_SIZE * (SMEM_A_SIZE + SMEM_B_SIZE + SMEM_SFA_SIZE + SMEM_SFB_SIZE);
