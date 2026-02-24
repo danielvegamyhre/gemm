@@ -442,68 +442,6 @@ __device__ __forceinline__ void cluster_sync() {
     asm volatile("barrier.cluster.wait.acquire.aligned;");
 }
 
-// Hilbert curve mapping utilities for cache-aware scheduling
-// see: https://en.wikipedia.org/wiki/Hilbert_curve
-__device__ __forceinline__ void hilbert_rot(int n, int* x, int* y, int rx, int ry) {
-    if (ry == 0) {
-        if (rx == 1) {
-            *x = n - 1 - *x;
-            *y = n - 1 - *y;
-        }
-        // Swap x and y
-        int t = *x;
-        *x = *y;
-        *y = t;
-    }
-}
-
-// Convert from Hilbert curve index to 2D coordinates
-// n must be a power of 2 (size of the grid dimension)
-__device__ __forceinline__ void hilbert_index_to_xy(int n, int index, int* x, int* y) {
-    *x = 0;
-    *y = 0;
-    for (int s = 1; s < n; s *= 2) {
-        int rx = 1 & (index / 2);
-        int ry = 1 & (index ^ rx);
-        hilbert_rot(s, x, y, rx, ry);
-        *x += s * rx;
-        *y += s * ry;
-        index /= 4;
-    }
-}
-
-__device__ __forceinline__ std::pair<int, int> compute_bid_hilbert(int bid, int grid_m, int grid_n) {
-    constexpr int CTA_GROUP_SIZE = 2;
-    const int group_id = bid / CTA_GROUP_SIZE;
-
-    // Find smallest power of 2 that fits both dimensions
-    int max_dim = max(grid_m, grid_n);
-    int hilbert_size = 1;
-    while (hilbert_size < max_dim) {
-        hilbert_size *= 2;
-    }
-
-    // Map group_id to 2D coordinates using Hilbert curve
-    int group_m, group_n;
-    hilbert_index_to_xy(hilbert_size, group_id, &group_n, &group_m);
-
-    // Clamp to actual grid bounds and handle out-of-bounds by wrapping
-    // This ensures we still process all tiles even with non-power-of-2 grids
-    if (group_m >= grid_m || group_n >= grid_n) {
-        // Fallback to linear mapping for out-of-bounds indices
-        int valid_group_id = group_id % (grid_m * grid_n);
-        group_n = valid_group_id % grid_n;
-        group_m = valid_group_id / grid_n;
-    }
-
-    // Convert group coordinates to block coordinates
-    // Each group is CTA_GROUP_SIZE blocks tall
-    const int base_block_m = group_m * CTA_GROUP_SIZE;
-    const int block_n = group_n;
-    const int block_m = base_block_m + (bid % CTA_GROUP_SIZE);
-
-    return {block_m, block_n};
-}
 
 __device__ __forceinline__ std::pair<int, int> compute_bid(int bid, int grid_n) {
     constexpr int CTA_GROUP_SIZE = 2;
@@ -563,7 +501,7 @@ void producer_warp(
 
     for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
         const int bid = group_id * CTA_GROUP_SIZE + (start_bid % CTA_GROUP_SIZE);
-        auto [block_m, block_n] = compute_bid_hilbert(bid, grid_m, grid_n);
+        auto [block_m, block_n] = compute_bid(bid, grid_n);
 
         int global_m_off = block_m * BM;
         int global_n_off = block_n * BN + cta_rank * BN / 2;
@@ -801,7 +739,7 @@ void epilogue_warpgroup(
 
     for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
         const int bid = group_id * CTA_GROUP_SIZE + (start_bid % CTA_GROUP_SIZE);
-        auto [block_m, block_n] = compute_bid_hilbert(bid, grid_m, grid_n);
+        auto [block_m, block_n] = compute_bid(bid, grid_n);
 
         mbarrier_wait_parity(mma_mbar_addrs[epilogue_tmem_buf], mma_parity[epilogue_tmem_buf]);
         mma_parity[epilogue_tmem_buf] ^= 1;
@@ -1055,7 +993,7 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     alignas(128) CUtensorMap sfa_map = {};
     alignas(128) CUtensorMap sfb_map = {};
 
-   // sfa has shape (M, K/32) with layout ((32,4),4) for 512 byte tile granularity)
+    // sfa has shape (M, K/32) with layout ((32,4),4) for 512 byte tile granularity)
     // Each 512-byte tile = 4 blocks × 128 bytes/block
     // Use 4D: {128 bytes per block, 4 blocks per tile, SF_K/4 tile cols, M/128 tile rows}
     const int SF_K = K / 32;
