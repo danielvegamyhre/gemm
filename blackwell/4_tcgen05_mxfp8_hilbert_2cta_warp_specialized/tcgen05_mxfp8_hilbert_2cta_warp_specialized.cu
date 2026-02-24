@@ -641,13 +641,15 @@ void consumer_warp(
             for (int sfa_off = 0; sfa_off < SMEM_SFA_SIZE; sfa_off += 512) {
                 uint64_t sfa_desc = make_sf_smem_desc(smem + smem_sfa_base + sfa_off);
                 // 32x16 load broadcasted to all 4 warp zones of TMEM (32 rows each -> 128 rows)
-                tcgen05_cp_smem_to_tmem(sfa_desc, tmem_sfa_base_addr, 0, sfa_off / 32); // 512/32= 16 cols per ((32,4),4) SF tile
+                // 512/32= 16 cols per ((32,4),4) SF tile
+                // tmem cells 4 bytes wide, so divide by 4 
+                tcgen05_cp_smem_to_tmem(sfa_desc, tmem_sfa_base_addr, 0, sfa_off / 32 / 4); 
             }
 
             #pragma unroll
             for (int sfb_off = 0; sfb_off < SMEM_SFB_SIZE; sfb_off += 512) {
                 uint64_t sfb_desc = make_sf_smem_desc(smem + smem_sfb_base + sfb_off);
-                tcgen05_cp_smem_to_tmem(sfb_desc, tmem_sfb_base_addr, 0, sfb_off / 32);
+                tcgen05_cp_smem_to_tmem(sfb_desc, tmem_sfb_base_addr, 0, sfb_off / 32 / 4);
             }
 
             // tcgen05 mma
