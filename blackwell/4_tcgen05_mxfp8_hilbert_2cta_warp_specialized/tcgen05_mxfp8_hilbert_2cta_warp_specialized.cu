@@ -570,7 +570,7 @@ void producer_warp(
     }
 }
 
-template<int QUEUE_SIZE, int BM, int BN, int BK, int MMA_M, int MMA_N, int MMA_K, int SFA_COLS, int TMEM_WIDTH>
+template<int QUEUE_SIZE, int BM, int BN, int BK, int MMA_M, int MMA_N, int MMA_K, int SFA_TMEM_COLS, int TMEM_WIDTH>
 __device__ __noinline__
 void consumer_warp(
     int K,
@@ -621,7 +621,7 @@ void consumer_warp(
         int buffer_offset = mma_tmem_buf * TMEM_WIDTH;
         int tmem_accum_addr = tmem_base_addr + buffer_offset;
         int tmem_sfa_base_addr = tmem_base_addr + buffer_offset + BN;
-        int tmem_sfb_base_addr = tmem_base_addr + buffer_offset + BN + SFA_COLS;
+        int tmem_sfb_base_addr = tmem_base_addr + buffer_offset + BN + SFA_TMEM_COLS;
 
         if (blocks_processed >= TMEM_BUFFERS) {
             mbarrier_wait_parity(epilogue_mbar_addrs[mma_tmem_buf], epilogue_parity[mma_tmem_buf]);
@@ -642,8 +642,8 @@ void consumer_warp(
                 uint64_t sfa_desc = make_sf_smem_desc(smem + smem_sfa_base + sfa_off);
                 // 32x16 load broadcasted to all 4 warp zones of TMEM (32 rows each -> 128 rows)
                 // 512/32= 16 cols per ((32,4),4) SF tile
-                // tmem cells 4 bytes wide, so divide by 4 
-                tcgen05_cp_smem_to_tmem(sfa_desc, tmem_sfa_base_addr, 0, sfa_off / 32 / 4); 
+                // tmem cells 4 bytes wide, so divide by 4
+                tcgen05_cp_smem_to_tmem(sfa_desc, tmem_sfa_base_addr, 0, sfa_off / 32 / 4);
             }
 
             #pragma unroll
@@ -653,6 +653,8 @@ void consumer_warp(
             }
 
             // tcgen05 mma
+            // MMA M/N/K = 128/128/32
+            // uses 128x32 of A, 128x32 of B, 32x4 SFA tmem, 32x4 SFB tmem
             constexpr int SWIZZLE_ATOM_K = 128;
             for (int bk_chunk = 0; bk_chunk < BK / SWIZZLE_ATOM_K; bk_chunk++) {
                 for (int mma_iter = 0; mma_iter < SWIZZLE_ATOM_K / MMA_K; mma_iter++) {
@@ -667,9 +669,9 @@ void consumer_warp(
                     uint64_t smem_a_desc = make_smem_desc(smem_buff_a + a_k_off);
                     uint64_t smem_b_desc = make_smem_desc(smem_buff_b + b_k_off);
 
-                    
+
                     // encode tcgen05.mma instruction descriptor.
-                    // SFA_ID is odd. for .block_32 mma scaling, it basically selects what *was* as 128x1 sf column 
+                    // SFA_ID is odd. for .block_32 mma scaling, it basically selects what *was* as 128x1 sf column
                     // before the transform to ((32,4),4) blocked layout. therefore, this 128x1 sf column corresponds exactly to a 128x32 chunk of A tile,
                     // which matches our MMA_M=128, MMA_K=32.
                     uint32_t idesc = 0;
@@ -678,11 +680,11 @@ void consumer_warp(
                     // only disable accumo on the first mma of each block
                     int enable_accum = (block_k_idx == 0 && bk_chunk == 0 && mma_iter == 0) ? 0 : 1;
 
-                    // i *think* that the `tmem_base_addr` of SFA and SFB should stay constant 
-                    // while we are using the same 512b scale factor tile for four MMAs, 
+                    // i *think* that the `tmem_base_addr` of SFA and SFB should stay constant
+                    // while we are using the same 512b scale factor tile for four MMAs,
                     // which use one 128x1 (or four 32x1) sf cols.
-                    // we use same tmem base address and increment `sfa_id` to communicate 
-                    // which sf cols to select for that MMA. 
+                    // we use same tmem base address and increment `sfa_id` to communicate
+                    // which sf cols to select for that MMA.
                     tcgen05_mma_mxfp8(smem_a_desc, smem_b_desc, tmem_sfa_base_addr, tmem_sfb_base_addr, tmem_accum_addr, idesc, enable_accum);
                 }
             }
@@ -871,13 +873,13 @@ void ws_gemm_2cta_mma(
     // alloc tmem addr for accumulator. allocates BN columns of TMEM (must always alloc full 128 rows)
     // 1 warp must do the allocation
     // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-memory-alloc-manage-instructions
-    // Per-buffer TMEM layout: [BN cols accum | SFA_COLS | SFB_COLS]
+    // Per-buffer TMEM layout: [BN cols accum | SFA_TMEM_COLS | SFB_TMEM_COLS]
     // Each ((32,4),4) tile occupies 16 TMEM columns
     constexpr int SFA_TILES = (BM * SF_BK) / 512;
     constexpr int SFB_TILES = (BN * SF_BK) / 512; 
-    constexpr int SFA_COLS = SFA_TILES * 16;  // ((32,4),4) layout -> 16 cols per sf til
-    constexpr int SFB_COLS = SFB_TILES * 16; 
-    constexpr int TMEM_WIDTH_PER_BUFFER = BN + SFA_COLS + SFB_COLS;
+    constexpr int SFA_TMEM_COLS = SFA_TILES * 16 / 4;  // ((32,4),4) layout -> 16 cols per sf tile. 4 bytes per tmem cell.
+    constexpr int SFB_TMEM_COLS = SFB_TILES * 16 / 4;
+    constexpr int TMEM_WIDTH_PER_BUFFER = BN + SFA_TMEM_COLS + SFB_TMEM_COLS;
     constexpr int TMEM_TOTAL_WIDTH = TMEM_BUFFERS * TMEM_WIDTH_PER_BUFFER;
 
     // round up to nearest power of 2
@@ -908,7 +910,7 @@ void ws_gemm_2cta_mma(
     }
     else if (cta_rank == 0 && warp_id == CONSUMER_WARP_ID && is_mma_master_thread)
     {
-        consumer_warp<QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K, SFA_COLS, TMEM_WIDTH_PER_BUFFER>(
+        consumer_warp<QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K, SFA_TMEM_COLS, TMEM_WIDTH_PER_BUFFER>(
             K, start_group_id, num_groups, total_groups, smem,
             smem_full_mbar_addr, smem_empty_mbar_addr, mma_mbar_addr,
             epilogue_mbar_addr, tmem_addr_smem
@@ -1012,7 +1014,7 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
         (uint32_t)(BM / 128)       // tile rows to load
     };
     uint32_t sfa_strides[3] = {
-        16,                                     // stride to next row in ((32,4),4) 
+        16,                                     // stride to next row in ((32,4),4)
         512,                                    // stride to next tile column
         (uint32_t)((SF_K / 4) * 512)           // stride to next tile row
     };
@@ -1028,8 +1030,7 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     );
 
     // sfb has shape (N, K/32) with layout ((32,4),4) for 512 byte tile granularity)
-    // Each 512-byte tile = 4 blocks × 128 bytes/block
-    // Use 4D: {128 bytes per block, 4 blocks per tile, SF_K/4 tile cols, N/128 tile rows}
+    // 4d tma load: [BM/128 rows of tiles, BK/32/4 cols of tiles, 32, 16]
     uint64_t sfb_global_dims[4] = {
         16,
         32,
@@ -1068,9 +1069,9 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     constexpr int tmem_width_cells = 512;
     constexpr int SFA_TILES = (BM * BK / 32) / 512;
     constexpr int SFB_TILES = (BN * BK / 32) / 512;
-    constexpr int SFA_COLS = SFA_TILES * 16;  // 16 TMEM cols per ((32,4),4) tile
-    constexpr int SFB_COLS = SFB_TILES * 16;
-    constexpr int TMEM_WIDTH_PER_BUFFER = BN + SFA_COLS + SFB_COLS;
+    constexpr int SFA_TMEM_COLS = SFA_TILES * 16 / 4;  // 16 TMEM cols per ((32,4),4) tile
+    constexpr int SFB_TMEM_COLS = SFB_TILES * 16 / 4; 
+    constexpr int TMEM_WIDTH_PER_BUFFER = BN + SFA_TMEM_COLS + SFB_TMEM_COLS;
     constexpr int TMEM_TOTAL_WIDTH = TMEM_BUFFERS * TMEM_WIDTH_PER_BUFFER;
 
     // TMEM allocation must be power of 2
