@@ -33,11 +33,6 @@ def test_gemm(M, K, N):
     A_data, A_scales = triton_to_mxfp8_dim0(A)
     B_data, B_scales = triton_to_mxfp8_dim0(B)
     A_scales_blocked, B_scales_blocked = to_blocked(A_scales), to_blocked(B_scales)
-    print("A scale")
-    print(A_scales_blocked.untyped_storage()[:512])
-    print()
-    print("B scale")
-    print(B_scales_blocked.untyped_storage()[:512])
 
     result = custom_gemm.gemm_cuda(
         A_data.view(torch.uint8),

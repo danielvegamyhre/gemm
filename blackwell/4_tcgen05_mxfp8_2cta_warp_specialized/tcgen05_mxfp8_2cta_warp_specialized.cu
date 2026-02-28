@@ -638,27 +638,22 @@ void consumer_warp(
             const int smem_sfa_base = mma_smem_buf * BUFF_SIZE + SMEM_A_SIZE + SMEM_B_SIZE;
             const int smem_sfb_base = smem_sfa_base + SMEM_SFA_SIZE;
 
-            #pragma unroll
-            for (int sfa_off = 0; sfa_off < SMEM_SFA_SIZE; sfa_off += 512) {
-                uint64_t sfa_desc = make_sf_smem_desc<SF_BK>(smem + smem_sfa_base + sfa_off);
-                // 32x16 load broadcasted to all 4 warp zones of TMEM (32 rows each -> 128 rows)
-                // 512/32= 16 cols per ((32,4),4) SF tile
-                // tmem cells 4 bytes wide, so divide by 4
-                tcgen05_cp_smem_to_tmem(sfa_desc, tmem_sfa_base_addr, 0, sfa_off / 32 / 4);
-            }
-
-            #pragma unroll
-            for (int sfb_off = 0; sfb_off < SMEM_SFB_SIZE; sfb_off += 512) {
-                uint64_t sfb_desc = make_sf_smem_desc<SF_BK>(smem + smem_sfb_base + sfb_off);
-                tcgen05_cp_smem_to_tmem(sfb_desc, tmem_sfb_base_addr, 0, sfb_off / 32 / 4);
-            }
-
             // tcgen05 mma
             // MMA M/N/K = 128/128/32
             // uses 128x32 of A, 128x32 of B, 32x4 SFA tmem, 32x4 SFB tmem
             constexpr int SWIZZLE_ATOM_K = 128;
+            int sf_tile_iter = 0;
             for (int bk_chunk = 0; bk_chunk < BK / SWIZZLE_ATOM_K; bk_chunk++) {
                 for (int mma_iter = 0; mma_iter < SWIZZLE_ATOM_K / MMA_K; mma_iter++) {
+
+                    // pipeline tcgen05.cp smem -> tmem loads
+                    // make sfa/sfb smem descs
+                    uint64_t sfa_desc = make_sf_smem_desc<SF_BK>(smem + smem_sfa_base + 512 * sf_tile_iter); // 512 bytes per sf tile
+                    uint64_t sfb_desc = make_sf_smem_desc<SF_BK>(smem + smem_sfb_base + 512 * sf_tile_iter);
+                    tcgen05_cp_smem_to_tmem(sfa_desc, tmem_sfa_base_addr, 0, 4 * sf_tile_iter);              // each sf tile 16 bytes / 4 tmem cells wid
+                    tcgen05_cp_smem_to_tmem(sfb_desc, tmem_sfb_base_addr, 0, 4 * sf_tile_iter);
+                    sf_tile_iter += 1;
+
                     const int a_chunk_off = bk_chunk * BM * SWIZZLE_ATOM_K;
                     const int b_chunk_off = bk_chunk * (BN / CTA_GROUP_SIZE) * SWIZZLE_ATOM_K;
                     const int a_k_off = a_chunk_off + mma_iter * MMA_K;
@@ -667,9 +662,9 @@ void consumer_warp(
                     uint32_t smem_buff_a = smem + mma_smem_buf * BUFF_SIZE;
                     uint32_t smem_buff_b = smem_buff_a + SMEM_A_SIZE;
 
+                    // A/B smem descs
                     uint64_t smem_a_desc = make_smem_desc(smem_buff_a + a_k_off);
                     uint64_t smem_b_desc = make_smem_desc(smem_buff_b + b_k_off);
-
 
                     // encode tcgen05.mma instruction descriptor.
                     // SFA_ID is odd. for .block_32 mma scaling, it basically selects what *was* as 128x1 sf column
@@ -686,8 +681,8 @@ void consumer_warp(
                     // which use one 128x1 (or four 32x1) sf cols.
                     // we use same tmem base address and increment `sfa_id` to communicate
                     // which sf cols to select for that MMA.
-                    int tmem_sfa_tile_addr = tmem_sfa_base_addr + bk_chunk * 4;
-                    int tmem_sfb_tile_addr = tmem_sfb_base_addr + bk_chunk * 4;
+                    int tmem_sfa_tile_addr = tmem_sfa_base_addr + sf_tile_iter * 4;
+                    int tmem_sfb_tile_addr = tmem_sfb_base_addr + sf_tile_iter * 4;
                     tcgen05_mma_mxfp8(smem_a_desc, smem_b_desc, tmem_sfa_tile_addr, tmem_sfb_tile_addr, tmem_accum_addr, idesc, enable_accum);
                 }
             }
