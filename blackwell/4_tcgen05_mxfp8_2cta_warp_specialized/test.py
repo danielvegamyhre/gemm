@@ -49,17 +49,7 @@ def test_gemm(M, K, N):
         B_scales_blocked,
         out_dtype=torch.float32,
     )
-    # expected = scaled_mm(
-    #     A_data,
-    #     B_data.t(),
-    #     scale_a=A_scales_blocked,
-    #     scale_recipe_a=ScalingType.BlockWise1x32,
-    #     scale_b=B_scales_blocked,
-    #     scale_recipe_b=ScalingType.BlockWise1x32,
-    #     swizzle_a=SwizzleType.SWIZZLE_32_4_4,
-    #     swizzle_b=SwizzleType.SWIZZLE_32_4_4,
-    #     output_dtype=torch.float32,
-    # )
+    
     print("=" * 80)
     print("RESULT STATISTICS")
     print("=" * 80)

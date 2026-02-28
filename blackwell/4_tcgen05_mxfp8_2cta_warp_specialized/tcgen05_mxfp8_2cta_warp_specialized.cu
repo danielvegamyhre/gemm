@@ -177,7 +177,7 @@ __device__ uint64_t make_sf_smem_desc(uint32_t smem_shared_addr) {
 
     // bits 32-45: matrix_desc_encode(stride dim byte offset)
     // SBO: stride horizontally between blocks = 8x16b
-    uint64_t SBO = 8 * 16;
+    uint64_t SBO = 8*16;
     desc |= (matrix_desc_encode(SBO) << 32);
 
     // bits 46-49: fixed value of 0b001
@@ -633,27 +633,34 @@ void consumer_warp(
             mbarrier_wait_parity(smem_full_mbar_addrs[mma_smem_buf], smem_full_parity[mma_smem_buf]);
             smem_full_parity[mma_smem_buf] ^= 1;
 
-            // copy SF tiles from SMEM -> TMEM
             constexpr int BUFF_SIZE = SMEM_A_SIZE + SMEM_B_SIZE + SMEM_SFA_SIZE + SMEM_SFB_SIZE;
             const int smem_sfa_base = mma_smem_buf * BUFF_SIZE + SMEM_A_SIZE + SMEM_B_SIZE;
             const int smem_sfb_base = smem_sfa_base + SMEM_SFA_SIZE;
-
-            // tcgen05 mma
-            // MMA M/N/K = 128/128/32
-            // uses 128x32 of A, 128x32 of B, 32x4 SFA tmem, 32x4 SFB tmem
             constexpr int SWIZZLE_ATOM_K = 128;
-            int sf_tile_iter = 0;
+
+            // at this point, in the smem buffer for this stage, we have:
+            // - A tile [BM,BK] = [128,128]
+            // - B tile [BN,BK] = [128,128]
+            // - SFA [BM/128, BK/32/4, 32, 16] = [1, 1, 32, 16] = one 512 byte sf
+            // - SFB [BN/128, BK/32/4, 32, 16] = [1, 1, 32, 16] = one 512 byte sf
+                
+            // A/B tiles in smem and SFA/SFB in tmem will take 4 mmas to use.
+            // each mma uses:
+            // 128x32 of A
+            // 128x32 of B
+            // 128x1 of SFA laid out as (32,4) in tmem
+            // 128x1 of SFB laid out as (32,4) in tmem
+
             for (int bk_chunk = 0; bk_chunk < BK / SWIZZLE_ATOM_K; bk_chunk++) {
+                uint64_t sfa_desc = make_sf_smem_desc<SF_BK>(smem + smem_sfa_base + 512 * bk_chunk);
+                uint64_t sfb_desc = make_sf_smem_desc<SF_BK>(smem + smem_sfb_base + 512 * bk_chunk);
+
+                // each sf tile is 16 bytes / 4 tmem cells wide. we have one sf tile per BK chunk.
+                // this does 32x16byte smem->tmem load broadcasted to all 128 rows of tmem (all 4 warp zones)
+                tcgen05_cp_smem_to_tmem(sfa_desc, tmem_sfa_base_addr, 0, 4 * bk_chunk);                              
+                tcgen05_cp_smem_to_tmem(sfb_desc, tmem_sfb_base_addr, 0, 4 * bk_chunk);
+
                 for (int mma_iter = 0; mma_iter < SWIZZLE_ATOM_K / MMA_K; mma_iter++) {
-
-                    // pipeline tcgen05.cp smem -> tmem loads
-                    // make sfa/sfb smem descs
-                    uint64_t sfa_desc = make_sf_smem_desc<SF_BK>(smem + smem_sfa_base + 512 * sf_tile_iter); // 512 bytes per sf tile
-                    uint64_t sfb_desc = make_sf_smem_desc<SF_BK>(smem + smem_sfb_base + 512 * sf_tile_iter);
-                    tcgen05_cp_smem_to_tmem(sfa_desc, tmem_sfa_base_addr, 0, 4 * sf_tile_iter);              // each sf tile 16 bytes / 4 tmem cells wid
-                    tcgen05_cp_smem_to_tmem(sfb_desc, tmem_sfb_base_addr, 0, 4 * sf_tile_iter);
-                    sf_tile_iter += 1;
-
                     const int a_chunk_off = bk_chunk * BM * SWIZZLE_ATOM_K;
                     const int b_chunk_off = bk_chunk * (BN / CTA_GROUP_SIZE) * SWIZZLE_ATOM_K;
                     const int a_k_off = a_chunk_off + mma_iter * MMA_K;
@@ -667,8 +674,9 @@ void consumer_warp(
                     uint64_t smem_b_desc = make_smem_desc(smem_buff_b + b_k_off);
 
                     // encode tcgen05.mma instruction descriptor.
-                    // SFA_ID is odd. for .block_32 mma scaling, it basically selects what *was* as 128x1 sf column
-                    // before the transform to ((32,4),4) blocked layout. therefore, this 128x1 sf column corresponds exactly to a 128x32 chunk of A tile,
+                    // SFA_ID is odd. for .block_32 mma scaling, it basically selects 4 separate 32x1 strips, separated by 4 cols each
+                    // so what *was* as 128x1 sf column before the transform to ((32,4),4) blocked layout. 
+                    // therefore, this 128x1 sf column corresponds exactly to a 128x32 chunk of A tile,
                     // which matches our MMA_M=128, MMA_K=32.
                     uint32_t idesc = 0;
                     tcgen05_encode_idesc<CTA_GROUP_SIZE * MMA_M, MMA_N>(idesc, mma_iter);
@@ -681,8 +689,8 @@ void consumer_warp(
                     // which use one 128x1 (or four 32x1) sf cols.
                     // we use same tmem base address and increment `sfa_id` to communicate
                     // which sf cols to select for that MMA.
-                    int tmem_sfa_tile_addr = tmem_sfa_base_addr + sf_tile_iter * 4;
-                    int tmem_sfb_tile_addr = tmem_sfb_base_addr + sf_tile_iter * 4;
+                    int tmem_sfa_tile_addr = tmem_sfa_base_addr + 4 * bk_chunk; // 32x16 for each bk chunk, i.e. 4 cols of tmem
+                    int tmem_sfb_tile_addr = tmem_sfb_base_addr + 4 * bk_chunk;
                     tcgen05_mma_mxfp8(smem_a_desc, smem_b_desc, tmem_sfa_tile_addr, tmem_sfb_tile_addr, tmem_accum_addr, idesc, enable_accum);
                 }
             }
@@ -1002,7 +1010,7 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     uint64_t sfa_global_dims[4] = {
         16,
         32,
-        (uint64_t)(K / 32/ 4),     // tile columns
+        (uint64_t)(K / 32 / 4),     // tile columns
         (uint64_t)(M / 128)        // tile rows
     };
     uint32_t sfa_smem_dims[4] = {
