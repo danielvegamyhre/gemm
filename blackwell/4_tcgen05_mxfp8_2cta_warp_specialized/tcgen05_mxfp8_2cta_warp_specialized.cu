@@ -249,27 +249,6 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint32_t mbar_addr, co
       : "memory");
 }
 
-__device__ __forceinline__ void cp_async_bulk_tensor_2d_global_to_shared(
-    const uint32_t dst_shmem,           // shared addr
-    const uint64_t *tensor_map_ptr,
-    const uint32_t offset_x,
-    const uint32_t offset_y,
-    uint32_t mbar_addr                  // shared addr
-) {
-    asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2 "
-        "[%0], [%1, {%2, %3}], [%4];"
-        :
-        :
-        "r"(dst_shmem),
-        "l"(tensor_map_ptr),
-        "r"(offset_x),
-        "r"(offset_y),
-        "r"(mbar_addr)
-        : "memory"
-    );
-}
-
 __device__ __forceinline__ void cp_async_bulk_tensor_3d_global_to_shared(
     const uint32_t dst_shmem,           // shared addr
     const uint64_t *tensor_map_ptr,
@@ -338,16 +317,20 @@ __device__ __forceinline__ void tcgen05_dealloc(int tmem_addr_reg) {
 }
 
 template <int MMA_M, int MMA_N>
-__device__ __forceinline__ void tcgen05_encode_idesc(uint32_t& idesc, int sfa_id) {
+__device__ __forceinline__ void tcgen05_encode_idesc(uint32_t& idesc, int sfa_id, int sfb_id) {
     // create idesc
     // from PTX docs: "The 32-bit register operand idesc is the instruction descriptor as described in
     //   Instruction descriptor, specifies the shapes, exact types, sparsity and other details of the
     //   input matrices, output matrix and the matrix multiply and accumulate operation."
     // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instruction-descriptor
 
-    // e4m3 input matrix A and B => encode 0 for bits 7-9 and bits 10-12 (so no-op here).
-    // then:
-    idesc |= (1 << 4);                          // fp32 output matrix D
+    idesc |= (sfb_id << 4);                     // matrix B scale factor ID for bits 4-5
+
+    // bits 7-9: 0 for A dtype = e4m3
+    // bits 10-12: 0 for B dtype = e4m3
+    // bit 15: A non tranpsose = 0
+    // bit 16: B non transpose = 0
+
     idesc |= (MMA_N >> 3) << 17;                // N dim of matrix B (without 3 LSBs) for bits 17-22
     idesc |= (1 << 23);                         // scale dtype for both scale_A / scale_B (bit 23). 1=e8m0
     idesc |= (MMA_M >> 7) << 27;                // M dim of matrix A (without 7 LSBs) for bits 27-28
@@ -679,7 +662,7 @@ void consumer_warp(
                     // therefore, this 128x1 sf column corresponds exactly to a 128x32 chunk of A tile,
                     // which matches our MMA_M=128, MMA_K=32.
                     uint32_t idesc = 0;
-                    tcgen05_encode_idesc<CTA_GROUP_SIZE * MMA_M, MMA_N>(idesc, mma_iter);
+                    tcgen05_encode_idesc<CTA_GROUP_SIZE * MMA_M, MMA_N>(idesc, mma_iter, mma_iter);
 
                     // only disable accumo on the first mma of each block
                     int enable_accum = (block_k_idx == 0 && bk_chunk == 0 && mma_iter == 0) ? 0 : 1;
