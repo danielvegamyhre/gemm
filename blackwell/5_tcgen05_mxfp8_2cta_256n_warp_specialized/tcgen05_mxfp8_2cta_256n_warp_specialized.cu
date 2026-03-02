@@ -155,7 +155,7 @@ __device__ uint64_t make_smem_desc(uint32_t smem_shared_addr) {
     // implied to be 1 for swizzled layouts, see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-leading-dimension-byte-offset
 
     // bits 32-45: matrix_desc_encode(stride dim byte offset)
-    // SBO (stride byte offset) is stride between rows of swizzle atoms which are (8x128 matrix of e4m3 in this 128b swizzle setup)
+    // SBO (stride byte offset) is stride between swizzle atoms which are (8x128 matrix of e4m3 in this 128b swizzle setup)
     uint64_t SBO = 8 * 128;
     desc |= (matrix_desc_encode(SBO) << 32);
 
@@ -637,7 +637,7 @@ void consumer_warp(
     constexpr int CTA_GROUP_SIZE = 2;
     constexpr int TMEM_BUFFERS = 2;
     constexpr int NUM_EPILOGUE_MBARS = 3; // we'll have 1 mbar per 128 cols of tmem accum to support accumlators sharing/overlapping 128 cols
-    constexpr int NUM_MMA_MBARS = TMEM_BUFFERS;  
+    constexpr int NUM_MMA_MBARS = TMEM_BUFFERS;
     constexpr int SF_BK = BK / 32;
     constexpr int SMEM_A_SIZE = BM * BK;
     constexpr int SMEM_B_SIZE = (BN / CTA_GROUP_SIZE) * BK;
@@ -648,7 +648,6 @@ void consumer_warp(
     int mma_tmem_buf = 0; // for 256 col wide accumulator
     int smem_full_parity[QUEUE_SIZE] = {0};
     int epilogue_parity[NUM_EPILOGUE_MBARS] = {0};
-    int blocks_processed = 0;
     int tmem_base_addr = *reinterpret_cast<int*>(__cvta_shared_to_generic(tmem_addr_smem));
 
     uint16_t cta_mask = 0b11;
@@ -674,6 +673,8 @@ void consumer_warp(
         smem_empty_mbar_addrs[i] = smem_empty_mbar_addr + i * sizeof(uint64_t);
     }
 
+    int blocks_processed = 0;
+
     for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
 
         // tmem layout for MMA_N=256
@@ -682,16 +683,25 @@ void consumer_warp(
         //                   [ sfa1 ][ sfb1 ][ sfa2 ][ sfb2 ]
         constexpr int tmem_both_accum_width = 2 * BN - ACCUM_OVERLAP_COLS;
         int tmem_accum_addr = tmem_base_addr + mma_tmem_buf * (BN - ACCUM_OVERLAP_COLS);
-        int tmem_sfa_base_addr = tmem_base_addr + tmem_both_accum_width + mma_tmem_buf * (SFA_TMEM_COLS + SFB_TMEM_COLS);
-        int tmem_sfb_base_addr = tmem_sfa_base_addr + SFA_TMEM_COLS;
+        int tmem_sfa_base_addr = tmem_base_addr + tmem_both_accum_width; 
+        int tmem_sfb_base_addr = tmem_sfa_base_addr + SFA_TMEM_COLS;    
 
-        if (group_id > start_group_id)
+        if (blocks_processed >= 1)
         {
-            // wait for both regions of the buffer we're about to reuse
-            mbarrier_wait_parity(epilogue_mbar_addrs[mma_tmem_buf + 0], epilogue_parity[mma_tmem_buf + 0]); // 0 or 1
-            mbarrier_wait_parity(epilogue_mbar_addrs[mma_tmem_buf + 1], epilogue_parity[mma_tmem_buf + 1]); // 1 or 2
-            epilogue_parity[mma_tmem_buf + 0] ^= 1;
-            epilogue_parity[mma_tmem_buf + 1] ^= 1;
+            // 3 epilgoue mbars, each responsible for 128 cols of tmem.
+            // after first block, always wait for epilogue to finish with middle/overlapped 128 columns of tmem
+            mbarrier_wait_parity(epilogue_mbar_addrs[1], epilogue_parity[1]);
+            epilogue_parity[1] ^= 1;
+
+            // after 2+ blocks:
+            // - mma buf 0 needs to wait for epilogue to finish with the leftmost 128 cols of tmem
+            // - mma buf 1 needs to wait for epilogue to finish with the rightmost 128 cols of tmem
+            if (blocks_processed >= 2) 
+            {
+                const int second_ep_mbar_idx = mma_tmem_buf == 0 ? 0 : 2;
+                mbarrier_wait_parity(epilogue_mbar_addrs[second_ep_mbar_idx], epilogue_parity[second_ep_mbar_idx]); 
+                epilogue_parity[second_ep_mbar_idx] ^= 1;
+            }
         }
 
         for (int block_k_idx = 0; block_k_idx < num_blocks_k; block_k_idx++) {
@@ -715,15 +725,17 @@ void consumer_warp(
             // 256x32 of B
             // 128x1 of SFA laid out as (32,4) in tmem which is only 1 tmem col (4 bytes) wide
             // 256x1 of SFB laid out as ((32,4),2) or basically (32,8) in tmem, so 2 tmem cols
-            for (int bk_chunk = 0; bk_chunk < BK / SWIZZLE_ATOM_K; bk_chunk++) {
-                uint64_t sfa_desc = make_sf_smem_desc(smem + smem_sfa_base + 512 * bk_chunk);
-                uint64_t sfb_desc = make_sf_smem_desc(smem + smem_sfb_base + 512 * bk_chunk);
-
+            for (int bk_chunk = 0; bk_chunk < BK / SWIZZLE_ATOM_K; bk_chunk++) { // 1 iter, 128/128=1
                 // sfa for each bk chunk is 32x16 e8m0 data so 32x4 tmem cols wide
-                tcgen05_cp_smem_to_tmem(sfa_desc, tmem_sfa_base_addr, 0, 4 * bk_chunk);                              
+                uint64_t sfa_desc = make_sf_smem_desc(smem + smem_sfa_base + 512 * bk_chunk);
+                tcgen05_cp_smem_to_tmem(sfa_desc, tmem_sfa_base_addr, 0, 0);
 
-                // sfb for each bk chunk is 2 32x16 laid out horizontally, so 32x32 e8m0 so 32x8 tmem cols wide
-                tcgen05_cp_smem_to_tmem(sfb_desc, tmem_sfb_base_addr, 0, 8 * bk_chunk);
+                // sfb for each bk chunk has 2 512 byte tiles as 2 32x16 laid out horizontally
+                uint64_t sfb_desc1 = make_sf_smem_desc(smem + smem_sfb_base + 0 + 512 * bk_chunk);
+                uint64_t sfb_desc2 = make_sf_smem_desc(smem + smem_sfb_base + 512 + 512 * bk_chunk);
+
+                tcgen05_cp_smem_to_tmem(sfb_desc1, tmem_sfb_base_addr, 0, 0);
+                tcgen05_cp_smem_to_tmem(sfb_desc2, tmem_sfb_base_addr, 0, 4);
 
                 for (int mma_iter = 0; mma_iter < SWIZZLE_ATOM_K / MMA_K; mma_iter++) {
                     const int a_chunk_off = bk_chunk * BM * SWIZZLE_ATOM_K;
@@ -743,8 +755,11 @@ void consumer_warp(
                     // so what *was* as 128x1 sf column before the transform to ((32,4),4) blocked layout. 
                     // therefore, this 128x1 sf column corresponds exactly to a 128x32 chunk of A tile,
                     // which matches our MMA_M=128, MMA_K=32.
+                    // SFB_ID works similarly, but for MMA_N=256, it is 8 strips.
                     uint32_t idesc = 0;
-                    tcgen05_encode_idesc<CTA_GROUP_SIZE * MMA_M, MMA_N>(idesc, mma_iter, mma_iter);
+                    int sfa_id = mma_iter;
+                    int sfb_id = mma_iter;
+                    tcgen05_encode_idesc<CTA_GROUP_SIZE * MMA_M, MMA_N>(idesc, sfa_id, sfb_id);
 
                     // only disable accumo on the first mma of each block
                     int enable_accum = (block_k_idx == 0 && bk_chunk == 0 && mma_iter == 0) ? 0 : 1;
@@ -754,8 +769,9 @@ void consumer_warp(
                     // which use one 128x1 (or four 32x1) sf cols.
                     // we use same tmem base address and increment `sfa_id` to communicate
                     // which sf cols to select for that MMA.
-                    int tmem_sfa_tile_addr = tmem_sfa_base_addr + 4 * bk_chunk; // 32x16 for each bk chunk, i.e. 4 cols of tmem
-                    int tmem_sfb_tile_addr = tmem_sfb_base_addr + 8 * bk_chunk;
+                    int tmem_sfa_tile_addr = tmem_sfa_base_addr; // 32x16 for each bk chunk, i.e. 4 cols of tmem
+                    int tmem_sfb_tile_addr = tmem_sfb_base_addr; // two 32x16 chunks, i.e. 8 cols of tmem
+
                     tcgen05_mma_mxfp8(smem_a_desc, smem_b_desc, tmem_sfa_tile_addr, tmem_sfb_tile_addr, tmem_accum_addr, idesc, enable_accum);
                 }
             }
@@ -860,10 +876,10 @@ void epilogue_warpgroup(
 template<
     int QUEUE_SIZE,
     int BM = 128,
-    int BN = 128,
+    int BN = 256,
     int BK = 64,
     int MMA_M = 128,
-    int MMA_N = 128,
+    int MMA_N = 256,
     int MMA_K = 32
 >
 __global__
@@ -1016,9 +1032,6 @@ void ws_gemm_2cta_mma(
 }
 
 extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int M, int N, int K) {
-    const uint8_t* sfa_ptr = reinterpret_cast<const uint8_t*>(SFA);
-    const uint8_t* sfb_ptr = reinterpret_cast<const uint8_t*>(SFB);
-
     // dims for smem tiles
     constexpr int BM = 128;
     constexpr int BN = 256;
@@ -1189,7 +1202,7 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     constexpr int QUEUE_SIZE = (max_smem_per_sm - tmem_addr_size - mma_mbar_size - epilogue_mbar_size) / total_smem_per_stage;
     constexpr int total_smem = total_smem_per_stage * QUEUE_SIZE + mma_mbar_size + epilogue_mbar_size + tmem_addr_size;
 
-    const int launch_blocks = 128;
+    const int launch_blocks = 148;
     dim3 grid_dim(launch_blocks);
     dim3 block_dim(BLOCK_SIZE);
     auto kernel = ws_gemm_2cta_mma<QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K>;
