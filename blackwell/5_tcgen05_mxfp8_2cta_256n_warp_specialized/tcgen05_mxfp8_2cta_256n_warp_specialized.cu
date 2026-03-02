@@ -450,6 +450,19 @@ __device__ __forceinline__ void tcgen05_ld_tmem_to_reg(int tmem_base_addr_reg, i
     asm volatile("tcgen05.wait::ld.sync.aligned;");
 }
 
+__device__ __forceinline__ void st_global_256b(float* ptr, float const c_reg[8]) {
+    const uint64_t* c_ptr = reinterpret_cast<const uint64_t*>(c_reg);
+    asm volatile (
+        "st.global.v4.u64 [%0], {%1, %2, %3, %4};"
+        : 
+        : "l"(ptr),      
+          "l"(c_ptr[0]), // c_reg[0] and c_reg[1]
+          "l"(c_ptr[1]), // c_reg[2] and c_reg[3]
+          "l"(c_ptr[2]), // c_reg[4] and c_reg[5]
+          "l"(c_ptr[3])  // c_reg[6] and c_reg[7]
+        : "memory"
+    );
+}
 
 __device__ __forceinline__ void tcgen05_cp_smem_to_tmem(uint64_t smem_desc, int tmem_base_addr_reg, int row, int base_col) {
     // TMEM address is 32bit and composed of 2 components:
@@ -672,11 +685,14 @@ void consumer_warp(
         int tmem_sfa_base_addr = tmem_base_addr + tmem_both_accum_width + mma_tmem_buf * (SFA_TMEM_COLS + SFB_TMEM_COLS);
         int tmem_sfb_base_addr = tmem_sfa_base_addr + SFA_TMEM_COLS;
 
-        // we should only wait on the middle overlapping 128cols of tmem to be finished by epilogue, then proceed with mma
-        mbarrier_wait_parity(epilogue_mbar_addrs[mma_tmem_buf + 0], epilogue_parity[mma_tmem_buf + 0]); // 0 or 1
-        mbarrier_wait_parity(epilogue_mbar_addrs[mma_tmem_buf + 1], epilogue_parity[mma_tmem_buf + 1]); // 1 or 2
-        epilogue_parity[mma_tmem_buf + 0] ^= 1;
-        epilogue_parity[mma_tmem_buf + 1] ^= 1;
+        if (group_id > start_group_id)
+        {
+            // wait for both regions of the buffer we're about to reuse
+            mbarrier_wait_parity(epilogue_mbar_addrs[mma_tmem_buf + 0], epilogue_parity[mma_tmem_buf + 0]); // 0 or 1
+            mbarrier_wait_parity(epilogue_mbar_addrs[mma_tmem_buf + 1], epilogue_parity[mma_tmem_buf + 1]); // 1 or 2
+            epilogue_parity[mma_tmem_buf + 0] ^= 1;
+            epilogue_parity[mma_tmem_buf + 1] ^= 1;
+        }
 
         for (int block_k_idx = 0; block_k_idx < num_blocks_k; block_k_idx++) {
             mbarrier_wait_parity(smem_full_mbar_addrs[mma_smem_buf], smem_full_parity[mma_smem_buf]);
@@ -699,7 +715,6 @@ void consumer_warp(
             // 256x32 of B
             // 128x1 of SFA laid out as (32,4) in tmem which is only 1 tmem col (4 bytes) wide
             // 256x1 of SFB laid out as ((32,4),2) or basically (32,8) in tmem, so 2 tmem cols
-
             for (int bk_chunk = 0; bk_chunk < BK / SWIZZLE_ATOM_K; bk_chunk++) {
                 uint64_t sfa_desc = make_sf_smem_desc(smem + smem_sfa_base + 512 * bk_chunk);
                 uint64_t sfb_desc = make_sf_smem_desc(smem + smem_sfb_base + 512 * bk_chunk);
@@ -821,8 +836,8 @@ void epilogue_warpgroup(
             const int tmem_base_row = ep_warp_id * 32;
 
             // read mma 0 accum right to left; read mma 1 accum left to right
-            const int col_off = mma_tmem_buf == 0 ? 128 - i * TMEM_COLS_PER_LOAD : i * TMEM_COLS_PER_LOAD;
-            tcgen05_ld_tmem_to_reg<TMEM_COLS_PER_LOAD>(tmem_addr_reg, tmem_base_row, col_off, c_reg);
+            const int base_col_off = mma_tmem_buf == 0 ? 128 - i * TMEM_COLS_PER_LOAD : i * TMEM_COLS_PER_LOAD;
+            tcgen05_ld_tmem_to_reg<TMEM_COLS_PER_LOAD>(tmem_addr_reg, tmem_base_row, base_col_off, c_reg);
 
             // signal completion to mma warp
             // for mma buf 0, select 1 then 0 (right to left)
@@ -830,11 +845,15 @@ void epilogue_warpgroup(
             const int ep_mbar_idx = (mma_tmem_buf == 0) ? 1 - i : 1 + i; 
             mbarrier_arrive(epilogue_mbar_addrs[ep_mbar_idx]);
 
-            // write to gmem
+            // reg -> gmem with STG.256  (8 floats per write)
             const int c_row = block_m * BM + ep_warp_id * 32 + lane_id;
-            const int c_col = block_n * BN + col_off;
-            *reinterpret_cast<float4*>(C + c_row * N + c_col) = *reinterpret_cast<float4*>(&c_reg);
+            #pragma unroll
+            for (int j = 0; j < TMEM_COLS_PER_LOAD / 8; j++) {
+                const int c_col = block_n * BN + base_col_off + j * 8;
+                st_global_256b(C + c_row * N + c_col, &c_reg[j * 8]);
+            }
         }
+        mma_tmem_buf = (mma_tmem_buf + 1) % NUM_MMA_TMEM_BUFFERS;
     }
 }
 
@@ -935,7 +954,6 @@ void ws_gemm_2cta_mma(
     // alloc tmem addr for accumulator. allocates BN columns of TMEM (must always alloc full 128 rows)
     // 1 warp must do the allocation
     // see: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-memory-alloc-manage-instructions
-    // Per-buffer TMEM layout: [BN cols accum | SFA_TMEM_COLS | SFB_TMEM_COLS]
     // Each ((32,4),4) tile occupies 16 TMEM columns
     constexpr int SFA_TILES = (BM * SF_BK) / 512;
     constexpr int SFB_TILES = (BN * SF_BK) / 512;
@@ -1169,7 +1187,7 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     constexpr int epilogue_mbar_size = NUM_EPILOGUE_TMEM_BUFFERS * sizeof(uint64_t);
     constexpr int tmem_addr_size = sizeof(int);
     constexpr int QUEUE_SIZE = (max_smem_per_sm - tmem_addr_size - mma_mbar_size - epilogue_mbar_size) / total_smem_per_stage;
-    constexpr int total_smem = total_smem_per_stage * QUEUE_SIZE;
+    constexpr int total_smem = total_smem_per_stage * QUEUE_SIZE + mma_mbar_size + epilogue_mbar_size + tmem_addr_size;
 
     const int launch_blocks = 128;
     dim3 grid_dim(launch_blocks);
