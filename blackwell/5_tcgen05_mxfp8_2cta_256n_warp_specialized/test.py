@@ -22,7 +22,7 @@ custom_gemm = load(
 )
 
 
-@pytest.mark.parametrize("M,K,N", [(256, 256, 256), (4096, 4096, 4096)])
+@pytest.mark.parametrize("M,K,N", [(256, 256, 256), (4096, 4096, 4096), (2048, 4096, 8192)])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_gemm(M, K, N):
     torch.manual_seed(42)
@@ -94,6 +94,29 @@ def test_gemm(M, K, N):
         print(f"\nFirst 20 rows with issues: {rows_with_issues[:20].tolist()}")
         print(f"Last 20 rows with issues: {rows_with_issues[-20:].tolist()}")
 
+    # Analyze individual columns
+    print("\n" + "=" * 80)
+    print("PER-COLUMN ANALYSIS")
+    print("=" * 80)
+    mismatch_per_col = mismatch_mask.sum(dim=0)
+    cols_fully_correct = (mismatch_per_col == 0).sum().item()
+    print(f"Columns fully correct: {cols_fully_correct}/{N}")
+    print(f"Columns with any mismatches: {N - cols_fully_correct}/{N}")
+
+    # Show which columns are correct/incorrect
+    correct_cols = torch.where(mismatch_per_col == 0)[0]
+    incorrect_cols = torch.where(mismatch_per_col > 0)[0]
+
+    if len(correct_cols) > 0:
+        print(f"\nFirst 20 fully correct columns: {correct_cols[:20].tolist()}")
+        if len(correct_cols) > 20:
+            print(f"Last 20 fully correct columns: {correct_cols[-20:].tolist()}")
+
+    if len(incorrect_cols) > 0:
+        print(f"\nFirst 20 incorrect columns: {incorrect_cols[:20].tolist()}")
+        if len(incorrect_cols) > 20:
+            print(f"Last 20 incorrect columns: {incorrect_cols[-20:].tolist()}")
+
     # Analyze by column ranges
     print("\n" + "=" * 80)
     print("PER-COLUMN RANGE ANALYSIS")
@@ -105,8 +128,9 @@ def test_gemm(M, K, N):
         end_col = (i + 1) * chunk_size
         chunk_mismatches = mismatch_mask[:, start_col:end_col].sum().item()
         chunk_unexpected_zeros = unexpected_zeros[:, start_col:end_col].sum().item()
+        chunk_cols_correct = (mismatch_per_col[start_col:end_col] == 0).sum().item()
         print(
-            f"Cols [{start_col:4d}-{end_col:4d}): mismatches={chunk_mismatches:6d}, unexpected_zeros={chunk_unexpected_zeros:6d}"
+            f"Cols [{start_col:4d}-{end_col:4d}): mismatches={chunk_mismatches:6d}, unexpected_zeros={chunk_unexpected_zeros:6d}, fully_correct_cols={chunk_cols_correct:3d}/{chunk_size}"
         )
 
     # Show sample mismatches
