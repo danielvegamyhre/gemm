@@ -296,6 +296,32 @@ __device__ __forceinline__ void cp_async_bulk_tensor_4d_global_to_shared(
     );
 }
 
+__device__ __forceinline__ void cp_async_bulk_tensor_4d_global_to_shared_multicast(
+    const uint32_t dst_shmem,           // shared addr
+    const uint64_t *tensor_map_ptr,
+    const uint32_t offset_x,
+    const uint32_t offset_y,
+    const uint32_t offset_z,
+    const uint32_t offset_w,
+    uint32_t mbar_addr                  // shared addr
+) {
+    constexpr uint16_t cta_mask = 0b11;
+    asm volatile(
+        "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2 "
+        "[%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+        :
+        :
+        "r"(dst_shmem),
+        "l"(tensor_map_ptr),
+        "r"(offset_x),
+        "r"(offset_y),
+        "r"(offset_z),
+        "r"(offset_w),
+        "r"(mbar_addr),
+        "h"(cta_mask)
+        : "memory"
+    );
+}
 template <int TMEM_COLS>
 __device__ __forceinline__ void tcgen05_alloc(uint32_t tmem_addr_smem) {
     // convert to shared addr
@@ -595,7 +621,7 @@ void producer_warp(
                 smem_full_mbar_addrs[tma_smem_buf]
             );
 
-            // load SFA/SFB tiles
+            // sfa tiles are different for each cta, so each cta loads their own
             cp_async_bulk_tensor_4d_global_to_shared(
                 SFA_smem,
                 reinterpret_cast<const uint64_t*>(sfa_map),
@@ -605,16 +631,19 @@ void producer_warp(
                 (uint32_t)(global_m_off/128),
                 smem_full_mbar_addrs[tma_smem_buf]
             );
-            cp_async_bulk_tensor_4d_global_to_shared(
-                SFB_smem,
-                reinterpret_cast<const uint64_t*>(sfb_map),
-                0,
-                0,
-                (uint32_t)(global_k_off/32/4),
-                (uint32_t)(global_n_off_sfb/128),
-                smem_full_mbar_addrs[tma_smem_buf]
-            );
 
+            // sfb tiles are duplicated for all BN on both ctas, so cta 1 multicasts to both
+            if (cta_rank == 1) {
+                cp_async_bulk_tensor_4d_global_to_shared_multicast(
+                    SFB_smem,
+                    reinterpret_cast<const uint64_t*>(sfb_map),
+                    0,
+                    0,
+                    (uint32_t)(global_k_off/32/4),
+                    (uint32_t)(global_n_off_sfb/128),
+                    smem_full_mbar_addrs[tma_smem_buf]
+                );
+            }
             tma_smem_buf = (tma_smem_buf + 1) % QUEUE_SIZE;
         }
     }
@@ -853,7 +882,7 @@ void epilogue_warpgroup(
             const int tmem_base_row = ep_warp_id * 32;
 
             // read mma 0 accum right to left; read mma 1 accum left to right
-            const int base_col_off = mma_tmem_buf == 0 ? 128 - i * TMEM_COLS_PER_LOAD : i * TMEM_COLS_PER_LOAD;
+            const int base_col_off = mma_tmem_buf == 0 ? ACCUM_OVERLAP_COLS - i * TMEM_COLS_PER_LOAD : i * TMEM_COLS_PER_LOAD;
             tcgen05_ld_tmem_to_reg<TMEM_COLS_PER_LOAD>(tmem_addr_reg, tmem_base_row, base_col_off, c_reg);
 
             // signal completion to mma warp
@@ -1003,13 +1032,13 @@ void ws_gemm_2cta_mma(
             cta_rank, grid_m, grid_n, smem, smem_full_mbar_addr, smem_empty_mbar_addr
         );
     }
-    else if (cta_rank == 0 && warp_id == CONSUMER_WARP_ID && is_mma_master_thread)
+    else if (warp_id == CONSUMER_WARP_ID && cta_rank == 0 && is_mma_master_thread) 
     {
         consumer_warp<QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K, SFA_TMEM_COLS, SFB_TMEM_COLS, ACCUM_OVERLAP_COLS>(
             K, start_group_id, num_groups, total_groups, smem,
             smem_full_mbar_addr, smem_empty_mbar_addr, mma_mbar_addr,
             epilogue_mbar_addr, tmem_addr_smem
-        );
+        ); 
     }
     else if (warpgroup_id == EPILOGUE_WARPGROUP_ID)
     {
