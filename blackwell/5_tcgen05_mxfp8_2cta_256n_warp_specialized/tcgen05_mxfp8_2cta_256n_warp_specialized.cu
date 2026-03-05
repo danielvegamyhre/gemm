@@ -833,8 +833,7 @@ void epilogue_warpgroup(
     int grid_n,
     uint32_t threadIdx_x,
     uint32_t mma_mbar_addr,
-    uint32_t epilogue_mbar_addr,
-    uint32_t tmem_addr_smem
+    uint32_t epilogue_mbar_addr
 ) {
     constexpr int CTA_GROUP_SIZE = 2;
     constexpr int TMEM_COLS_PER_LOAD = 128;
@@ -843,7 +842,7 @@ void epilogue_warpgroup(
 
     int mma_tmem_buf = 0;
     int mma_parity[NUM_MMA_TMEM_BUFFERS] = {0};
-    int tmem_base_addr = *reinterpret_cast<int*>(__cvta_shared_to_generic(tmem_addr_smem));
+    int tmem_base_addr = 0; // tmem addr alloc-ed in this kernel design will always be 0 since we always allocate only one buffer
 
     // pre-compute mapped barrier addresses
     uint32_t epilogue_mbar_addrs[NUM_EPILOGUE_TMEM_BUFFERS];
@@ -1008,12 +1007,7 @@ void ws_gemm_2cta_mma(
 
     // round up to nearest power of 2
     constexpr int TMEM_WIDTH_ROUNDED = 1 << (32 - __builtin_clz(TMEM_TOTAL_WIDTH - 1));
-    if (warp_id == 0)
-    {
-        // allocate tmem buffers (must be power of 2)
-        tcgen05_alloc<TMEM_WIDTH_ROUNDED>(tmem_addr_smem);
-    }
-
+    
     // make sure mbarriers and tmem addr are visible to full cluster
     cluster_sync();
 
@@ -1032,20 +1026,25 @@ void ws_gemm_2cta_mma(
             cta_rank, grid_m, grid_n, smem, smem_full_mbar_addr, smem_empty_mbar_addr
         );
     }
-    else if (warp_id == CONSUMER_WARP_ID && cta_rank == 0 && is_mma_master_thread) 
+    else if (warp_id == CONSUMER_WARP_ID) 
     {
-        consumer_warp<QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K, SFA_TMEM_COLS, SFB_TMEM_COLS, ACCUM_OVERLAP_COLS>(
-            K, start_group_id, num_groups, total_groups, smem,
-            smem_full_mbar_addr, smem_empty_mbar_addr, mma_mbar_addr,
-            epilogue_mbar_addr, tmem_addr_smem
-        ); 
+        // allocate tmem here because producer starting should not be blocked on tmem allocation
+        tcgen05_alloc<TMEM_WIDTH_ROUNDED>(tmem_addr_smem);
+
+        if (cta_rank == 0 && is_mma_master_thread) {
+            consumer_warp<QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K, SFA_TMEM_COLS, SFB_TMEM_COLS, ACCUM_OVERLAP_COLS>(
+                K, start_group_id, num_groups, total_groups, smem,
+                smem_full_mbar_addr, smem_empty_mbar_addr, mma_mbar_addr,
+                epilogue_mbar_addr, tmem_addr_smem
+            ); 
+        }
     }
     else if (warpgroup_id == EPILOGUE_WARPGROUP_ID)
     {
         epilogue_warpgroup<BM, BN, ACCUM_OVERLAP_COLS>(
             C, N, start_bid, start_group_id, num_groups, total_groups,
-            cta_rank, grid_m, grid_n, threadIdx.x, mma_mbar_addr,
-            epilogue_mbar_addr, tmem_addr_smem
+            cta_rank, grid_m, grid_n, threadIdx.x, 
+            mma_mbar_addr, epilogue_mbar_addr
         );
     }
 
