@@ -535,6 +535,36 @@ __device__ __forceinline__ std::pair<int, int> compute_bid(int bid, int grid_n) 
     return {block_m, block_n};
 }
 
+// Helper macro for static indexing of parity arrays to avoid local memory spills
+#define MBARRIER_WAIT_PARITY_STATIC_INDEX(buf_var, max_size, mbar_addr, parity_array) \
+    do { \
+        if (buf_var == 0) { \
+            mbarrier_wait_parity(mbar_addr + 0 * sizeof(uint64_t), parity_array[0]); \
+            parity_array[0] ^= 1; \
+        } else if (max_size > 1 && buf_var == 1) { \
+            mbarrier_wait_parity(mbar_addr + 1 * sizeof(uint64_t), parity_array[1]); \
+            parity_array[1] ^= 1; \
+        } else if (max_size > 2 && buf_var == 2) { \
+            mbarrier_wait_parity(mbar_addr + 2 * sizeof(uint64_t), parity_array[2]); \
+            parity_array[2] ^= 1; \
+        } else if (max_size > 3 && buf_var == 3) { \
+            mbarrier_wait_parity(mbar_addr + 3 * sizeof(uint64_t), parity_array[3]); \
+            parity_array[3] ^= 1; \
+        } else if (max_size > 4 && buf_var == 4) { \
+            mbarrier_wait_parity(mbar_addr + 4 * sizeof(uint64_t), parity_array[4]); \
+            parity_array[4] ^= 1; \
+        } else if (max_size > 5 && buf_var == 5) { \
+            mbarrier_wait_parity(mbar_addr + 5 * sizeof(uint64_t), parity_array[5]); \
+            parity_array[5] ^= 1; \
+        } else if (max_size > 6 && buf_var == 6) { \
+            mbarrier_wait_parity(mbar_addr + 6 * sizeof(uint64_t), parity_array[6]); \
+            parity_array[6] ^= 1; \
+        } else if (max_size > 7 && buf_var == 7) { \
+            mbarrier_wait_parity(mbar_addr + 7 * sizeof(uint64_t), parity_array[7]); \
+            parity_array[7] ^= 1; \
+        } \
+    } while (0)
+
 template<int QUEUE_SIZE, int BM, int BN, int BK>
 __device__ __noinline__
 void producer_warp(
@@ -577,8 +607,7 @@ void producer_warp(
         for (int block_k_idx = 0; block_k_idx < num_blocks_k; block_k_idx++) {
             if (block_k_idx >= QUEUE_SIZE || group_id > start_group_id)
             {
-                mbarrier_wait_parity(smem_empty_mbar_addr + tma_smem_buf * sizeof(uint64_t), smem_empty_parity[tma_smem_buf]);
-                smem_empty_parity[tma_smem_buf] ^= 1;
+                MBARRIER_WAIT_PARITY_STATIC_INDEX(tma_smem_buf, QUEUE_SIZE, smem_empty_mbar_addr, smem_empty_parity);
             }
 
             // smem offsets for next A/B tiles - layout: [A, B, SFA, SFB]
