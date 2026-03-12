@@ -22,7 +22,7 @@ custom_gemm = load(
 )
 
 
-@pytest.mark.parametrize("M,K,N", [(256, 256, 256), (4096, 4096, 4096), (2048, 4096, 8192)])
+@pytest.mark.parametrize("M,K,N", [(256, 256, 256), (4096, 4096, 4096), (2048, 4096, 8192), (16384, 16384, 16384)])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_gemm(M, K, N):
     torch.manual_seed(42)

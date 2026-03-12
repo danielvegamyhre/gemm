@@ -562,7 +562,8 @@ void producer_warp(
     constexpr int SMEM_SFB_SIZE = BN * SF_BK;
 
     int tma_smem_buf = 0;
-    int smem_empty_parity[QUEUE_SIZE] = {0};
+    int smem_empty_parity[QUEUE_SIZE];
+    for (int i = 0; i < QUEUE_SIZE; i++) smem_empty_parity[i] = 0;
 
     for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
         const int bid = group_id * CTA_GROUP_SIZE + (start_bid % CTA_GROUP_SIZE);
@@ -667,9 +668,8 @@ void consumer_warp(
     constexpr int SMEM_SFA_SIZE = BM * SF_BK;
     constexpr int SMEM_SFB_SIZE = BN * SF_BK;
 
-    int mma_smem_buf = 0; 
+    int mma_smem_buf = 0;
     int mma_tmem_buf = 0; // for 256 col wide accumulator
-    int smem_full_parity[QUEUE_SIZE] = {0};
     int epilogue_parity[NUM_EPILOGUE_MBARS] = {0};
     int tmem_base_addr = *reinterpret_cast<int*>(__cvta_shared_to_generic(tmem_addr_smem));
 
@@ -677,6 +677,7 @@ void consumer_warp(
     const int num_blocks_k = (K + BK - 1) / BK;
 
     int blocks_processed = 0;
+    int smem_full_parity = 0; // flips every QUEUE_SIZE iterations
 
     for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
 
@@ -701,15 +702,24 @@ void consumer_warp(
             // - mma buf 1 needs to wait for epilogue to finish with the rightmost 128 cols of tmem
             if (blocks_processed >= 2)
             {
-                const int second_ep_mbar_idx = mma_tmem_buf == 0 ? 0 : 2;
-                mbarrier_wait_parity(epilogue_mbar_addr + second_ep_mbar_idx * sizeof(uint64_t), epilogue_parity[second_ep_mbar_idx]);
-                epilogue_parity[second_ep_mbar_idx] ^= 1;
+                // for epilogue mbar parity bits, use registers via static indexing, instead of array with dynamic indexing 
+                // to avoid using local memory (long scoreboard stalls).
+                // flips every 2 blocks we process, since we have 2 tmem buffers
+                if (mma_tmem_buf == 0)
+                {
+                    mbarrier_wait_parity(epilogue_mbar_addr + 0 * sizeof(uint64_t), epilogue_parity[0]);
+                    epilogue_parity[0] ^= 1;
+                }
+                else
+                {
+                    mbarrier_wait_parity(epilogue_mbar_addr + 2 * sizeof(uint64_t), epilogue_parity[2]);
+                    epilogue_parity[2] ^= 1;
+                }
             }
         }
 
         for (int block_k_idx = 0; block_k_idx < num_blocks_k; block_k_idx++) {
-            mbarrier_wait_parity(smem_full_mbar_addr + mma_smem_buf * sizeof(uint64_t), smem_full_parity[mma_smem_buf]);
-            smem_full_parity[mma_smem_buf] ^= 1;
+            mbarrier_wait_parity(smem_full_mbar_addr + mma_smem_buf * sizeof(uint64_t), smem_full_parity);
 
             constexpr int BUFF_SIZE = SMEM_A_SIZE + SMEM_B_SIZE + SMEM_SFA_SIZE + SMEM_SFB_SIZE;
             const int smem_sfa_base = mma_smem_buf * BUFF_SIZE + SMEM_A_SIZE + SMEM_B_SIZE;
@@ -784,6 +794,10 @@ void consumer_warp(
             // cta 0 signals to both ctas the smem buffer can now be safely re-used
             tcgen05_commit_multicast(smem_empty_mbar_addr + mma_smem_buf * sizeof(uint64_t), cta_mask);
             mma_smem_buf = (mma_smem_buf + 1) % QUEUE_SIZE;
+           
+            // when we wraparound to the beginning of the queue to re-use smem buffers, flip parity bit
+            if (mma_smem_buf == 0)
+                smem_full_parity ^= 1;
         }
 
         // cta0 signals to both ctas the tmem accum buff is ready for epilogue
@@ -825,8 +839,13 @@ void epilogue_warpgroup(
         const int bid = group_id * CTA_GROUP_SIZE + (start_bid % CTA_GROUP_SIZE);
         auto [block_m, block_n] = compute_bid(bid, grid_n);
 
-        mbarrier_wait_parity(mma_mbar_addr + mma_tmem_buf * sizeof(uint64_t), mma_parity[mma_tmem_buf]);
-        mma_parity[mma_tmem_buf] ^= 1;
+        if (mma_tmem_buf == 0) {
+            mbarrier_wait_parity(mma_mbar_addr + 0 * sizeof(uint64_t), mma_parity[0]);
+            mma_parity[0] ^= 1;
+        } else {
+            mbarrier_wait_parity(mma_mbar_addr + 1 * sizeof(uint64_t), mma_parity[1]);
+            mma_parity[1] ^= 1;
+        }
 
         // fence that ensures all previously committed
         // tcgen05.mma operations are complete with results visible in tmem to this thread
