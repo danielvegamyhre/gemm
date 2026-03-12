@@ -564,17 +564,6 @@ void producer_warp(
     int tma_smem_buf = 0;
     int smem_empty_parity[QUEUE_SIZE] = {0};
 
-    // pre-compute mapped barrier addresses to avoid repeated arithmetic and mapping in loop
-    uint32_t smem_full_mbar_addrs[QUEUE_SIZE];
-    uint32_t smem_empty_mbar_addrs[QUEUE_SIZE];
-    for (int i = 0; i < QUEUE_SIZE; i++) {
-        smem_full_mbar_addrs[i] = smem_full_mbar_addr + i * sizeof(uint64_t);
-        smem_empty_mbar_addrs[i] = smem_empty_mbar_addr + i * sizeof(uint64_t);
-        if (cta_rank == 1) {
-            smem_full_mbar_addrs[i] = map_smem_addr_to_cta_rank(smem_full_mbar_addrs[i], 0);
-        }
-    }
-
     for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
         const int bid = group_id * CTA_GROUP_SIZE + (start_bid % CTA_GROUP_SIZE);
         auto [block_m, block_n] = compute_bid(bid, grid_n);
@@ -587,7 +576,7 @@ void producer_warp(
         for (int block_k_idx = 0; block_k_idx < num_blocks_k; block_k_idx++) {
             if (block_k_idx >= QUEUE_SIZE || group_id > start_group_id)
             {
-                mbarrier_wait_parity(smem_empty_mbar_addrs[tma_smem_buf], smem_empty_parity[tma_smem_buf]);
+                mbarrier_wait_parity(smem_empty_mbar_addr + tma_smem_buf * sizeof(uint64_t), smem_empty_parity[tma_smem_buf]);
                 smem_empty_parity[tma_smem_buf] ^= 1;
             }
 
@@ -598,7 +587,12 @@ void producer_warp(
             const uint32_t SFA_smem = B_smem + SMEM_B_SIZE;
             const uint32_t SFB_smem = SFA_smem + SMEM_SFA_SIZE;
 
-            mbarrier_arrive_expect_tx(smem_full_mbar_addrs[tma_smem_buf], SMEM_A_SIZE + SMEM_B_SIZE + SMEM_SFA_SIZE + SMEM_SFB_SIZE);
+            uint32_t smem_full_mbar = smem_full_mbar_addr + tma_smem_buf * sizeof(uint64_t);
+            if (cta_rank == 1) {
+                smem_full_mbar = map_smem_addr_to_cta_rank(smem_full_mbar, 0);
+            }
+
+            mbarrier_arrive_expect_tx(smem_full_mbar, SMEM_A_SIZE + SMEM_B_SIZE + SMEM_SFA_SIZE + SMEM_SFB_SIZE);
 
             // load A tile
             int global_k_off = block_k_idx * BK;
@@ -607,8 +601,8 @@ void producer_warp(
                 reinterpret_cast<const uint64_t*>(a_map),
                 0,
                 (uint32_t)global_m_off,
-                (uint32_t)global_k_off/128,
-                smem_full_mbar_addrs[tma_smem_buf]
+                (uint32_t)global_k_off/128, // divide by 128b swizzle atom size, following tensor map global dims
+                smem_full_mbar
             );
 
             // load B tile
@@ -618,7 +612,7 @@ void producer_warp(
                 0,
                 (uint32_t)global_n_off,
                 (uint32_t)global_k_off/128,
-                smem_full_mbar_addrs[tma_smem_buf]
+                smem_full_mbar
             );
 
             // sfa tiles are different for each cta, so each cta loads their own
@@ -629,7 +623,7 @@ void producer_warp(
                 0,
                 (uint32_t)(global_k_off/32/4),
                 (uint32_t)(global_m_off/128),
-                smem_full_mbar_addrs[tma_smem_buf]
+                smem_full_mbar
             );
 
             // sfb tiles are duplicated for all BN on both ctas, so cta 1 multicasts to both
@@ -641,7 +635,7 @@ void producer_warp(
                     0,
                     (uint32_t)(global_k_off/32/4),
                     (uint32_t)(global_n_off_sfb/128),
-                    smem_full_mbar_addrs[tma_smem_buf]
+                    smem_full_mbar
                 );
             }
             tma_smem_buf = (tma_smem_buf + 1) % QUEUE_SIZE;
@@ -682,26 +676,6 @@ void consumer_warp(
     uint16_t cta_mask = 0b11;
     const int num_blocks_k = (K + BK - 1) / BK;
 
-    // pre-compute barrier addresses
-    uint32_t epilogue_mbar_addrs[NUM_EPILOGUE_MBARS];
-    uint32_t smem_full_mbar_addrs[QUEUE_SIZE];
-    uint32_t smem_empty_mbar_addrs[QUEUE_SIZE];
-    uint32_t mma_mbar_addrs[NUM_MMA_MBARS];
-
-    #pragma unroll
-    for (int i = 0; i < NUM_EPILOGUE_MBARS; i++) {
-        epilogue_mbar_addrs[i] = epilogue_mbar_addr + i * sizeof(uint64_t);
-    }
-    #pragma unroll
-    for (int i = 0; i < NUM_MMA_MBARS; i++) {
-        mma_mbar_addrs[i] = mma_mbar_addr + i * sizeof(uint64_t);
-    }
-    #pragma unroll
-    for (int i = 0; i < QUEUE_SIZE; i++) {
-        smem_full_mbar_addrs[i] = smem_full_mbar_addr + i * sizeof(uint64_t);
-        smem_empty_mbar_addrs[i] = smem_empty_mbar_addr + i * sizeof(uint64_t);
-    }
-
     int blocks_processed = 0;
 
     for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
@@ -719,22 +693,22 @@ void consumer_warp(
         {
             // 3 epilgoue mbars, each responsible for 128 cols of tmem.
             // after first block, always wait for epilogue to finish with middle/overlapped 128 columns of tmem
-            mbarrier_wait_parity(epilogue_mbar_addrs[1], epilogue_parity[1]);
+            mbarrier_wait_parity(epilogue_mbar_addr + 1 * sizeof(uint64_t), epilogue_parity[1]);
             epilogue_parity[1] ^= 1;
 
             // after 2+ blocks:
             // - mma buf 0 needs to wait for epilogue to finish with the leftmost 128 cols of tmem
             // - mma buf 1 needs to wait for epilogue to finish with the rightmost 128 cols of tmem
-            if (blocks_processed >= 2) 
+            if (blocks_processed >= 2)
             {
                 const int second_ep_mbar_idx = mma_tmem_buf == 0 ? 0 : 2;
-                mbarrier_wait_parity(epilogue_mbar_addrs[second_ep_mbar_idx], epilogue_parity[second_ep_mbar_idx]); 
+                mbarrier_wait_parity(epilogue_mbar_addr + second_ep_mbar_idx * sizeof(uint64_t), epilogue_parity[second_ep_mbar_idx]);
                 epilogue_parity[second_ep_mbar_idx] ^= 1;
             }
         }
 
         for (int block_k_idx = 0; block_k_idx < num_blocks_k; block_k_idx++) {
-            mbarrier_wait_parity(smem_full_mbar_addrs[mma_smem_buf], smem_full_parity[mma_smem_buf]);
+            mbarrier_wait_parity(smem_full_mbar_addr + mma_smem_buf * sizeof(uint64_t), smem_full_parity[mma_smem_buf]);
             smem_full_parity[mma_smem_buf] ^= 1;
 
             constexpr int BUFF_SIZE = SMEM_A_SIZE + SMEM_B_SIZE + SMEM_SFA_SIZE + SMEM_SFB_SIZE;
@@ -808,12 +782,12 @@ void consumer_warp(
             }
 
             // cta 0 signals to both ctas the smem buffer can now be safely re-used
-            tcgen05_commit_multicast(smem_empty_mbar_addrs[mma_smem_buf], cta_mask);
+            tcgen05_commit_multicast(smem_empty_mbar_addr + mma_smem_buf * sizeof(uint64_t), cta_mask);
             mma_smem_buf = (mma_smem_buf + 1) % QUEUE_SIZE;
         }
 
         // cta0 signals to both ctas the tmem accum buff is ready for epilogue
-        tcgen05_commit_multicast(mma_mbar_addrs[mma_tmem_buf], cta_mask);
+        tcgen05_commit_multicast(mma_mbar_addr + mma_tmem_buf * sizeof(uint64_t), cta_mask);
         mma_tmem_buf = (mma_tmem_buf + 1) % TMEM_BUFFERS;
         blocks_processed += 1;
     }
@@ -844,21 +818,6 @@ void epilogue_warpgroup(
     int mma_parity[NUM_MMA_TMEM_BUFFERS] = {0};
     int tmem_base_addr = 0; // tmem addr alloc-ed in this kernel design will always be 0 since we always allocate only one buffer
 
-    // pre-compute mapped barrier addresses
-    uint32_t epilogue_mbar_addrs[NUM_EPILOGUE_TMEM_BUFFERS];
-    uint32_t mma_mbar_addrs[NUM_MMA_TMEM_BUFFERS];
-    #pragma unroll
-    for (int i = 0; i < NUM_EPILOGUE_TMEM_BUFFERS; i++) {
-        epilogue_mbar_addrs[i] = epilogue_mbar_addr + i * sizeof(uint64_t);
-        if (cta_rank == 1) {
-            epilogue_mbar_addrs[i] = map_smem_addr_to_cta_rank(epilogue_mbar_addrs[i], 0);
-        }
-    }
-    #pragma unroll
-    for (int i = 0; i < NUM_MMA_TMEM_BUFFERS; i++) {
-        mma_mbar_addrs[i] = mma_mbar_addr + i * sizeof(uint64_t);
-    }
-
     int ep_warp_id = (threadIdx_x / 32);
     int lane_id = threadIdx_x % 32;
 
@@ -866,7 +825,7 @@ void epilogue_warpgroup(
         const int bid = group_id * CTA_GROUP_SIZE + (start_bid % CTA_GROUP_SIZE);
         auto [block_m, block_n] = compute_bid(bid, grid_n);
 
-        mbarrier_wait_parity(mma_mbar_addrs[mma_tmem_buf], mma_parity[mma_tmem_buf]);
+        mbarrier_wait_parity(mma_mbar_addr + mma_tmem_buf * sizeof(uint64_t), mma_parity[mma_tmem_buf]);
         mma_parity[mma_tmem_buf] ^= 1;
 
         // fence that ensures all previously committed
@@ -887,8 +846,12 @@ void epilogue_warpgroup(
             // signal completion to mma warp
             // for mma buf 0, select 1 then 0 (right to left)
             // for mma buf 1, select 1 then 2 (left to right)
-            const int ep_mbar_idx = (mma_tmem_buf == 0) ? 1 - i : 1 + i; 
-            mbarrier_arrive(epilogue_mbar_addrs[ep_mbar_idx]);
+            const int ep_mbar_idx = (mma_tmem_buf == 0) ? 1 - i : 1 + i;
+            uint32_t ep_mbar_addr = epilogue_mbar_addr + ep_mbar_idx * sizeof(uint64_t);
+            if (cta_rank == 1) {
+                ep_mbar_addr = map_smem_addr_to_cta_rank(ep_mbar_addr, 0);
+            }
+            mbarrier_arrive(ep_mbar_addr);
 
             // reg -> gmem with STG.256  (8 floats per write)
             const int c_row = block_m * BM + ep_warp_id * 32 + lane_id;
@@ -1008,7 +971,7 @@ void ws_gemm_2cta_mma(
     // round up to nearest power of 2
     constexpr int TMEM_WIDTH_ROUNDED = 1 << (32 - __builtin_clz(TMEM_TOTAL_WIDTH - 1));
     
-    // make sure mbarriers and tmem addr are visible to full cluster
+    // make sure mbarriers are visible to full cluster
     cluster_sync();
 
     constexpr int PRODUCER_WARP_ID = 4, CONSUMER_WARP_ID = 5;
