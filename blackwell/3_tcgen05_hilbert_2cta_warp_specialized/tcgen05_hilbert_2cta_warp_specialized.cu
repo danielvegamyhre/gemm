@@ -425,6 +425,36 @@ __device__ __forceinline__ std::pair<int, int> compute_bid(int bid, int grid_n) 
     return {block_m, block_n};
 }
 
+// Helper macro for static indexing of parity arrays to avoid local memory spills
+#define MBARRIER_WAIT_PARITY_STATIC_INDEX(buf_var, max_size, mbar_addr, parity_array) \
+    do { \
+        if (buf_var == 0) { \
+            mbarrier_wait_parity(mbar_addr + 0 * sizeof(uint64_t), parity_array[0]); \
+            parity_array[0] ^= 1; \
+        } else if (max_size > 1 && buf_var == 1) { \
+            mbarrier_wait_parity(mbar_addr + 1 * sizeof(uint64_t), parity_array[1]); \
+            parity_array[1] ^= 1; \
+        } else if (max_size > 2 && buf_var == 2) { \
+            mbarrier_wait_parity(mbar_addr + 2 * sizeof(uint64_t), parity_array[2]); \
+            parity_array[2] ^= 1; \
+        } else if (max_size > 3 && buf_var == 3) { \
+            mbarrier_wait_parity(mbar_addr + 3 * sizeof(uint64_t), parity_array[3]); \
+            parity_array[3] ^= 1; \
+        } else if (max_size > 4 && buf_var == 4) { \
+            mbarrier_wait_parity(mbar_addr + 4 * sizeof(uint64_t), parity_array[4]); \
+            parity_array[4] ^= 1; \
+        } else if (max_size > 5 && buf_var == 5) { \
+            mbarrier_wait_parity(mbar_addr + 5 * sizeof(uint64_t), parity_array[5]); \
+            parity_array[5] ^= 1; \
+        } else if (max_size > 6 && buf_var == 6) { \
+            mbarrier_wait_parity(mbar_addr + 6 * sizeof(uint64_t), parity_array[6]); \
+            parity_array[6] ^= 1; \
+        } else if (max_size > 7 && buf_var == 7) { \
+            mbarrier_wait_parity(mbar_addr + 7 * sizeof(uint64_t), parity_array[7]); \
+            parity_array[7] ^= 1; \
+        } \
+    } while (0)
+
 template<int QUEUE_SIZE, int BM, int BN, int BK>
 __device__ __noinline__
 void producer_warp(
@@ -447,18 +477,8 @@ void producer_warp(
     constexpr int SMEM_B_SIZE = (BN / CTA_GROUP_SIZE) * BK * sizeof(__nv_bfloat16);
 
     int tma_smem_buf = 0;
-    int smem_empty_parity[QUEUE_SIZE] = {0};
-
-    // pre-compute mapped barrier addresses to avoid repeated arithmetic and mapping in loop
-    uint32_t smem_full_mbar_addrs[QUEUE_SIZE];
-    uint32_t smem_empty_mbar_addrs[QUEUE_SIZE];
-    for (int i = 0; i < QUEUE_SIZE; i++) {
-        smem_full_mbar_addrs[i] = smem_full_mbar_addr + i * sizeof(uint64_t);
-        smem_empty_mbar_addrs[i] = smem_empty_mbar_addr + i * sizeof(uint64_t);
-        if (cta_rank == 1) {
-            smem_full_mbar_addrs[i] = map_smem_addr_to_cta_rank(smem_full_mbar_addrs[i], 0);
-        }
-    }
+    int smem_empty_parity[QUEUE_SIZE];
+    for (int i = 0; i < QUEUE_SIZE; i++) smem_empty_parity[i] = 0;
 
     for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
         const int bid = group_id * CTA_GROUP_SIZE + (start_bid % CTA_GROUP_SIZE);
@@ -469,17 +489,21 @@ void producer_warp(
         const int num_blocks_k = (K + BK - 1) / BK;
 
         for (int block_k_idx = 0; block_k_idx < num_blocks_k; block_k_idx++) {
-            if (block_k_idx >= QUEUE_SIZE || bid > start_bid)
+            if (block_k_idx >= QUEUE_SIZE || group_id > start_group_id)
             {
-                mbarrier_wait_parity(smem_empty_mbar_addrs[tma_smem_buf], smem_empty_parity[tma_smem_buf]);
-                smem_empty_parity[tma_smem_buf] ^= 1;
+                MBARRIER_WAIT_PARITY_STATIC_INDEX(tma_smem_buf, QUEUE_SIZE, smem_empty_mbar_addr, smem_empty_parity);
             }
 
             const uint32_t A_smem = smem + tma_smem_buf * (SMEM_A_SIZE + SMEM_B_SIZE);
             const uint32_t B_smem = A_smem + SMEM_A_SIZE;
             int global_k_off = block_k_idx * BK;
 
-            mbarrier_arrive_expect_tx(smem_full_mbar_addrs[tma_smem_buf], SMEM_A_SIZE + SMEM_B_SIZE);
+            uint32_t smem_full_mbar = smem_full_mbar_addr + tma_smem_buf * sizeof(uint64_t);
+            if (cta_rank == 1) {
+                smem_full_mbar = map_smem_addr_to_cta_rank(smem_full_mbar, 0);
+            }
+
+            mbarrier_arrive_expect_tx(smem_full_mbar, SMEM_A_SIZE + SMEM_B_SIZE);
 
             cp_async_bulk_tensor_3d_global_to_shared(
                 A_smem,
@@ -487,7 +511,7 @@ void producer_warp(
                 0,
                 (uint32_t)global_m_off,
                 (uint32_t)global_k_off/64,
-                smem_full_mbar_addrs[tma_smem_buf]
+                smem_full_mbar
             );
             cp_async_bulk_tensor_3d_global_to_shared(
                 B_smem,
@@ -495,7 +519,7 @@ void producer_warp(
                 0,
                 (uint32_t)global_n_off,
                 (uint32_t)global_k_off/64,
-                smem_full_mbar_addrs[tma_smem_buf]
+                smem_full_mbar
             );
             tma_smem_buf = (tma_smem_buf + 1) % QUEUE_SIZE;
         }
@@ -526,8 +550,8 @@ void consumer_warp(
 
     int mma_smem_buf = 0;
     int mma_tmem_buf = 0;
-    int smem_full_parity[QUEUE_SIZE] = {0};
-    int epilogue_parity[TMEM_BUFFERS] = {0};
+    int epilogue_parity_0 = 0;
+    int epilogue_parity_1 = 0;
     int blocks_processed = 0;
     int tmem_base_addr = *reinterpret_cast<int*>(__cvta_shared_to_generic(tmem_addr_smem));
 
@@ -537,32 +561,24 @@ void consumer_warp(
 
     uint16_t cta_mask = 0b11;
     const int num_blocks_k = (K + BK - 1) / BK;
-
-    // pre-compute barrier addresses to avoid repeated arithmetic in loops
-    uint32_t epilogue_mbar_addrs[TMEM_BUFFERS];
-    uint32_t smem_full_mbar_addrs[QUEUE_SIZE];
-    uint32_t smem_empty_mbar_addrs[QUEUE_SIZE];
-    uint32_t mma_mbar_addrs[TMEM_BUFFERS];
-    for (int i = 0; i < TMEM_BUFFERS; i++) {
-        epilogue_mbar_addrs[i] = epilogue_mbar_addr + i * sizeof(uint64_t);
-        mma_mbar_addrs[i] = mma_mbar_addr + i * sizeof(uint64_t);
-    }
-    for (int i = 0; i < QUEUE_SIZE; i++) {
-        smem_full_mbar_addrs[i] = smem_full_mbar_addr + i * sizeof(uint64_t);
-        smem_empty_mbar_addrs[i] = smem_empty_mbar_addr + i * sizeof(uint64_t);
-    }
+    int smem_full_parity = 0; // flips every QUEUE_SIZE iterations
 
     for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
         if (blocks_processed >= TMEM_BUFFERS)
         {
-            mbarrier_wait_parity(epilogue_mbar_addrs[mma_tmem_buf], epilogue_parity[mma_tmem_buf]);
-            epilogue_parity[mma_tmem_buf] ^= 1;
+            // use explicit parity variables instead of array to avoid dynamic indexing
+            if (mma_tmem_buf == 0) {
+                mbarrier_wait_parity(epilogue_mbar_addr + 0 * sizeof(uint64_t), epilogue_parity_0);
+                epilogue_parity_0 ^= 1;
+            } else {
+                mbarrier_wait_parity(epilogue_mbar_addr + 1 * sizeof(uint64_t), epilogue_parity_1);
+                epilogue_parity_1 ^= 1;
+            }
         }
         int tmem_addr_reg = tmem_base_addr + mma_tmem_buf * BN;
         bool enable_accum = false;
         for (int block_k_idx = 0; block_k_idx < num_blocks_k; block_k_idx++) {
-            mbarrier_wait_parity(smem_full_mbar_addrs[mma_smem_buf], smem_full_parity[mma_smem_buf]);
-            smem_full_parity[mma_smem_buf] ^= 1;
+            mbarrier_wait_parity(smem_full_mbar_addr + mma_smem_buf * sizeof(uint64_t), smem_full_parity);
 
             uint32_t smem_buff_a = smem + mma_smem_buf * (SMEM_A_SIZE + SMEM_B_SIZE);
             uint32_t smem_buff_b = smem_buff_a + SMEM_A_SIZE;
@@ -582,12 +598,16 @@ void consumer_warp(
                         enable_accum = true;
                 }
             }
-            tcgen05_commit_multicast(smem_empty_mbar_addrs[mma_smem_buf], cta_mask);
+            tcgen05_commit_multicast(smem_empty_mbar_addr + mma_smem_buf * sizeof(uint64_t), cta_mask);
 
             mma_smem_buf = (mma_smem_buf + 1) % QUEUE_SIZE;
+
+            // when we wraparound to the beginning of the queue to re-use smem buffers, flip parity bit
+            if (mma_smem_buf == 0)
+                smem_full_parity ^= 1;
         }
 
-        tcgen05_commit_multicast(mma_mbar_addrs[mma_tmem_buf], cta_mask);
+        tcgen05_commit_multicast(mma_mbar_addr + mma_tmem_buf * sizeof(uint64_t), cta_mask);
 
         mma_tmem_buf = (mma_tmem_buf + 1) % TMEM_BUFFERS;
         blocks_processed += 1;
@@ -630,20 +650,9 @@ void epilogue_warpgroup(
     constexpr int COLS_PER_THREAD = 128;  // Try .x8 instead of .x128
 
     int epilogue_tmem_buf = 0;
-    int mma_parity[TMEM_BUFFERS] = {0};
+    int mma_parity_0 = 0;
+    int mma_parity_1 = 0;
     int tmem_base_addr = *reinterpret_cast<int*>(__cvta_shared_to_generic(tmem_addr_smem));
-
-    // pre-compute mapped barrier addresses to avoid repeated arithmetic and mapping in loop
-    uint32_t epilogue_mbar_addrs[TMEM_BUFFERS];
-    uint32_t mma_mbar_addrs[TMEM_BUFFERS];
-    #pragma unroll
-    for (int i = 0; i < TMEM_BUFFERS; i++) {
-        epilogue_mbar_addrs[i] = epilogue_mbar_addr + i * sizeof(uint64_t);
-        mma_mbar_addrs[i] = mma_mbar_addr + i * sizeof(uint64_t);
-        if (cta_rank == 1) {
-            epilogue_mbar_addrs[i] = map_smem_addr_to_cta_rank(epilogue_mbar_addrs[i], 0);
-        }
-    }
 
     int ep_warp_id = (threadIdx_x / 32);
     int lane_id = threadIdx_x % 32;
@@ -651,8 +660,15 @@ void epilogue_warpgroup(
         const int bid = group_id * CTA_GROUP_SIZE + (start_bid % CTA_GROUP_SIZE);
         auto [block_m, block_n] = compute_bid_hilbert(bid, grid_m, grid_n);
 
-        mbarrier_wait_parity(mma_mbar_addrs[epilogue_tmem_buf], mma_parity[epilogue_tmem_buf]);
-        mma_parity[epilogue_tmem_buf] ^= 1;
+        // use explicit parity variables instead of array to avoid dynamic indexing
+        uint32_t mma_mbar = mma_mbar_addr + epilogue_tmem_buf * sizeof(uint64_t);
+        if (epilogue_tmem_buf == 0) {
+            mbarrier_wait_parity(mma_mbar, mma_parity_0);
+            mma_parity_0 ^= 1;
+        } else {
+            mbarrier_wait_parity(mma_mbar, mma_parity_1);
+            mma_parity_1 ^= 1;
+        }
 
         asm volatile("tcgen05.fence::after_thread_sync;");
 
@@ -680,7 +696,11 @@ void epilogue_warpgroup(
         }
 
         // signal mma warp that tmem buffer is consumed and can be re-used
-        mbarrier_arrive(epilogue_mbar_addrs[epilogue_tmem_buf]);
+        uint32_t epilogue_mbar = epilogue_mbar_addr + epilogue_tmem_buf * sizeof(uint64_t);
+        if (cta_rank == 1) {
+            epilogue_mbar = map_smem_addr_to_cta_rank(epilogue_mbar, 0);
+        }
+        mbarrier_arrive(epilogue_mbar);
         epilogue_tmem_buf = (epilogue_tmem_buf + 1) % TMEM_BUFFERS;
     }
 }
