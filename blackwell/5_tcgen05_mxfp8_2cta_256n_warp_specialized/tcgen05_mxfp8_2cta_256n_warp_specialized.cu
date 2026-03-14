@@ -518,8 +518,70 @@ __device__ __forceinline__ void cluster_sync() {
     asm volatile("barrier.cluster.wait.acquire.aligned;");
 }
 
+// Hilbert curve mapping utilities for cache-aware scheduling
+// see: https://en.wikipedia.org/wiki/Hilbert_curve
+__device__ __forceinline__ void hilbert_rot(int n, int* x, int* y, int rx, int ry) {
+    if (ry == 0) {
+        if (rx == 1) {
+            *x = n - 1 - *x;
+            *y = n - 1 - *y;
+        }
+        // Swap x and y
+        int t = *x;
+        *x = *y;
+        *y = t;
+    }
+}
 
-__device__ __forceinline__ std::pair<int, int> compute_bid(int bid, int grid_n) {
+// Convert from Hilbert curve index to 2D coordinates
+// n must be a power of 2 (size of the grid dimension)
+__device__ __forceinline__ void hilbert_index_to_xy(int n, int index, int* x, int* y) {
+    *x = 0;
+    *y = 0;
+    for (int s = 1; s < n; s *= 2) {
+        int rx = 1 & (index / 2);
+        int ry = 1 & (index ^ rx);
+        hilbert_rot(s, x, y, rx, ry);
+        *x += s * rx;
+        *y += s * ry;
+        index /= 4;
+    }
+}
+
+__device__ __forceinline__ std::pair<int, int> compute_bid_hilbert(int bid, int grid_m, int grid_n) {
+    constexpr int CTA_GROUP_SIZE = 2;
+    const int group_id = bid / CTA_GROUP_SIZE;
+
+    // Find smallest power of 2 that fits both dimensions
+    int max_dim = max(grid_m, grid_n);
+    int hilbert_size = 1;
+    while (hilbert_size < max_dim) {
+        hilbert_size *= 2;
+    }
+
+    // Map group_id to 2D coordinates using Hilbert curve
+    int group_m, group_n;
+    hilbert_index_to_xy(hilbert_size, group_id, &group_n, &group_m);
+
+    // Clamp to actual grid bounds and handle out-of-bounds by wrapping
+    // This ensures we still process all tiles even with non-power-of-2 grids
+    if (group_m >= grid_m || group_n >= grid_n) {
+        // Fallback to linear mapping for out-of-bounds indices
+        int valid_group_id = group_id % (grid_m * grid_n);
+        group_n = valid_group_id % grid_n;
+        group_m = valid_group_id / grid_n;
+    }
+
+    // Convert group coordinates to block coordinates
+    // Each group is CTA_GROUP_SIZE blocks tall
+    const int base_block_m = group_m * CTA_GROUP_SIZE;
+    const int block_n = group_n;
+    const int block_m = base_block_m + (bid % CTA_GROUP_SIZE);
+
+    return {block_m, block_n};
+}
+
+__device__ __forceinline__ std::pair<int, int> compute_bid_linear(int bid, int grid_n) {
     constexpr int CTA_GROUP_SIZE = 2;
     const int group_id = bid / CTA_GROUP_SIZE;
 
@@ -533,6 +595,16 @@ __device__ __forceinline__ std::pair<int, int> compute_bid(int bid, int grid_n) 
     const int block_m = base_block_m + (bid % CTA_GROUP_SIZE);
 
     return {block_m, block_n};
+}
+
+// Templated compute_bid dispatcher
+template<bool USE_HILBERT>
+__device__ __forceinline__ std::pair<int, int> compute_bid(int bid, int grid_m, int grid_n) {
+    if constexpr (USE_HILBERT) {
+        return compute_bid_hilbert(bid, grid_m, grid_n);
+    } else {
+        return compute_bid_linear(bid, grid_n);
+    }
 }
 
 // Helper macro for static indexing of parity arrays to avoid local memory spills
@@ -565,7 +637,7 @@ __device__ __forceinline__ std::pair<int, int> compute_bid(int bid, int grid_n) 
         } \
     } while (0)
 
-template<int QUEUE_SIZE, int BM, int BN, int BK>
+template<bool USE_HILBERT, int QUEUE_SIZE, int BM, int BN, int BK>
 __device__ __noinline__
 void producer_warp(
     const CUtensorMap* a_map,
@@ -597,7 +669,7 @@ void producer_warp(
 
     for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
         const int bid = group_id * CTA_GROUP_SIZE + (start_bid % CTA_GROUP_SIZE);
-        auto [block_m, block_n] = compute_bid(bid, grid_n);
+        auto [block_m, block_n] = compute_bid<USE_HILBERT>(bid, grid_m, grid_n);
 
         int global_m_off = block_m * BM;
         int global_n_off = block_n * BN + cta_rank * BN / 2;
@@ -836,7 +908,7 @@ void consumer_warp(
     }
 }
 
-template<int BM, int BN, int ACCUM_OVERLAP_COLS>
+template<bool USE_HILBERT, int BM, int BN, int ACCUM_OVERLAP_COLS>
 __device__ __noinline__
 void epilogue_warpgroup(
     float* C,
@@ -866,7 +938,7 @@ void epilogue_warpgroup(
 
     for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
         const int bid = group_id * CTA_GROUP_SIZE + (start_bid % CTA_GROUP_SIZE);
-        auto [block_m, block_n] = compute_bid(bid, grid_n);
+        auto [block_m, block_n] = compute_bid<USE_HILBERT>(bid, grid_m, grid_n);
 
         if (mma_tmem_buf == 0) {
             mbarrier_wait_parity(mma_mbar_addr + 0 * sizeof(uint64_t), mma_parity[0]);
@@ -914,6 +986,7 @@ void epilogue_warpgroup(
 }
 
 template<
+    bool USE_HILBERT,
     int QUEUE_SIZE,
     int BM = 128,
     int BN = 256,
@@ -1032,12 +1105,12 @@ void ws_gemm_2cta_mma(
 
     if (warp_id == PRODUCER_WARP_ID && is_producer_master_thread)
     {
-        producer_warp<QUEUE_SIZE, BM, BN, BK>(
+        producer_warp<USE_HILBERT, QUEUE_SIZE, BM, BN, BK>(
             &a_map, &b_map, &sfa_map, &sfb_map, K, start_bid, start_group_id, num_groups, total_groups,
             cta_rank, grid_m, grid_n, smem, smem_full_mbar_addr, smem_empty_mbar_addr
         );
     }
-    else if (warp_id == CONSUMER_WARP_ID) 
+    else if (warp_id == CONSUMER_WARP_ID)
     {
         // allocate tmem here because producer starting should not be blocked on tmem allocation
         tcgen05_alloc<TMEM_WIDTH_ROUNDED>(tmem_addr_smem);
@@ -1047,14 +1120,14 @@ void ws_gemm_2cta_mma(
                 K, start_group_id, num_groups, total_groups, smem,
                 smem_full_mbar_addr, smem_empty_mbar_addr, mma_mbar_addr,
                 epilogue_mbar_addr, tmem_addr_smem
-            ); 
+            );
         }
     }
     else if (warpgroup_id == EPILOGUE_WARPGROUP_ID)
     {
-        epilogue_warpgroup<BM, BN, ACCUM_OVERLAP_COLS>(
+        epilogue_warpgroup<USE_HILBERT, BM, BN, ACCUM_OVERLAP_COLS>(
             C, N, start_bid, start_group_id, num_groups, total_groups,
-            cta_rank, grid_m, grid_n, threadIdx.x, 
+            cta_rank, grid_m, grid_n, threadIdx.x,
             mma_mbar_addr, epilogue_mbar_addr
         );
     }
@@ -1243,12 +1316,28 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     const int launch_blocks = 148;
     dim3 grid_dim(launch_blocks);
     dim3 block_dim(BLOCK_SIZE);
-    auto kernel = ws_gemm_2cta_mma<QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K>;
 
-    CUDA_CHECK(cudaFuncSetAttribute(
-        kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        total_smem
-    ));
-    kernel<<<grid_dim, block_dim, total_smem>>>(a_map, b_map, sfa_map, sfb_map, c_ptr, M, N, K);
+    // Use Hilbert scheduling for square matrices (M == N) for better cache locality
+    const bool use_hilbert = (M == N);
+
+    if (use_hilbert) 
+    {
+        auto kernel = ws_gemm_2cta_mma<true, QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K>;
+        CUDA_CHECK(cudaFuncSetAttribute(
+            kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            total_smem
+        ));
+        kernel<<<grid_dim, block_dim, total_smem>>>(a_map, b_map, sfa_map, sfb_map, c_ptr, M, N, K);
+    } 
+    else 
+    {
+        auto kernel = ws_gemm_2cta_mma<false, QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K>;
+        CUDA_CHECK(cudaFuncSetAttribute(
+            kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            total_smem
+        ));
+        kernel<<<grid_dim, block_dim, total_smem>>>(a_map, b_map, sfa_map, sfb_map, c_ptr, M, N, K);
+    }
 }
