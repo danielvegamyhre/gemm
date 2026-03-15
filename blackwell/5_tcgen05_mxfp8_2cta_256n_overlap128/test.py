@@ -6,10 +6,10 @@ from torchao.prototype.mx_formats.kernels import triton_to_mxfp8_dim0
 from torchao.prototype.mx_formats.utils import to_blocked
 
 custom_gemm = load(
-    name="tcgen05_mxfp8_2cta_256n_warp_specialized",
+    name="tcgen05_mxfp8_2cta_256n_overlap128",
     sources=[
-        "tcgen05_mxfp8_2cta_256n_warp_specialized.cpp",
-        "tcgen05_mxfp8_2cta_256n_warp_specialized.cu",
+        "tcgen05_mxfp8_2cta_256n_overlap128.cpp",
+        "tcgen05_mxfp8_2cta_256n_overlap128.cu",
     ],
     extra_cuda_cflags=[
         "-g",
