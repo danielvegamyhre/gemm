@@ -892,7 +892,7 @@ void consumer_warp(
             // - B tile [BN,BK] = [256,128]
             // - SFA [BM/128, BK/32/4, 32, 16] = [1, 1, 32, 16] = 1 512 byte sfs
             // - SFB [BN/128, BK/32/4, 32, 16] = [2, 1, 32, 16] = 2 512 byte sfs
-                
+
             // A/B tiles in smem and SFA/SFB in tmem will take 4 mmas to use.
             // each mma uses:
             // 128x32 of A
@@ -928,7 +928,7 @@ void consumer_warp(
 
                     // encode tcgen05.mma instruction descriptor.
                     // SFA_ID is odd. for .block_32 mma scaling, it basically selects 4 separate 32x1 strips, separated by 4 cols each
-                    // so what *was* as 128x1 sf column before the transform to ((32,4),4) blocked layout. 
+                    // so what *was* as 128x1 sf column before the transform to ((32,4),4) blocked layout.
                     // therefore, this 128x1 sf column corresponds exactly to a 128x32 chunk of A tile,
                     // which matches our MMA_M=128, MMA_K=32.
                     // SFB_ID works similarly, but for MMA_N=256, it is 8 strips.
@@ -961,7 +961,7 @@ void consumer_warp(
 
 // Helper function to process epilogue chunk - noinline to reduce register pressure in main function
 template<int COLS, int BM, int BN>
-__device__ __noinline__
+__device__ __forceinline__
 void process_epilogue_chunk(
     float* C,
     int N,
@@ -1383,8 +1383,11 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     dim3 grid_dim(launch_blocks);
     dim3 block_dim(BLOCK_SIZE);
 
-    // use hilbert curve only for square outputs
-    const bool use_hilbert = (M == N);
+    // use hilbert curve only for square outputs whose dims are powers of 2
+    const bool m_power_of_2 = M > 0 && (M & (M - 1)) == 0;
+    const bool n_power_of_2 = N > 0 && (N & (N - 1)) == 0;
+    const bool use_hilbert = (M == N) && m_power_of_2 && n_power_of_2; 
+
 
     if (use_hilbert) 
     {

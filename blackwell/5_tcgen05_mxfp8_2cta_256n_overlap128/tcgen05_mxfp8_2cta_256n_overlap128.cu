@@ -664,8 +664,12 @@ void producer_warp(
     constexpr int SMEM_SFB_SIZE = BN * SF_BK;
 
     int tma_smem_buf = 0;
-    int smem_empty_parity[QUEUE_SIZE];
-    for (int i = 0; i < QUEUE_SIZE; i++) smem_empty_parity[i] = 0;
+    int smem_empty_parity[QUEUE_SIZE] = {0};
+
+    const uint64_t* a_map_ptr = reinterpret_cast<const uint64_t*>(a_map);
+    const uint64_t* b_map_ptr = reinterpret_cast<const uint64_t*>(b_map);
+    const uint64_t* sfa_map_ptr = reinterpret_cast<const uint64_t*>(sfa_map);
+    const uint64_t* sfb_map_ptr = reinterpret_cast<const uint64_t*>(sfb_map);
 
     for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
         const int bid = group_id * CTA_GROUP_SIZE + (start_bid % CTA_GROUP_SIZE);
@@ -698,32 +702,34 @@ void producer_warp(
 
             // load A tile
             int global_k_off = block_k_idx * BK;
+            const uint32_t k_off_128 = (uint32_t)(global_k_off >> 7);
+            const uint32_t k_off_sf = (uint32_t)(global_k_off >> 7);
             cp_async_bulk_tensor_3d_global_to_shared(
                 A_smem,
-                reinterpret_cast<const uint64_t*>(a_map),
+                a_map_ptr,
                 0,
                 (uint32_t)global_m_off,
-                (uint32_t)global_k_off/128, // divide by 128b swizzle atom size, following tensor map global dims
+                k_off_128, // divide by 128b swizzle atom size, following tensor map global dims
                 smem_full_mbar
             );
 
             // load B tile
             cp_async_bulk_tensor_3d_global_to_shared(
                 B_smem,
-                reinterpret_cast<const uint64_t*>(b_map),
+                b_map_ptr,
                 0,
                 (uint32_t)global_n_off,
-                (uint32_t)global_k_off/128,
+                k_off_128,
                 smem_full_mbar
             );
 
             // sfa tiles are different for each cta, so each cta loads their own
             cp_async_bulk_tensor_4d_global_to_shared(
                 SFA_smem,
-                reinterpret_cast<const uint64_t*>(sfa_map),
+                sfa_map_ptr,
                 0,
                 0,
-                (uint32_t)(global_k_off/32/4),
+                k_off_sf,
                 (uint32_t)(global_m_off/128),
                 smem_full_mbar
             );
@@ -732,10 +738,10 @@ void producer_warp(
             if (cta_rank == 1) {
                 cp_async_bulk_tensor_4d_global_to_shared_multicast(
                     SFB_smem,
-                    reinterpret_cast<const uint64_t*>(sfb_map),
+                    sfb_map_ptr,
                     0,
                     0,
-                    (uint32_t)(global_k_off/32/4),
+                    k_off_sf,
                     (uint32_t)(global_n_off_sfb/128),
                     smem_full_mbar
                 );
@@ -768,6 +774,7 @@ void consumer_warp(
     constexpr int SMEM_B_SIZE = (BN / CTA_GROUP_SIZE) * BK;
     constexpr int SMEM_SFA_SIZE = BM * SF_BK;
     constexpr int SMEM_SFB_SIZE = BN * SF_BK;
+    constexpr int MBAR_SIZE = sizeof(uint64_t);
 
     int mma_smem_buf = 0;
     int mma_tmem_buf = 0; // for 256 col wide accumulator
@@ -781,6 +788,7 @@ void consumer_warp(
     int smem_full_parity = 0; // flips every QUEUE_SIZE iterations
 
     for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
+        int enable_accum = 0; // disable accum for first MMA of this block, then always enable
 
         // tmem layout for MMA_N=256
         // [   acc1   ]
@@ -827,12 +835,15 @@ void consumer_warp(
             const int smem_sfb_base = smem_sfa_base + SMEM_SFA_SIZE;
             constexpr int SWIZZLE_ATOM_K = 128;
 
+            uint32_t smem_buff_a = smem + mma_smem_buf * BUFF_SIZE;
+            uint32_t smem_buff_b = smem_buff_a + SMEM_A_SIZE;
+
             // at this point, in the smem buffer for this stage, we have:
             // - A tile [BM,BK] = [128,256]
             // - B tile [BN,BK] = [256,256]
             // - SFA [BM/128, BK/32/4, 32, 16] = [1, 2, 32, 16] = two 512 byte sfs
             // - SFB [BN/128, BK/32/4, 32, 16] = [2, 2, 32, 16] = four 512 byte sfs
-                
+
             // A/B tiles in smem and SFA/SFB in tmem will take 8 mmas to use.
             // each mma uses:
             // 128x32 of A
@@ -853,14 +864,12 @@ void consumer_warp(
                 tcgen05_cp_smem_to_tmem(sfb_desc1, tmem_sfb_base_addr, 0, 0 + 8 * bk_chunk);
                 tcgen05_cp_smem_to_tmem(sfb_desc2, tmem_sfb_base_addr, 0, 4 + 8 * bk_chunk);
 
+                const int a_chunk_off = bk_chunk * BM * SWIZZLE_ATOM_K;
+                const int b_chunk_off = bk_chunk * (BN / CTA_GROUP_SIZE) * SWIZZLE_ATOM_K;
+
                 for (int mma_iter = 0; mma_iter < SWIZZLE_ATOM_K / MMA_K; mma_iter++) {
-                    const int a_chunk_off = bk_chunk * BM * SWIZZLE_ATOM_K;
-                    const int b_chunk_off = bk_chunk * (BN / CTA_GROUP_SIZE) * SWIZZLE_ATOM_K;
                     const int a_k_off = a_chunk_off + mma_iter * MMA_K;
                     const int b_k_off = b_chunk_off + mma_iter * MMA_K;
-
-                    uint32_t smem_buff_a = smem + mma_smem_buf * BUFF_SIZE;
-                    uint32_t smem_buff_b = smem_buff_a + SMEM_A_SIZE;
 
                     // A/B smem descs
                     uint64_t smem_a_desc = make_smem_desc(smem_buff_a + a_k_off);
@@ -868,17 +877,12 @@ void consumer_warp(
 
                     // encode tcgen05.mma instruction descriptor.
                     // SFA_ID is odd. for .block_32 mma scaling, it basically selects 4 separate 32x1 strips, separated by 4 cols each
-                    // so what *was* as 128x1 sf column before the transform to ((32,4),4) blocked layout. 
+                    // so what *was* as 128x1 sf column before the transform to ((32,4),4) blocked layout.
                     // therefore, this 128x1 sf column corresponds exactly to a 128x32 chunk of A tile,
                     // which matches our MMA_M=128, MMA_K=32.
                     // SFB_ID works similarly, but for MMA_N=256, it is 8 strips.
                     uint32_t idesc = 0;
-                    int sfa_id = mma_iter;
-                    int sfb_id = mma_iter;
-                    tcgen05_encode_idesc<CTA_GROUP_SIZE * MMA_M, MMA_N>(idesc, sfa_id, sfb_id);
-
-                    // only disable accumo on the first mma of each block
-                    int enable_accum = (block_k_idx == 0 && bk_chunk == 0 && mma_iter == 0) ? 0 : 1;
+                    tcgen05_encode_idesc<CTA_GROUP_SIZE * MMA_M, MMA_N>(idesc, mma_iter, mma_iter);
 
                     // i *think* that the `tmem_base_addr` of SFA and SFB should stay constant
                     // while we are using the same 512b scale factor tile for four MMAs,
@@ -889,6 +893,7 @@ void consumer_warp(
                     int tmem_sfb_tile_addr = tmem_sfb_base_addr + 8 * bk_chunk; // two 32x16 chunks, i.e. 8 cols of tmem
 
                     tcgen05_mma_mxfp8(smem_a_desc, smem_b_desc, tmem_sfa_tile_addr, tmem_sfb_tile_addr, tmem_accum_addr, idesc, enable_accum);
+                    enable_accum = 1;
                 }
             }
 
@@ -1317,8 +1322,11 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     dim3 grid_dim(launch_blocks);
     dim3 block_dim(BLOCK_SIZE);
 
-    // use hilbert curve only for square outputs
-    const bool use_hilbert = (M == N);
+    // use hilbert curve only for square outputs whose dims are powers of 2
+    const bool m_power_of_2 = M > 0 && (M & (M - 1)) == 0;
+    const bool n_power_of_2 = N > 0 && (N & (N - 1)) == 0;
+    const bool use_hilbert = (M == N) && m_power_of_2 && n_power_of_2; 
+
     if (use_hilbert) 
     {
         auto kernel = ws_gemm_2cta_mma<true, QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K>;

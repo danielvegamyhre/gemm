@@ -229,6 +229,7 @@ __device__ __forceinline__ void mbarrier_wait_parity(uint32_t mbar_addr, const u
   }
 }
 
+
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-arrive
 __device__ __forceinline__ void mbarrier_arrive(uint32_t mbar_addr) {
   asm volatile(
@@ -712,8 +713,12 @@ void producer_warp(
     constexpr int SMEM_SFB_SIZE = BN * SF_BK;
 
     int tma_smem_buf = 0;
-    int smem_empty_parity[QUEUE_SIZE];
-    for (int i = 0; i < QUEUE_SIZE; i++) smem_empty_parity[i] = 0;
+    int smem_empty_parity[QUEUE_SIZE] = {0};
+
+    const uint64_t* a_map_ptr = reinterpret_cast<const uint64_t*>(a_map);
+    const uint64_t* b_map_ptr = reinterpret_cast<const uint64_t*>(b_map);
+    const uint64_t* sfa_map_ptr = reinterpret_cast<const uint64_t*>(sfa_map);
+    const uint64_t* sfb_map_ptr = reinterpret_cast<const uint64_t*>(sfb_map);
 
     for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
         const int bid = group_id * CTA_GROUP_SIZE + (start_bid % CTA_GROUP_SIZE);
@@ -737,42 +742,46 @@ void producer_warp(
             const uint32_t SFA_smem = B_smem + SMEM_B_SIZE;
             const uint32_t SFB_smem = SFA_smem + SMEM_SFA_SIZE;
 
-            uint32_t smem_full_mbar = smem_full_mbar_addr + tma_smem_buf * sizeof(uint64_t);
+            constexpr int MBAR_SIZE = sizeof(uint64_t);
+            uint32_t smem_full_mbar = smem_full_mbar_addr + tma_smem_buf * MBAR_SIZE;
             if (cta_rank == 1) {
                 smem_full_mbar = map_smem_addr_to_cta_rank(smem_full_mbar, 0);
             }
 
             mbarrier_arrive_expect_tx(smem_full_mbar, SMEM_A_SIZE + SMEM_B_SIZE + SMEM_SFA_SIZE + SMEM_SFB_SIZE);
 
-            // load A tile
             int global_k_off = block_k_idx * BK;
+            const uint32_t k_off_128 = (uint32_t)(global_k_off >> 7); // k / 128 for 128b swizzle dim of A/B tiles
+            const uint32_t k_off_sf = (uint32_t)(global_k_off >> 7);  // k / 32 / 4 for sfa/sfb col id
+
+            // load A tile
             cp_async_bulk_tensor_3d_global_to_shared(
                 A_smem,
-                reinterpret_cast<const uint64_t*>(a_map),
+                a_map_ptr,
                 0,
                 (uint32_t)global_m_off,
-                (uint32_t)global_k_off/128, // divide by 128b swizzle atom size, following tensor map global dims
+                k_off_128,
                 smem_full_mbar
             );
 
             // load B tile
             cp_async_bulk_tensor_3d_global_to_shared(
                 B_smem,
-                reinterpret_cast<const uint64_t*>(b_map),
+                b_map_ptr,
                 0,
                 (uint32_t)global_n_off,
-                (uint32_t)global_k_off/128,
+                k_off_128,
                 smem_full_mbar
             );
 
             // sfa tiles are different for each cta, so each cta loads their own
             cp_async_bulk_tensor_4d_global_to_shared(
                 SFA_smem,
-                reinterpret_cast<const uint64_t*>(sfa_map),
+                sfa_map_ptr,
                 0,
                 0,
-                (uint32_t)(global_k_off/32/4),
-                (uint32_t)(global_m_off/128),
+                k_off_sf,
+                (uint32_t)(global_m_off >> 7), // m/128 for SFA row tile id
                 smem_full_mbar
             );
 
@@ -780,11 +789,11 @@ void producer_warp(
             if (cta_rank == 1) {
                 cp_async_bulk_tensor_4d_global_to_shared_multicast(
                     SFB_smem,
-                    reinterpret_cast<const uint64_t*>(sfb_map),
+                    sfb_map_ptr,
                     0,
                     0,
-                    (uint32_t)(global_k_off/32/4),
-                    (uint32_t)(global_n_off_sfb/128),
+                    k_off_sf,
+                    (uint32_t)(global_n_off_sfb >> 7), // n/128 for SFB row tile id
                     smem_full_mbar
                 );
             }
@@ -816,9 +825,11 @@ void consumer_warp(
     constexpr int SMEM_B_SIZE = (BN / CTA_GROUP_SIZE) * BK;
     constexpr int SMEM_SFA_SIZE = BM * SF_BK;
     constexpr int SMEM_SFB_SIZE = BN * SF_BK;
+    constexpr int MBAR_SIZE = sizeof(uint64_t);
 
-    int mma_smem_buf = 0;
-    int mma_tmem_buf = 0; // for 256 col wide accumulator
+    int mma_smem_buf = 0; // which smem buff in QUEUE_SIZE buffers 
+    int mma_tmem_buf = 0; // which 256 col wide accumulator
+
     // use separate parity variables for each mbar to avoid dynamic indexing
     int epilogue_parity_0 = 0, epilogue_parity_1 = 0, epilogue_parity_2 = 0;
     int epilogue_parity_3 = 0, epilogue_parity_4 = 0;
@@ -831,6 +842,7 @@ void consumer_warp(
     int smem_full_parity = 0; // flips every QUEUE_SIZE iterations
 
     for (int group_id = start_group_id; group_id < total_groups; group_id += num_groups) {
+        int enable_accum = 0; // disable accum for first MMA of this block, then always enable
 
         // tmem layout for MMA_N=256
         // [   acc1   ]
@@ -844,7 +856,7 @@ void consumer_warp(
         if (blocks_processed >= 1)
         {
             // after first block, always wait for epilogue to finish with the overlapped 64 columns (mbar 2)
-            mbarrier_wait_parity(epilogue_mbar_addr + 2 * sizeof(uint64_t), epilogue_parity_2);
+            mbarrier_wait_parity(epilogue_mbar_addr + 2 * MBAR_SIZE, epilogue_parity_2);
             epilogue_parity_2 ^= 1;
 
             // after 2+ blocks:
@@ -855,38 +867,41 @@ void consumer_warp(
                 if (mma_tmem_buf == 0)
                 {
                     // Wait for leftmost chunks of buf 0: 128, 64 cols (mbars 0, 1)
-                    mbarrier_wait_parity(epilogue_mbar_addr + 0 * sizeof(uint64_t), epilogue_parity_0);
+                    mbarrier_wait_parity(epilogue_mbar_addr + 0 * MBAR_SIZE, epilogue_parity_0);
                     epilogue_parity_0 ^= 1;
 
-                    mbarrier_wait_parity(epilogue_mbar_addr + 1 * sizeof(uint64_t), epilogue_parity_1);
+                    mbarrier_wait_parity(epilogue_mbar_addr + 1 * MBAR_SIZE, epilogue_parity_1);
                     epilogue_parity_1 ^= 1;
                 }
                 else
                 {
                     // Wait for rightmost chunks of buf 1: 64, 128 cols (mbars 3, 4)
-                    mbarrier_wait_parity(epilogue_mbar_addr + 3 * sizeof(uint64_t), epilogue_parity_3);
+                    mbarrier_wait_parity(epilogue_mbar_addr + 3 * MBAR_SIZE, epilogue_parity_3);
                     epilogue_parity_3 ^= 1;
 
-                    mbarrier_wait_parity(epilogue_mbar_addr + 4 * sizeof(uint64_t), epilogue_parity_4);
+                    mbarrier_wait_parity(epilogue_mbar_addr + 4 * MBAR_SIZE, epilogue_parity_4);
                     epilogue_parity_4 ^= 1;
                 }
             }
         }
 
         for (int block_k_idx = 0; block_k_idx < num_blocks_k; block_k_idx++) {
-            mbarrier_wait_parity(smem_full_mbar_addr + mma_smem_buf * sizeof(uint64_t), smem_full_parity);
+            mbarrier_wait_parity(smem_full_mbar_addr + mma_smem_buf * MBAR_SIZE, smem_full_parity);
 
             constexpr int BUFF_SIZE = SMEM_A_SIZE + SMEM_B_SIZE + SMEM_SFA_SIZE + SMEM_SFB_SIZE;
             const int smem_sfa_base = mma_smem_buf * BUFF_SIZE + SMEM_A_SIZE + SMEM_B_SIZE;
             const int smem_sfb_base = smem_sfa_base + SMEM_SFA_SIZE;
             constexpr int SWIZZLE_ATOM_K = 128;
 
+            uint32_t smem_buff_a = smem + mma_smem_buf * BUFF_SIZE;
+            uint32_t smem_buff_b = smem_buff_a + SMEM_A_SIZE;
+
             // at this point, in the smem buffer for this stage, we have:
             // - A tile [BM,BK] = [128,256]
             // - B tile [BN,BK] = [256,256]
             // - SFA [BM/128, BK/32/4, 32, 16] = [1, 2, 32, 16] = two 512 byte sfs
             // - SFB [BN/128, BK/32/4, 32, 16] = [2, 2, 32, 16] = four 512 byte sfs
-                
+
             // A/B tiles in smem and SFA/SFB in tmem will take 8 mmas to use.
             // each mma uses:
             // 128x32 of A
@@ -894,6 +909,9 @@ void consumer_warp(
             // 128x1 of SFA laid out as (32,4) in tmem which is only 1 tmem col (4 bytes) wide
             // 256x1 of SFB laid out as ((32,4),2) or basically (32,8) in tmem, so 2 tmem cols
             for (int bk_chunk = 0; bk_chunk < BK / SWIZZLE_ATOM_K; bk_chunk++) {
+                const int a_chunk_off = bk_chunk * BM * SWIZZLE_ATOM_K;
+                const int b_chunk_off = bk_chunk * (BN / CTA_GROUP_SIZE) * SWIZZLE_ATOM_K;
+
                 // sfa for each bk chunk is 512 bytes in 32x16 e8m0 data so 32x4 tmem cols wide
                 uint64_t sfa_desc = make_sf_smem_desc(smem + smem_sfa_base + 512 * bk_chunk);
                 tcgen05_cp_smem_to_tmem(sfa_desc, tmem_sfa_base_addr, 0, 0);
@@ -908,13 +926,8 @@ void consumer_warp(
                 tcgen05_cp_smem_to_tmem(sfb_desc2, tmem_sfb_base_addr, 0, 4);
 
                 for (int mma_iter = 0; mma_iter < SWIZZLE_ATOM_K / MMA_K; mma_iter++) {
-                    const int a_chunk_off = bk_chunk * BM * SWIZZLE_ATOM_K;
-                    const int b_chunk_off = bk_chunk * (BN / CTA_GROUP_SIZE) * SWIZZLE_ATOM_K;
                     const int a_k_off = a_chunk_off + mma_iter * MMA_K;
                     const int b_k_off = b_chunk_off + mma_iter * MMA_K;
-
-                    uint32_t smem_buff_a = smem + mma_smem_buf * BUFF_SIZE;
-                    uint32_t smem_buff_b = smem_buff_a + SMEM_A_SIZE;
 
                     // A/B smem descs
                     uint64_t smem_a_desc = make_smem_desc(smem_buff_a + a_k_off);
@@ -922,17 +935,12 @@ void consumer_warp(
 
                     // encode tcgen05.mma instruction descriptor.
                     // SFA_ID is odd. for .block_32 mma scaling, it basically selects 4 separate 32x1 strips, separated by 4 cols each
-                    // so what *was* as 128x1 sf column before the transform to ((32,4),4) blocked layout. 
+                    // so what *was* as 128x1 sf column before the transform to ((32,4),4) blocked layout.
                     // therefore, this 128x1 sf column corresponds exactly to a 128x32 chunk of A tile,
                     // which matches our MMA_M=128, MMA_K=32.
                     // SFB_ID works similarly, but for MMA_N=256, it is 8 strips.
                     uint32_t idesc = 0;
-                    int sfa_id = mma_iter;
-                    int sfb_id = mma_iter;
-                    tcgen05_encode_idesc<CTA_GROUP_SIZE * MMA_M, MMA_N>(idesc, sfa_id, sfb_id);
-
-                    // only disable accumo on the first mma of each block
-                    int enable_accum = (block_k_idx == 0 && bk_chunk == 0 && mma_iter == 0) ? 0 : 1;
+                    tcgen05_encode_idesc<CTA_GROUP_SIZE * MMA_M, MMA_N>(idesc, mma_iter, mma_iter);
 
                     // i *think* that the `tmem_base_addr` of SFA and SFB should stay constant
                     // while we are using the same 512b scale factor tile for four MMAs,
@@ -940,23 +948,54 @@ void consumer_warp(
                     // we use same tmem base address and increment `sfa_id` to communicate
                     // which sf cols to select for that MMA.
                     tcgen05_mma_mxfp8(smem_a_desc, smem_b_desc, tmem_sfa_base_addr, tmem_sfb_base_addr, tmem_accum_addr, idesc, enable_accum);
+                    enable_accum = 1;
                 }
             }
 
             // cta 0 signals to both ctas the smem buffer can now be safely re-used
-            tcgen05_commit_multicast(smem_empty_mbar_addr + mma_smem_buf * sizeof(uint64_t), cta_mask);
+            tcgen05_commit_multicast(smem_empty_mbar_addr + mma_smem_buf * MBAR_SIZE, cta_mask);
             mma_smem_buf = (mma_smem_buf + 1) % QUEUE_SIZE;
-           
+
             // when we wraparound to the beginning of the queue to re-use smem buffers, flip parity bit
             if (mma_smem_buf == 0)
                 smem_full_parity ^= 1;
         }
 
         // cta0 signals to both ctas the tmem accum buff is ready for epilogue
-        tcgen05_commit_multicast(mma_mbar_addr + mma_tmem_buf * sizeof(uint64_t), cta_mask);
+        tcgen05_commit_multicast(mma_mbar_addr + mma_tmem_buf * MBAR_SIZE, cta_mask);
         mma_tmem_buf = (mma_tmem_buf + 1) % TMEM_BUFFERS;
         blocks_processed += 1;
     }
+}
+
+template<int COLS, int BM, int BN>
+__device__ __forceinline__
+void process_epilogue_chunk(
+    float* C,
+    int N,
+    int c_row_base,
+    int c_col_base,
+    int tmem_addr_reg,
+    int tmem_base_row,
+    int col_offset,
+    uint32_t ep_mbar_addr,
+    uint32_t cta_rank
+) {
+    // tmem -> reg with tcgen05.ld for 32xCOLS floats 
+    float c_reg[COLS];
+    tcgen05_ld_tmem_to_reg<COLS>(tmem_addr_reg, tmem_base_row, col_offset, c_reg);
+
+    // reg -> gmem with STG.256  (8 floats per write)
+    #pragma unroll
+    for (int j = 0; j < COLS / 8; j++) {
+        const int c_col = c_col_base + col_offset + j * 8;
+        st_global_256b(C + c_row_base * N + c_col, &c_reg[j * 8]);
+    }
+
+    if (cta_rank == 1) {
+        ep_mbar_addr = map_smem_addr_to_cta_rank(ep_mbar_addr, 0);
+    }
+    mbarrier_arrive(ep_mbar_addr);
 }
 
 template<bool USE_HILBERT, int BM, int BN, int ACCUM_OVERLAP_COLS>
@@ -976,13 +1015,12 @@ void epilogue_warpgroup(
     uint32_t epilogue_mbar_addr
 ) {
     constexpr int CTA_GROUP_SIZE = 2;
-    constexpr int TMEM_COLS_PER_LOAD = 128;
-    constexpr int NUM_EPILOGUE_TMEM_BUFFERS = 5;  // two 256 col wide accum buffers, with 64 cols overlapping = 5 chunks (128,64,64,64,128)
     constexpr int NUM_MMA_TMEM_BUFFERS = 2;
+    constexpr int MBAR_SIZE = sizeof(uint64_t);
 
     int mma_tmem_buf = 0;
     int mma_parity[NUM_MMA_TMEM_BUFFERS] = {0};
-    int tmem_base_addr = 0; // tmem addr alloc-ed in this kernel design will always be 0 since we always allocate only one buffer
+    int tmem_base_addr = 0;
 
     int ep_warp_id = (threadIdx_x / 32);
     int lane_id = threadIdx_x % 32;
@@ -992,10 +1030,10 @@ void epilogue_warpgroup(
         auto [block_m, block_n] = compute_bid<USE_HILBERT>(bid, grid_m, grid_n);
 
         if (mma_tmem_buf == 0) {
-            mbarrier_wait_parity(mma_mbar_addr + 0 * sizeof(uint64_t), mma_parity[0]);
+            mbarrier_wait_parity(mma_mbar_addr + 0 * MBAR_SIZE, mma_parity[0]);
             mma_parity[0] ^= 1;
         } else {
-            mbarrier_wait_parity(mma_mbar_addr + 1 * sizeof(uint64_t), mma_parity[1]);
+            mbarrier_wait_parity(mma_mbar_addr + 1 * MBAR_SIZE, mma_parity[1]);
             mma_parity[1] ^= 1;
         }
 
@@ -1004,103 +1042,20 @@ void epilogue_warpgroup(
         asm volatile("tcgen05.fence::after_thread_sync;");
 
         int tmem_addr_reg = tmem_base_addr + mma_tmem_buf * (BN - ACCUM_OVERLAP_COLS);
-
         const int tmem_base_row = ep_warp_id * 32;
-        const int c_row = block_m * BM + ep_warp_id * 32 + lane_id;
+        const int c_row_base = block_m * BM + ep_warp_id * 32 + lane_id;
+        const int c_col_base = block_n * BN;
 
-        // Process chunks for each MMA buffer with 64-col overlap
-        // MMA buf 0: [128, 64, 64] at offsets [0, 128, 192], process right to left -> mbars 0, 1, 2
+        // MMA buf 0: [128, 64, 64] at offsets [0, 128, 192], process right to left -> mbars 2, 1, 0
         // MMA buf 1: [64, 64, 128] at offsets [0, 64, 128], process left to right -> mbars 2, 3, 4
         if (mma_tmem_buf == 0) {
-            // Chunk 2: 64 cols at offset 192
-            {
-                float c_reg[64];
-                constexpr int col_offset = 192;
-                tcgen05_ld_tmem_to_reg<64>(tmem_addr_reg, tmem_base_row, col_offset, c_reg);
-                #pragma unroll
-                for (int j = 0; j < 8; j++) {
-                    const int c_col = block_n * BN + col_offset + j * 8;
-                    st_global_256b(C + c_row * N + c_col, &c_reg[j * 8]);
-                }
-                uint32_t ep_mbar_addr = epilogue_mbar_addr + 2 * sizeof(uint64_t);
-                if (cta_rank == 1) ep_mbar_addr = map_smem_addr_to_cta_rank(ep_mbar_addr, 0);
-                mbarrier_arrive(ep_mbar_addr);
-            }
-
-            // Chunk 1: 64 cols at offset 128
-            {
-                float c_reg[64];
-                constexpr int col_offset = 128;
-                tcgen05_ld_tmem_to_reg<64>(tmem_addr_reg, tmem_base_row, col_offset, c_reg);
-                #pragma unroll
-                for (int j = 0; j < 8; j++) {
-                    const int c_col = block_n * BN + col_offset + j * 8;
-                    st_global_256b(C + c_row * N + c_col, &c_reg[j * 8]);
-                }
-                uint32_t ep_mbar_addr = epilogue_mbar_addr + 1 * sizeof(uint64_t);
-                if (cta_rank == 1) ep_mbar_addr = map_smem_addr_to_cta_rank(ep_mbar_addr, 0);
-                mbarrier_arrive(ep_mbar_addr);
-            }
-
-            // Chunk 0: 128 cols at offset 0
-            {
-                float c_reg[128];
-                constexpr int col_offset = 0;
-                tcgen05_ld_tmem_to_reg<128>(tmem_addr_reg, tmem_base_row, col_offset, c_reg);
-                #pragma unroll
-                for (int j = 0; j < 16; j++) {
-                    const int c_col = block_n * BN + col_offset + j * 8;
-                    st_global_256b(C + c_row * N + c_col, &c_reg[j * 8]);
-                }
-                uint32_t ep_mbar_addr = epilogue_mbar_addr + 0 * sizeof(uint64_t);
-                if (cta_rank == 1) ep_mbar_addr = map_smem_addr_to_cta_rank(ep_mbar_addr, 0);
-                mbarrier_arrive(ep_mbar_addr);
-            }
+            process_epilogue_chunk<64, BM, BN>(C, N, c_row_base, c_col_base, tmem_addr_reg, tmem_base_row, 192, epilogue_mbar_addr + 2 * MBAR_SIZE, cta_rank);
+            process_epilogue_chunk<64, BM, BN>(C, N, c_row_base, c_col_base, tmem_addr_reg, tmem_base_row, 128, epilogue_mbar_addr + 1 * MBAR_SIZE, cta_rank);
+            process_epilogue_chunk<128, BM, BN>(C, N, c_row_base, c_col_base, tmem_addr_reg, tmem_base_row, 0, epilogue_mbar_addr + 0 * MBAR_SIZE, cta_rank);
         } else {
-            // Chunk 0: 64 cols at offset 0
-            {
-                float c_reg[64];
-                constexpr int col_offset = 0;
-                tcgen05_ld_tmem_to_reg<64>(tmem_addr_reg, tmem_base_row, col_offset, c_reg);
-                #pragma unroll
-                for (int j = 0; j < 8; j++) {
-                    const int c_col = block_n * BN + col_offset + j * 8;
-                    st_global_256b(C + c_row * N + c_col, &c_reg[j * 8]);
-                }
-                uint32_t ep_mbar_addr = epilogue_mbar_addr + 2 * sizeof(uint64_t);
-                if (cta_rank == 1) ep_mbar_addr = map_smem_addr_to_cta_rank(ep_mbar_addr, 0);
-                mbarrier_arrive(ep_mbar_addr);
-            }
-
-            // Chunk 1: 64 cols at offset 64
-            {
-                float c_reg[64];
-                constexpr int col_offset = 64;
-                tcgen05_ld_tmem_to_reg<64>(tmem_addr_reg, tmem_base_row, col_offset, c_reg);
-                #pragma unroll
-                for (int j = 0; j < 8; j++) {
-                    const int c_col = block_n * BN + col_offset + j * 8;
-                    st_global_256b(C + c_row * N + c_col, &c_reg[j * 8]);
-                }
-                uint32_t ep_mbar_addr = epilogue_mbar_addr + 3 * sizeof(uint64_t);
-                if (cta_rank == 1) ep_mbar_addr = map_smem_addr_to_cta_rank(ep_mbar_addr, 0);
-                mbarrier_arrive(ep_mbar_addr);
-            }
-
-            // Chunk 2: 128 cols at offset 128
-            {
-                float c_reg[128];
-                constexpr int col_offset = 128;
-                tcgen05_ld_tmem_to_reg<128>(tmem_addr_reg, tmem_base_row, col_offset, c_reg);
-                #pragma unroll
-                for (int j = 0; j < 16; j++) {
-                    const int c_col = block_n * BN + col_offset + j * 8;
-                    st_global_256b(C + c_row * N + c_col, &c_reg[j * 8]);
-                }
-                uint32_t ep_mbar_addr = epilogue_mbar_addr + 4 * sizeof(uint64_t);
-                if (cta_rank == 1) ep_mbar_addr = map_smem_addr_to_cta_rank(ep_mbar_addr, 0);
-                mbarrier_arrive(ep_mbar_addr);
-            }
+            process_epilogue_chunk<64, BM, BN>(C, N, c_row_base, c_col_base, tmem_addr_reg, tmem_base_row, 0, epilogue_mbar_addr + 2 * MBAR_SIZE, cta_rank);
+            process_epilogue_chunk<64, BM, BN>(C, N, c_row_base, c_col_base, tmem_addr_reg, tmem_base_row, 64, epilogue_mbar_addr + 3 * MBAR_SIZE, cta_rank);
+            process_epilogue_chunk<128, BM, BN>(C, N, c_row_base, c_col_base, tmem_addr_reg, tmem_base_row, 128, epilogue_mbar_addr + 4 * MBAR_SIZE, cta_rank);
         }
 
         mma_tmem_buf = (mma_tmem_buf + 1) % NUM_MMA_TMEM_BUFFERS;
@@ -1435,12 +1390,14 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     constexpr int QUEUE_SIZE = (max_smem_per_sm - tmem_addr_size - mma_mbar_size - epilogue_mbar_size) / total_smem_per_stage;
     constexpr int total_smem = total_smem_per_stage * QUEUE_SIZE + mma_mbar_size + epilogue_mbar_size + tmem_addr_size;
 
-    const int launch_blocks = 148;
+    const int launch_blocks = NUM_SMS;
     dim3 grid_dim(launch_blocks);
     dim3 block_dim(BLOCK_SIZE);
 
-    // use hilbert curve only for square outputs
-    const bool use_hilbert = (M == N);
+    // use hilbert curve only for square outputs whose dims are powers of 2
+    const bool m_power_of_2 = M > 0 && (M & (M - 1)) == 0;
+    const bool n_power_of_2 = N > 0 && (N & (N - 1)) == 0;
+    const bool use_hilbert = (M == N) && m_power_of_2 && n_power_of_2; 
 
     if (use_hilbert) 
     {
