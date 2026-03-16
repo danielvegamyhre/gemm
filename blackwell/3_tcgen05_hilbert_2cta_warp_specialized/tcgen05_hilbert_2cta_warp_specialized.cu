@@ -617,7 +617,7 @@ void consumer_warp(
 __device__ __forceinline__ void st_global_256b(float* ptr, float const c_reg[8]) {
     const uint64_t* c_ptr = reinterpret_cast<const uint64_t*>(c_reg);
     asm volatile (
-        "st.global.v4.u64 [%0], {%1, %2, %3, %4};"
+        "st.global.L1::no_allocate.v4.u64 [%0], {%1, %2, %3, %4};"
         : 
         : "l"(ptr),      
           "l"(c_ptr[0]), // c_reg[0] and c_reg[1]
