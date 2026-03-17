@@ -554,34 +554,27 @@ __device__ __forceinline__ void st_shared_fp32(const uint32_t shared_addr, const
     }
 }
 
-template <int VECTOR_SIZE>
-__device__ __forceinline__ void st_shared_fp32_swizzle_32b(
+__device__ __forceinline__ void st_shared_fp32_v4_swizzle(
     uint32_t smem_base_addr,
     int row,
     int col,
     int stride,
-    const float reg[VECTOR_SIZE])
+    const float reg[4])
 {
-    static_assert(VECTOR_SIZE == 1 || VECTOR_SIZE == 2 || VECTOR_SIZE == 4 || VECTOR_SIZE == 8,
-                  "VECTOR_SIZE must be 1, 2, 4, or 8");
-
     // swizzle: swizzle 16B chunks within 32B span
     // see: https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html
     // formula: col ^= row % (32 / 16) = row % 2
 
-    // 16b chunk index (4 floats per 16b chunk)
     int chunk_idx = col / 4;
     int chunk_offset = col % 4;
 
-    // swizzle at chunk level
-    int swizzled_chunk = chunk_idx ^ (row & 1);  // row & 1 == row % 2
+    int swizzled_chunk = chunk_idx ^ ((row >> 2) & 1);
 
-    // convert back to float column
     int col_swizzled = swizzled_chunk * 4 + chunk_offset;
 
     // compute address and store
     uint32_t addr = smem_base_addr + row * stride * sizeof(float) + col_swizzled * sizeof(float);
-    st_shared_fp32<VECTOR_SIZE>(addr, reg);
+    st_shared_fp32<4>(addr, reg);
 }
 
 template <int VECTOR_SIZE>
@@ -780,6 +773,7 @@ void producer_warp(
     constexpr int SMEM_SFB_SIZE = BN * SF_BK;
     constexpr int SMEM_TMA_STORE_SIZE = BM * TMA_STORE_COLS * sizeof(float);
     constexpr int SMEM_QUEUE_OFFSET = SMEM_TMA_STORE_SIZE;
+    constexpr int MBAR_SIZE = sizeof(uint64_t);
 
     int tma_smem_buf = 0;
     int smem_empty_parity[QUEUE_SIZE] = {0};
@@ -811,7 +805,7 @@ void producer_warp(
             const uint32_t SFA_smem = B_smem + SMEM_B_SIZE;
             const uint32_t SFB_smem = SFA_smem + SMEM_SFA_SIZE;
 
-            uint32_t smem_full_mbar = smem_full_mbar_addr + tma_smem_buf * sizeof(uint64_t);
+            uint32_t smem_full_mbar = smem_full_mbar_addr + tma_smem_buf * MBAR_SIZE;
             if (cta_rank == 1) {
                 smem_full_mbar = map_smem_addr_to_cta_rank(smem_full_mbar, 0);
             }
@@ -886,7 +880,6 @@ void consumer_warp(
     constexpr int CTA_GROUP_SIZE = 2;
     constexpr int TMEM_BUFFERS = 2;
     constexpr int NUM_EPILOGUE_MBARS = 3; // we'll have 1 mbar per 128 cols of tmem accum to support accumlators sharing/overlapping 128 cols
-    constexpr int NUM_MMA_MBARS = TMEM_BUFFERS;
     constexpr int SF_BK = BK / 32;
     constexpr int SMEM_A_SIZE = BM * BK;
     constexpr int SMEM_B_SIZE = (BN / CTA_GROUP_SIZE) * BK;
@@ -923,7 +916,7 @@ void consumer_warp(
         {
             // 3 epilgoue mbars, each responsible for 128 cols of tmem.
             // after first block, always wait for epilogue to finish with middle/overlapped 128 columns of tmem
-            mbarrier_wait_parity(epilogue_mbar_addr + 1 * sizeof(uint64_t), epilogue_parity[1]);
+            mbarrier_wait_parity(epilogue_mbar_addr + 1 * MBAR_SIZE, epilogue_parity[1]);
             epilogue_parity[1] ^= 1;
 
             // after 2+ blocks:
@@ -936,19 +929,19 @@ void consumer_warp(
                 // flips every 2 blocks we process, since we have 2 tmem buffers
                 if (mma_tmem_buf == 0)
                 {
-                    mbarrier_wait_parity(epilogue_mbar_addr + 0 * sizeof(uint64_t), epilogue_parity[0]);
+                    mbarrier_wait_parity(epilogue_mbar_addr + 0 * MBAR_SIZE, epilogue_parity[0]);
                     epilogue_parity[0] ^= 1;
                 }
                 else
                 {
-                    mbarrier_wait_parity(epilogue_mbar_addr + 2 * sizeof(uint64_t), epilogue_parity[2]);
+                    mbarrier_wait_parity(epilogue_mbar_addr + 2 * MBAR_SIZE, epilogue_parity[2]);
                     epilogue_parity[2] ^= 1;
                 }
             }
         }
 
         for (int block_k_idx = 0; block_k_idx < num_blocks_k; block_k_idx++) {
-            mbarrier_wait_parity(smem_full_mbar_addr + mma_smem_buf * sizeof(uint64_t), smem_full_parity);
+            mbarrier_wait_parity(smem_full_mbar_addr + mma_smem_buf * MBAR_SIZE, smem_full_parity);
 
             constexpr int BUFF_SIZE = SMEM_A_SIZE + SMEM_B_SIZE + SMEM_SFA_SIZE + SMEM_SFB_SIZE;
             const int smem_sfa_base = SMEM_QUEUE_OFFSET + mma_smem_buf * BUFF_SIZE + SMEM_A_SIZE + SMEM_B_SIZE;
@@ -1018,7 +1011,7 @@ void consumer_warp(
             }
 
             // cta 0 signals to both ctas the smem buffer can now be safely re-used
-            tcgen05_commit_multicast(smem_empty_mbar_addr + mma_smem_buf * sizeof(uint64_t), cta_mask);
+            tcgen05_commit_multicast(smem_empty_mbar_addr + mma_smem_buf * MBAR_SIZE, cta_mask);
             mma_smem_buf = (mma_smem_buf + 1) % QUEUE_SIZE;
            
             // when we wraparound to the beginning of the queue to re-use smem buffers, flip parity bit
@@ -1027,7 +1020,7 @@ void consumer_warp(
         }
 
         // cta0 signals to both ctas the tmem accum buff is ready for epilogue
-        tcgen05_commit_multicast(mma_mbar_addr + mma_tmem_buf * sizeof(uint64_t), cta_mask);
+        tcgen05_commit_multicast(mma_mbar_addr + mma_tmem_buf * MBAR_SIZE, cta_mask);
         mma_tmem_buf = (mma_tmem_buf + 1) % TMEM_BUFFERS;
         blocks_processed += 1;
     }
@@ -1057,6 +1050,7 @@ void epilogue_warpgroup(
     constexpr int TMEM_COLS_PER_LOAD = 128;
     constexpr int NUM_EPILOGUE_TMEM_BUFFERS = 3;  // two 256 col wide accum buffers, with middle 128 cols overlapping = 3 128 col buffers
     constexpr int NUM_MMA_TMEM_BUFFERS = 2;
+    constexpr int MBAR_SIZE = sizeof(uint64_t);
 
     int mma_tmem_buf = 0;
     int mma_parity[NUM_MMA_TMEM_BUFFERS] = {0};
@@ -1075,10 +1069,10 @@ void epilogue_warpgroup(
         auto [block_m, block_n] = compute_bid<USE_HILBERT>(bid, grid_m, grid_n);
 
         if (mma_tmem_buf == 0) {
-            mbarrier_wait_parity(mma_mbar_addr + 0 * sizeof(uint64_t), mma_parity[0]);
+            mbarrier_wait_parity(mma_mbar_addr + 0 * MBAR_SIZE, mma_parity[0]);
             mma_parity[0] ^= 1;
         } else {
-            mbarrier_wait_parity(mma_mbar_addr + 1 * sizeof(uint64_t), mma_parity[1]);
+            mbarrier_wait_parity(mma_mbar_addr + 1 * MBAR_SIZE, mma_parity[1]);
             mma_parity[1] ^= 1;
         }
 
@@ -1104,24 +1098,23 @@ void epilogue_warpgroup(
             // for mma buf 0, select 1 then 0 (right to left)
             // for mma buf 1, select 1 then 2 (left to right)
             const int ep_mbar_idx = (mma_tmem_buf == 0) ? 1 - i : 1 + i;
-            uint32_t ep_mbar_addr = epilogue_mbar_addr + ep_mbar_idx * sizeof(uint64_t);
+            uint32_t ep_mbar_addr = epilogue_mbar_addr + ep_mbar_idx * MBAR_SIZE;
             if (cta_rank == 1) {
                 ep_mbar_addr = map_smem_addr_to_cta_rank(ep_mbar_addr, 0);
             }
             mbarrier_arrive(ep_mbar_addr);
 
             const int smem_row = ep_warp_id * 32 + lane_id;
-            constexpr int TMA_BUFFER_COLS = 8; // 8 cols = 32 bytes for 32B swizzle
+            constexpr int TMA_BUFFER_COLS = 8;
             constexpr int smem_stride = TMA_BUFFER_COLS;
-            constexpr int NUM_TMA_CHUNKS = TMEM_COLS_PER_LOAD / TMA_STORE_COLS; // 128 / 32 = 4 chunks
-            constexpr int NUM_SUB_CHUNKS = TMA_STORE_COLS / TMA_BUFFER_COLS; // 32 / 8 = 4 sub-chunks
+            constexpr int NUM_TMA_CHUNKS = TMEM_COLS_PER_LOAD / TMA_STORE_COLS;
+            constexpr int NUM_SUB_CHUNKS = TMA_STORE_COLS / TMA_BUFFER_COLS;
             constexpr int BUFFER_SIZE = BM * TMA_BUFFER_COLS * sizeof(float);
 
             #pragma unroll
             for (int chunk = 0; chunk < NUM_TMA_CHUNKS; chunk++) {
                 #pragma unroll
                 for (int sub = 0; sub < NUM_SUB_CHUNKS; sub++) {
-                    // wait for TMA to finish reading this buffer
                     if (ep_warp_id == 0)
                         asm volatile(
                             "cp.async.bulk.wait_group.read %0;"
@@ -1131,15 +1124,13 @@ void epilogue_warpgroup(
                         );
                     warpgroup_sync();
 
-                    // select tma staging buffer
                     uint32_t buffer_addr = smem_tma_store_addr + sub * BUFFER_SIZE;
 
-                    // reg -> smem (4 floats per write)
                     #pragma unroll
                     for (int j = 0; j < TMA_BUFFER_COLS / 4; j++) {
                         const int reg_col = chunk * TMA_STORE_COLS + sub * TMA_BUFFER_COLS + j * 4;
                         const int smem_col = j * 4;
-                        st_shared_fp32_swizzle_32b<4>(
+                        st_shared_fp32_v4_swizzle(
                             buffer_addr,
                             smem_row,
                             smem_col,
@@ -1152,7 +1143,6 @@ void epilogue_warpgroup(
                     warpgroup_sync();
                     asm volatile("fence.proxy.async.shared::cta;");
 
-                    // issue tma
                     if (threadIdx_x == epilogue_master_thread)
                     {
                         const int c_row = block_m * BM;
@@ -1196,6 +1186,7 @@ void ws_gemm_2cta_mma(
     constexpr int SF_BK = BK / 32;
     constexpr int NUM_MMA_TMEM_BUFFERS = 2;      // two 256 col wide accumulators
     constexpr int NUM_EPILOGUE_TMEM_BUFFERS = 3; // two 256 col wide accumulators, with middle 128 cols overlapping
+    constexpr int MBAR_SIZE = sizeof(uint64_t);
 
     // get start block and group id for grid strided loop
     const int start_bid = blockIdx.x;
@@ -1221,8 +1212,6 @@ void ws_gemm_2cta_mma(
     constexpr int SMEM_SFA_SIZE = BM * SF_BK;               // for SFA each CTA gets BM rows (so 2 BMxSF_BK tiles stacked vertically)
     constexpr int SMEM_SFB_SIZE = BN * SF_BK;               // for SFB, full BN cols must be duplicated on both CTAs
     constexpr int SMEM_QUEUE_SIZE = QUEUE_SIZE * (SMEM_A_SIZE + SMEM_B_SIZE + SMEM_SFA_SIZE + SMEM_SFB_SIZE);
-    constexpr int TMA_BUFFER_COLS = 8; // 8 cols = 32 bytes for 32B swizzle
-    constexpr int NUM_TMA_BUFFERS = 4; // 4 buffers of 8 cols each = 32 cols total
     constexpr int SMEM_TMA_STORE_SIZE = BM * TMA_STORE_COLS * sizeof(float);
 
     // calculate start offset for each smem buffer
@@ -1230,10 +1219,10 @@ void ws_gemm_2cta_mma(
     constexpr int SMEM_TMA_STORE_OFFSET = 0;
     constexpr int SMEM_QUEUE_OFFSET = SMEM_TMA_STORE_SIZE;
     constexpr int SMEM_FULL_MBAR_OFFSET = SMEM_QUEUE_OFFSET + SMEM_QUEUE_SIZE;
-    constexpr int SMEM_EMPTY_MBAR_OFFSET = SMEM_FULL_MBAR_OFFSET + QUEUE_SIZE * sizeof(uint64_t);
-    constexpr int SMEM_MMA_MBAR_OFFSET = SMEM_EMPTY_MBAR_OFFSET + QUEUE_SIZE * sizeof(uint64_t);
-    constexpr int SMEM_EPILOGUE_MBAR_OFFSET = SMEM_MMA_MBAR_OFFSET + NUM_MMA_TMEM_BUFFERS * sizeof(uint64_t);
-    constexpr int TMEM_ADDR_OFFSET = SMEM_EPILOGUE_MBAR_OFFSET + NUM_EPILOGUE_TMEM_BUFFERS * sizeof(uint64_t);
+    constexpr int SMEM_EMPTY_MBAR_OFFSET = SMEM_FULL_MBAR_OFFSET + QUEUE_SIZE * MBAR_SIZE;
+    constexpr int SMEM_MMA_MBAR_OFFSET = SMEM_EMPTY_MBAR_OFFSET + QUEUE_SIZE * MBAR_SIZE;
+    constexpr int SMEM_EPILOGUE_MBAR_OFFSET = SMEM_MMA_MBAR_OFFSET + NUM_MMA_TMEM_BUFFERS * MBAR_SIZE;
+    constexpr int TMEM_ADDR_OFFSET = SMEM_EPILOGUE_MBAR_OFFSET + NUM_EPILOGUE_TMEM_BUFFERS * MBAR_SIZE;
 
     // get shared addrs for staging buffers and mbars - used for mapping to peer CTA for DSMEM access
     uint32_t smem_tma_store_addr = smem + SMEM_TMA_STORE_OFFSET;
