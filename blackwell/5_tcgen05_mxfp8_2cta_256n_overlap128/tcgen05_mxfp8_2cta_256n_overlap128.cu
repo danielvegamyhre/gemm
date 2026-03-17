@@ -771,13 +771,11 @@ void consumer_warp(
     constexpr int CTA_GROUP_SIZE = 2;
     constexpr int TMEM_BUFFERS = 2;
     constexpr int NUM_EPILOGUE_MBARS = 3; // we'll have 1 mbar per 128 cols of tmem accum to support accumlators sharing/overlapping 128 cols
-    constexpr int NUM_MMA_MBARS = TMEM_BUFFERS;
     constexpr int SF_BK = BK / 32;
     constexpr int SMEM_A_SIZE = BM * BK;
     constexpr int SMEM_B_SIZE = (BN / CTA_GROUP_SIZE) * BK;
     constexpr int SMEM_SFA_SIZE = BM * SF_BK;
     constexpr int SMEM_SFB_SIZE = BN * SF_BK;
-    constexpr int MBAR_SIZE = sizeof(uint64_t);
 
     int mma_smem_buf = 0;
     int mma_tmem_buf = 0; // for 256 col wide accumulator
@@ -934,7 +932,6 @@ void epilogue_warpgroup(
 ) {
     constexpr int CTA_GROUP_SIZE = 2;
     constexpr int TMEM_COLS_PER_LOAD = 128;
-    constexpr int NUM_EPILOGUE_TMEM_BUFFERS = 3;  // two 256 col wide accum buffers, with middle 128 cols overlapping = 3 128 col buffers
     constexpr int NUM_MMA_TMEM_BUFFERS = 2;
 
     int mma_tmem_buf = 0;
@@ -1328,7 +1325,7 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     // use hilbert curve only for square outputs whose dims are powers of 2
     const bool m_power_of_2 = M > 0 && (M & (M - 1)) == 0;
     const bool n_power_of_2 = N > 0 && (N & (N - 1)) == 0;
-    const bool use_hilbert = (M == N) && m_power_of_2 && n_power_of_2; 
+    const bool use_hilbert = (M >= 8192 && N >= 8192) && m_power_of_2 && n_power_of_2; 
 
     if (use_hilbert) 
     {

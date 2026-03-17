@@ -568,7 +568,7 @@ __device__ __forceinline__ void st_shared_fp32_v4_swizzle(
     int chunk_idx = col / 4;
     int chunk_offset = col % 4;
 
-    int swizzled_chunk = chunk_idx ^ ((row >> 2) & 1);
+    int swizzled_chunk = chunk_idx ^ ((row >> 2) & 1); // rotate 16b chunks every 4 rows
 
     int col_swizzled = swizzled_chunk * 4 + chunk_offset;
 
@@ -1048,7 +1048,6 @@ void epilogue_warpgroup(
 
     constexpr int CTA_GROUP_SIZE = 2;
     constexpr int TMEM_COLS_PER_LOAD = 128;
-    constexpr int NUM_EPILOGUE_TMEM_BUFFERS = 3;  // two 256 col wide accum buffers, with middle 128 cols overlapping = 3 128 col buffers
     constexpr int NUM_MMA_TMEM_BUFFERS = 2;
     constexpr int MBAR_SIZE = sizeof(uint64_t);
 
@@ -1521,7 +1520,7 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     // use hilbert curve only for square outputs whose dims are powers of 2
     const bool m_power_of_2 = M > 0 && (M & (M - 1)) == 0;
     const bool n_power_of_2 = N > 0 && (N & (N - 1)) == 0;
-    const bool use_hilbert = (M == N) && m_power_of_2 && n_power_of_2; 
+    const bool use_hilbert = (M >= 8192 && N >= 8192) && m_power_of_2 && n_power_of_2; 
 
     if (use_hilbert) 
     {
