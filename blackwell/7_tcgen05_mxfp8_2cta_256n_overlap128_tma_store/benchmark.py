@@ -12,6 +12,7 @@ custom_gemm = load(
     ],
     extra_cuda_cflags=[
         "-O3",
+        "-lineinfo",
         "--use_fast_math",
         "-gencode=arch=compute_100a,code=sm_100a",
         "--ptxas-options=-v",

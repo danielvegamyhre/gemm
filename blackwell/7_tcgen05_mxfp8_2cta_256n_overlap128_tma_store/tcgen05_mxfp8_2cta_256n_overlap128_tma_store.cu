@@ -589,11 +589,11 @@ __device__ __forceinline__ void st_shared_fp32_swizzle_64b(
                   "VECTOR_SIZE must be 1, 2, 4, or 8");
 
     // swizzle: swizzle 16B chunks within 64B span
-    // formula: col ^= row % (64 / 16) = row % 4
+    // formula: rotate chunks every 2 rows for 64B swizzle
 
     int chunk_idx = col / 4;
     int chunk_offset = col % 4;
-    int swizzled_chunk = chunk_idx ^ (row & 3);
+    int swizzled_chunk = chunk_idx ^ ((row >> 1) & 3);  // rotate every 2 rows
     int col_swizzled = swizzled_chunk * 4 + chunk_offset;
 
     uint32_t addr = smem_base_addr + row * stride * sizeof(float) + col_swizzled * sizeof(float);
@@ -1026,7 +1026,7 @@ void consumer_warp(
     }
 }
 
-template<bool USE_HILBERT, int BM, int BN, int ACCUM_OVERLAP_COLS, int TMA_STORE_COLS>
+template<bool USE_HILBERT, int BM, int BN, int ACCUM_OVERLAP_COLS, int TMA_STORE_COLS, int SWIZZLE_BYTES>
 __device__ __noinline__
 void epilogue_warpgroup(
     const CUtensorMap* c_map,
@@ -1104,7 +1104,7 @@ void epilogue_warpgroup(
             mbarrier_arrive(ep_mbar_addr);
 
             const int smem_row = ep_warp_id * 32 + lane_id;
-            constexpr int TMA_BUFFER_COLS = 8;
+            constexpr int TMA_BUFFER_COLS = SWIZZLE_BYTES / sizeof(float);
             constexpr int smem_stride = TMA_BUFFER_COLS;
             constexpr int NUM_TMA_CHUNKS = TMEM_COLS_PER_LOAD / TMA_STORE_COLS;
             constexpr int NUM_SUB_CHUNKS = TMA_STORE_COLS / TMA_BUFFER_COLS;
@@ -1129,13 +1129,32 @@ void epilogue_warpgroup(
                     for (int j = 0; j < TMA_BUFFER_COLS / 4; j++) {
                         const int reg_col = chunk * TMA_STORE_COLS + sub * TMA_BUFFER_COLS + j * 4;
                         const int smem_col = j * 4;
-                        st_shared_fp32_v4_swizzle(
-                            buffer_addr,
-                            smem_row,
-                            smem_col,
-                            smem_stride,
-                            &c_reg[reg_col]
-                        );
+
+                        if constexpr (SWIZZLE_BYTES == 32) {
+                            st_shared_fp32_v4_swizzle(
+                                buffer_addr,
+                                smem_row,
+                                smem_col,
+                                smem_stride,
+                                &c_reg[reg_col]
+                            );
+                        } else if constexpr (SWIZZLE_BYTES == 64) {
+                            st_shared_fp32_swizzle_64b<4>(
+                                buffer_addr,
+                                smem_row,
+                                smem_col,
+                                smem_stride,
+                                &c_reg[reg_col]
+                            );
+                        } else if constexpr (SWIZZLE_BYTES == 128) {
+                            st_shared_fp32_swizzle_128b<4>(
+                                buffer_addr,
+                                smem_row,
+                                smem_col,
+                                smem_stride,
+                                &c_reg[reg_col]
+                            );
+                        }
                     }
 
                     // ensure writes visible to tma
@@ -1166,7 +1185,8 @@ template<
     int MMA_M = 128,
     int MMA_N = 256,
     int MMA_K = 32,
-    int TMA_STORE_COLS = 32
+    int TMA_STORE_COLS = 32,
+    int SWIZZLE_BYTES = 64
 >
 __global__
 __cluster_dims__(2, 1, 1)  // threadblock cluster for 2 cta mma
@@ -1305,7 +1325,7 @@ void ws_gemm_2cta_mma(
     }
     else if (warpgroup_id == EPILOGUE_WARPGROUP_ID)
     {
-        epilogue_warpgroup<USE_HILBERT, BM, BN, ACCUM_OVERLAP_COLS, TMA_STORE_COLS>(
+        epilogue_warpgroup<USE_HILBERT, BM, BN, ACCUM_OVERLAP_COLS, TMA_STORE_COLS, SWIZZLE_BYTES>(
             &c_map, N, start_bid, start_group_id, num_groups, total_groups,
             cta_rank, grid_m, grid_n, threadIdx.x,
             mma_mbar_addr, epilogue_mbar_addr, smem_tma_store_addr
@@ -1333,6 +1353,9 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     constexpr int MMA_M = 128;
     constexpr int MMA_N = 256;
     constexpr int MMA_K = 32;
+
+    // TMA swizzle mode: 32, 64, or 128 bytes
+    constexpr int SWIZZLE_BYTES = 128;
 
     assert(BM == MMA_M);
     assert(BN == MMA_N);
@@ -1443,10 +1466,19 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
 
     alignas(128) CUtensorMap c_map = {};
     constexpr int TMA_STORE_COLS = 32;
-    constexpr int TMA_BUFFER_COLS = 8;  // 8 cols = 32 bytes for 32B swizzle
+    constexpr int TMA_BUFFER_COLS = SWIZZLE_BYTES / sizeof(float);
+
+    CUtensorMapSwizzle c_swizzle_mode;
+    if constexpr (SWIZZLE_BYTES == 32) {
+        c_swizzle_mode = CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_32B;
+    } else if constexpr (SWIZZLE_BYTES == 64) {
+        c_swizzle_mode = CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B;
+    } else if constexpr (SWIZZLE_BYTES == 128) {
+        c_swizzle_mode = CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B;
+    }
 
     uint64_t c_global_dims[2] = {(uint64_t)N, (uint64_t)M};
-    uint32_t c_smem_dims[2] = {TMA_BUFFER_COLS, BM};  // 8 x 128
+    uint32_t c_smem_dims[2] = {TMA_BUFFER_COLS, BM};
     uint32_t c_strides[1] = {(uint32_t)(N * sizeof(float))};
     create_2d_tensor_map(
         C,
@@ -1454,7 +1486,7 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
         c_global_dims,
         c_smem_dims,
         c_strides,
-        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_32B,
+        c_swizzle_mode,
         CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT32
     );
 
@@ -1522,9 +1554,9 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     const bool n_power_of_2 = N > 0 && (N & (N - 1)) == 0;
     const bool use_hilbert = (M >= 8192 && N >= 8192) && m_power_of_2 && n_power_of_2; 
 
-    if (use_hilbert) 
+    if (use_hilbert)
     {
-        auto kernel = ws_gemm_2cta_mma<true, QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K, TMA_STORE_COLS>;
+        auto kernel = ws_gemm_2cta_mma<true, QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K, TMA_STORE_COLS, SWIZZLE_BYTES>;
         CUDA_CHECK(cudaFuncSetAttribute(
             kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -1534,7 +1566,7 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     }
     else
     {
-        auto kernel = ws_gemm_2cta_mma<false, QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K, TMA_STORE_COLS>;
+        auto kernel = ws_gemm_2cta_mma<false, QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K, TMA_STORE_COLS, SWIZZLE_BYTES>;
         CUDA_CHECK(cudaFuncSetAttribute(
             kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
