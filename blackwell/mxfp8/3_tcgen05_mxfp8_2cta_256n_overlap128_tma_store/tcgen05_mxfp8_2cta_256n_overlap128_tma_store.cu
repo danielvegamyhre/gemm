@@ -1181,7 +1181,6 @@ void epilogue_warpgroup(
     const uint64_t* c_map_ptr = reinterpret_cast<const uint64_t*>(c_map);
 
     constexpr int CTA_GROUP_SIZE = 2;
-    constexpr int TMEM_COLS_PER_LOAD = 128;
     constexpr int NUM_MMA_TMEM_BUFFERS = 2;
     constexpr int MBAR_SIZE = sizeof(uint64_t);
 
