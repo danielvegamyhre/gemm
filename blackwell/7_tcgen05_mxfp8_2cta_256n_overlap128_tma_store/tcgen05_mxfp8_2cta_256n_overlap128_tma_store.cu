@@ -1114,6 +1114,7 @@ void epilogue_warpgroup(
             for (int chunk = 0; chunk < NUM_TMA_CHUNKS; chunk++) {
                 #pragma unroll
                 for (int sub = 0; sub < NUM_SUB_CHUNKS; sub++) {
+                    // have full warp containing epilogue master thread wait, to avoid warp divergence
                     if (ep_warp_id == 0)
                         asm volatile(
                             "cp.async.bulk.wait_group.read %0;"
