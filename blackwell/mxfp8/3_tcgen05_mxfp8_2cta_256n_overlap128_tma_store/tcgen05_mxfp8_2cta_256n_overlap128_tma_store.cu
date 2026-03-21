@@ -529,6 +529,36 @@ __device__ __forceinline__ uint32_t map_smem_addr_to_cta_rank(uint32_t shared_ad
   return mapped_addr;
 }
 
+template<int COLS, int BM, int BN>
+__device__ __forceinline__
+void process_epilogue_chunk(
+    float* C,
+    int N,
+    int c_row_base,
+    int c_col_base,
+    int tmem_addr_reg,
+    int tmem_base_row,
+    int col_offset,
+    uint32_t ep_mbar_addr,
+    uint32_t cta_rank
+) {
+    // tmem -> reg with tcgen05.ld for 32xCOLS floats
+    float c_reg[COLS];
+    tcgen05_ld_tmem_to_reg<COLS>(tmem_addr_reg, tmem_base_row, col_offset, c_reg);
+
+    // reg -> gmem with STG.256  (8 floats per write)
+    #pragma unroll
+    for (int j = 0; j < COLS / 8; j++) {
+        const int c_col = c_col_base + col_offset + j * 8;
+        st_global_256b(C + c_row_base * N + c_col, &c_reg[j * 8]);
+    }
+
+    if (cta_rank == 1) {
+        ep_mbar_addr = map_smem_addr_to_cta_rank(ep_mbar_addr, 0);
+    }
+    mbarrier_arrive(ep_mbar_addr);
+}
+
 template <int VECTOR_SIZE>
 __device__ __forceinline__ void st_shared_fp32(const uint32_t shared_addr, const float reg[VECTOR_SIZE]) {
     static_assert(VECTOR_SIZE == 1 || VECTOR_SIZE == 2 || VECTOR_SIZE == 4 || VECTOR_SIZE == 8,
@@ -621,6 +651,109 @@ __device__ __forceinline__ void st_shared_fp32_swizzle_128b(
 
     uint32_t addr = smem_base_addr + row * stride * sizeof(float) + col_swizzled * sizeof(float);
     st_shared_fp32<VECTOR_SIZE>(addr, reg);
+}
+
+
+template<int COLS, int BM, int BN, int TMA_STORE_COLS, int SWIZZLE_BYTES>
+__device__ __forceinline__
+void process_epilogue_chunk_tma(
+    const uint64_t* c_map_ptr,
+    int block_m,
+    int block_n,
+    int tmem_addr_reg,
+    int tmem_base_row,
+    int col_offset,
+    uint32_t ep_mbar_addr,
+    uint32_t cta_rank,
+    uint32_t smem_tma_store_addr,
+    int ep_warp_id,
+    int lane_id,
+    int epilogue_master_thread,
+    uint32_t threadIdx_x
+) {
+    // tmem -> reg
+    float c_reg[COLS];
+    tcgen05_ld_tmem_to_reg<COLS>(tmem_addr_reg, tmem_base_row, col_offset, c_reg);
+
+    // signal completion to mma warp
+    if (cta_rank == 1) {
+        ep_mbar_addr = map_smem_addr_to_cta_rank(ep_mbar_addr, 0);
+    }
+    mbarrier_arrive(ep_mbar_addr);
+
+    // TMA store path: reg -> smem -> TMA -> gmem
+    const int smem_row = ep_warp_id * 32 + lane_id;
+    constexpr int TMA_BUFFER_COLS = SWIZZLE_BYTES / sizeof(float);
+    constexpr int smem_stride = TMA_BUFFER_COLS;
+    constexpr int NUM_TMA_CHUNKS = COLS / TMA_STORE_COLS;
+    constexpr int NUM_SUB_CHUNKS = TMA_STORE_COLS / TMA_BUFFER_COLS;
+    constexpr int BUFFER_SIZE = BM * TMA_BUFFER_COLS * sizeof(float);
+
+    auto warpgroup_sync = []() {
+      asm volatile("bar.sync %0, %1;" :: "r"(1), "r"(128) : "memory");
+    };
+
+    #pragma unroll
+    for (int chunk = 0; chunk < NUM_TMA_CHUNKS; chunk++) {
+        #pragma unroll
+        for (int sub = 0; sub < NUM_SUB_CHUNKS; sub++) {
+            if (ep_warp_id == 0)
+                asm volatile(
+                    "cp.async.bulk.wait_group.read %0;"
+                    :
+                    : "n"(NUM_SUB_CHUNKS-1)
+                    : "memory"
+                );
+            warpgroup_sync();
+
+            uint32_t buffer_addr = smem_tma_store_addr + sub * BUFFER_SIZE;
+
+            #pragma unroll
+            for (int j = 0; j < TMA_BUFFER_COLS / 4; j++) {
+                const int reg_col = chunk * TMA_STORE_COLS + sub * TMA_BUFFER_COLS + j * 4;
+                const int smem_col = j * 4;
+
+                if constexpr (SWIZZLE_BYTES == 32) {
+                    st_shared_fp32_v4_swizzle(
+                        buffer_addr,
+                        smem_row,
+                        smem_col,
+                        smem_stride,
+                        &c_reg[reg_col]
+                    );
+                } else if constexpr (SWIZZLE_BYTES == 64) {
+                    st_shared_fp32_swizzle_64b<4>(
+                        buffer_addr,
+                        smem_row,
+                        smem_col,
+                        smem_stride,
+                        &c_reg[reg_col]
+                    );
+                } else if constexpr (SWIZZLE_BYTES == 128) {
+                    st_shared_fp32_swizzle_128b<4>(
+                        buffer_addr,
+                        smem_row,
+                        smem_col,
+                        smem_stride,
+                        &c_reg[reg_col]
+                    );
+                }
+            }
+
+            // ensure writes visible to tma
+            warpgroup_sync();
+            asm volatile("fence.proxy.async.shared::cta;");
+
+            if (threadIdx_x == epilogue_master_thread)
+            {
+                const int c_row = block_m * BM;
+                const int c_col = block_n * BN + col_offset + chunk * TMA_STORE_COLS + sub * TMA_BUFFER_COLS;
+
+                cp_async_bulk_tensor_2d_shared_to_global(c_map_ptr, c_col, c_row, buffer_addr);
+                asm volatile("cp.async.bulk.commit_group;");
+            }
+        }
+    }
 }
 
 // like __syncthreads() but for the cluster
@@ -1026,10 +1159,11 @@ void consumer_warp(
     }
 }
 
-template<bool USE_HILBERT, int BM, int BN, int ACCUM_OVERLAP_COLS, int TMA_STORE_COLS, int SWIZZLE_BYTES>
+template<bool USE_HILBERT, bool USE_TMA_STORE, int BM, int BN, int ACCUM_OVERLAP_COLS, int TMA_STORE_COLS, int SWIZZLE_BYTES>
 __device__ __noinline__
 void epilogue_warpgroup(
     const CUtensorMap* c_map,
+    float* C,
     int N,
     int start_bid,
     int start_group_id,
@@ -1080,105 +1214,38 @@ void epilogue_warpgroup(
         asm volatile("tcgen05.fence::after_thread_sync;");
 
         int tmem_addr_reg = tmem_base_addr + mma_tmem_buf * (BN - ACCUM_OVERLAP_COLS);
+        const int tmem_base_row = ep_warp_id * 32;
+        const int c_row_base = block_m * BM + ep_warp_id * 32 + lane_id;
+        const int c_col_base = block_n * BN;
 
-        #pragma unroll
-        for (int i = 0; i < BN/TMEM_COLS_PER_LOAD; i++) { // 2 total iters, i=0,1
-            float c_reg[TMEM_COLS_PER_LOAD];
-            const int tmem_base_row = ep_warp_id * 32;
-
-            // read mma 0 accum right to left; read mma 1 accum left to right
-            const int base_col_off = mma_tmem_buf == 0 ? ACCUM_OVERLAP_COLS - i * TMEM_COLS_PER_LOAD : i * TMEM_COLS_PER_LOAD;
-            tcgen05_ld_tmem_to_reg<TMEM_COLS_PER_LOAD>(tmem_addr_reg, tmem_base_row, base_col_off, c_reg);
-
-            // Global column offset - need to account for right-to-left reading for mma_tmem_buf==0
-            const int gmem_col_base = mma_tmem_buf == 0 ? (1 - i) * TMEM_COLS_PER_LOAD : i * TMEM_COLS_PER_LOAD;
-
-            // signal completion to mma warp
-            // for mma buf 0, select 1 then 0 (right to left)
-            // for mma buf 1, select 1 then 2 (left to right)
-            const int ep_mbar_idx = (mma_tmem_buf == 0) ? 1 - i : 1 + i;
-            uint32_t ep_mbar_addr = epilogue_mbar_addr + ep_mbar_idx * MBAR_SIZE;
-            if (cta_rank == 1) {
-                ep_mbar_addr = map_smem_addr_to_cta_rank(ep_mbar_addr, 0);
+        // MMA buf 0: [128, 128] at offsets [0, 128], process right to left -> mbars 1, 0
+        // MMA buf 1: [128, 128] at offsets [0, 128], process left to right -> mbars 1, 2
+        if constexpr (USE_TMA_STORE) {
+            if (mma_tmem_buf == 0) {
+                process_epilogue_chunk_tma<128, BM, BN, TMA_STORE_COLS, SWIZZLE_BYTES>(c_map_ptr, block_m, block_n, tmem_addr_reg, tmem_base_row, 128, epilogue_mbar_addr + 1 * MBAR_SIZE, cta_rank, smem_tma_store_addr, ep_warp_id, lane_id, epilogue_master_thread, threadIdx_x);
+                process_epilogue_chunk_tma<128, BM, BN, TMA_STORE_COLS, SWIZZLE_BYTES>(c_map_ptr, block_m, block_n, tmem_addr_reg, tmem_base_row, 0, epilogue_mbar_addr + 0 * MBAR_SIZE, cta_rank, smem_tma_store_addr, ep_warp_id, lane_id, epilogue_master_thread, threadIdx_x);
+            } else {
+                process_epilogue_chunk_tma<128, BM, BN, TMA_STORE_COLS, SWIZZLE_BYTES>(c_map_ptr, block_m, block_n, tmem_addr_reg, tmem_base_row, 0, epilogue_mbar_addr + 1 * MBAR_SIZE, cta_rank, smem_tma_store_addr, ep_warp_id, lane_id, epilogue_master_thread, threadIdx_x);
+                process_epilogue_chunk_tma<128, BM, BN, TMA_STORE_COLS, SWIZZLE_BYTES>(c_map_ptr, block_m, block_n, tmem_addr_reg, tmem_base_row, 128, epilogue_mbar_addr + 2 * MBAR_SIZE, cta_rank, smem_tma_store_addr, ep_warp_id, lane_id, epilogue_master_thread, threadIdx_x);
             }
-            mbarrier_arrive(ep_mbar_addr);
-
-            const int smem_row = ep_warp_id * 32 + lane_id;
-            constexpr int TMA_BUFFER_COLS = SWIZZLE_BYTES / sizeof(float);
-            constexpr int smem_stride = TMA_BUFFER_COLS;
-            constexpr int NUM_TMA_CHUNKS = TMEM_COLS_PER_LOAD / TMA_STORE_COLS;
-            constexpr int NUM_SUB_CHUNKS = TMA_STORE_COLS / TMA_BUFFER_COLS;
-            constexpr int BUFFER_SIZE = BM * TMA_BUFFER_COLS * sizeof(float);
-
-            #pragma unroll
-            for (int chunk = 0; chunk < NUM_TMA_CHUNKS; chunk++) {
-                #pragma unroll
-                for (int sub = 0; sub < NUM_SUB_CHUNKS; sub++) {
-                    // have full warp containing epilogue master thread wait, to avoid warp divergence
-                    if (ep_warp_id == 0)
-                        asm volatile(
-                            "cp.async.bulk.wait_group.read %0;"
-                            :
-                            : "n"(NUM_SUB_CHUNKS-1)
-                            : "memory"
-                        );
-                    warpgroup_sync();
-
-                    uint32_t buffer_addr = smem_tma_store_addr + sub * BUFFER_SIZE;
-
-                    #pragma unroll
-                    for (int j = 0; j < TMA_BUFFER_COLS / 4; j++) {
-                        const int reg_col = chunk * TMA_STORE_COLS + sub * TMA_BUFFER_COLS + j * 4;
-                        const int smem_col = j * 4;
-
-                        if constexpr (SWIZZLE_BYTES == 32) {
-                            st_shared_fp32_v4_swizzle(
-                                buffer_addr,
-                                smem_row,
-                                smem_col,
-                                smem_stride,
-                                &c_reg[reg_col]
-                            );
-                        } else if constexpr (SWIZZLE_BYTES == 64) {
-                            st_shared_fp32_swizzle_64b<4>(
-                                buffer_addr,
-                                smem_row,
-                                smem_col,
-                                smem_stride,
-                                &c_reg[reg_col]
-                            );
-                        } else if constexpr (SWIZZLE_BYTES == 128) {
-                            st_shared_fp32_swizzle_128b<4>(
-                                buffer_addr,
-                                smem_row,
-                                smem_col,
-                                smem_stride,
-                                &c_reg[reg_col]
-                            );
-                        }
-                    }
-
-                    // ensure writes visible to tma
-                    warpgroup_sync();
-                    asm volatile("fence.proxy.async.shared::cta;");
-
-                    if (threadIdx_x == epilogue_master_thread)
-                    {
-                        const int c_row = block_m * BM;
-                        const int c_col = block_n * BN + gmem_col_base + chunk * TMA_STORE_COLS + sub * TMA_BUFFER_COLS;
-
-                        cp_async_bulk_tensor_2d_shared_to_global(c_map_ptr, c_col, c_row, buffer_addr);
-                        asm volatile("cp.async.bulk.commit_group;");
-                    }
-                }
+        } else {
+            // Direct global store path
+            if (mma_tmem_buf == 0) {
+                process_epilogue_chunk<128, BM, BN>(C, N, c_row_base, c_col_base, tmem_addr_reg, tmem_base_row, 128, epilogue_mbar_addr + 1 * MBAR_SIZE, cta_rank);
+                process_epilogue_chunk<128, BM, BN>(C, N, c_row_base, c_col_base, tmem_addr_reg, tmem_base_row, 0, epilogue_mbar_addr + 0 * MBAR_SIZE, cta_rank);
+            } else {
+                process_epilogue_chunk<128, BM, BN>(C, N, c_row_base, c_col_base, tmem_addr_reg, tmem_base_row, 0, epilogue_mbar_addr + 1 * MBAR_SIZE, cta_rank);
+                process_epilogue_chunk<128, BM, BN>(C, N, c_row_base, c_col_base, tmem_addr_reg, tmem_base_row, 128, epilogue_mbar_addr + 2 * MBAR_SIZE, cta_rank);
             }
         }
+
         mma_tmem_buf = (mma_tmem_buf + 1) % NUM_MMA_TMEM_BUFFERS;
     }
 }
 
 template<
     bool USE_HILBERT,
+    bool USE_TMA_STORE,
     int QUEUE_SIZE,
     int BM = 128,
     int BN = 256,
@@ -1187,7 +1254,7 @@ template<
     int MMA_N = 256,
     int MMA_K = 32,
     int TMA_STORE_COLS = 32,
-    int SWIZZLE_BYTES = 64
+    int SWIZZLE_BYTES = 128
 >
 __global__
 __cluster_dims__(2, 1, 1)  // threadblock cluster for 2 cta mma
@@ -1326,8 +1393,8 @@ void ws_gemm_2cta_mma(
     }
     else if (warpgroup_id == EPILOGUE_WARPGROUP_ID)
     {
-        epilogue_warpgroup<USE_HILBERT, BM, BN, ACCUM_OVERLAP_COLS, TMA_STORE_COLS, SWIZZLE_BYTES>(
-            &c_map, N, start_bid, start_group_id, num_groups, total_groups,
+        epilogue_warpgroup<USE_HILBERT, USE_TMA_STORE, BM, BN, ACCUM_OVERLAP_COLS, TMA_STORE_COLS, SWIZZLE_BYTES>(
+            &c_map, C, N, start_bid, start_group_id, num_groups, total_groups,
             cta_rank, grid_m, grid_n, threadIdx.x,
             mma_mbar_addr, epilogue_mbar_addr, smem_tma_store_addr
         );
@@ -1553,11 +1620,34 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     // use hilbert curve only for square outputs whose dims are powers of 2
     const bool m_power_of_2 = M > 0 && (M & (M - 1)) == 0;
     const bool n_power_of_2 = N > 0 && (N & (N - 1)) == 0;
-    const bool use_hilbert = (M >= 8192 && N >= 8192) && m_power_of_2 && n_power_of_2; 
+    const bool use_hilbert = (M >= 8192 && N >= 8192) && m_power_of_2 && n_power_of_2;
 
-    if (use_hilbert)
+    // use TMA stores for large problems, otherwise use direct st_global_256b
+    const bool use_tma_store = (M >= 8192 && N >= 8192 && K >= 8192);
+
+    if (use_hilbert && use_tma_store)
     {
-        auto kernel = ws_gemm_2cta_mma<true, QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K, TMA_STORE_COLS, SWIZZLE_BYTES>;
+        auto kernel = ws_gemm_2cta_mma<true, true, QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K, TMA_STORE_COLS, SWIZZLE_BYTES>;
+        CUDA_CHECK(cudaFuncSetAttribute(
+            kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            total_smem
+        ));
+        kernel<<<grid_dim, block_dim, total_smem>>>(a_map, b_map, sfa_map, sfb_map, c_map, c_ptr, M, N, K);
+    }
+    else if (use_hilbert && !use_tma_store)
+    {
+        auto kernel = ws_gemm_2cta_mma<true, false, QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K, TMA_STORE_COLS, SWIZZLE_BYTES>;
+        CUDA_CHECK(cudaFuncSetAttribute(
+            kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            total_smem
+        ));
+        kernel<<<grid_dim, block_dim, total_smem>>>(a_map, b_map, sfa_map, sfb_map, c_map, c_ptr, M, N, K);
+    }
+    else if (!use_hilbert && use_tma_store)
+    {
+        auto kernel = ws_gemm_2cta_mma<false, true, QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K, TMA_STORE_COLS, SWIZZLE_BYTES>;
         CUDA_CHECK(cudaFuncSetAttribute(
             kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -1567,7 +1657,7 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     }
     else
     {
-        auto kernel = ws_gemm_2cta_mma<false, QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K, TMA_STORE_COLS, SWIZZLE_BYTES>;
+        auto kernel = ws_gemm_2cta_mma<false, false, QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K, TMA_STORE_COLS, SWIZZLE_BYTES>;
         CUDA_CHECK(cudaFuncSetAttribute(
             kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize,

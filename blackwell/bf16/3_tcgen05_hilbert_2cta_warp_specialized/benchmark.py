@@ -1,21 +1,25 @@
 import torch
 from torch.utils.cpp_extension import load
 from triton.testing import do_bench
+import subprocess
 
 custom_gemm = load(
-    name='tcgen05_2cta_mma_warp_specialized',
-    sources=['tcgen05_2cta_mma_warp_specialized.cpp', 'tcgen05_2cta_mma_warp_specialized.cu'],
-    extra_cuda_cflags=['-O3', '--use_fast_math', '-gencode=arch=compute_100a,code=sm_100a'],
+    name='tcgen05_hilbert_2cta_warp_specialized',
+    sources=['tcgen05_hilbert_2cta_warp_specialized.cpp', 'tcgen05_hilbert_2cta_warp_specialized.cu'],
+    extra_cuda_cflags=['-O3', '--use_fast_math', '-gencode=arch=compute_100a,code=sm_100a', '--ptxas-options=-v'],
     extra_cflags=['-O3'],
-    verbose=False
+    verbose=True
 )
 
 def benchmark():
-    def benchmark_cuda_function_in_microseconds(f, *args, **kwargs):
-        return do_bench(lambda: f(*args, **kwargs), return_mode="median") * 1e3
+    WARMUP = 50
+    REP = 500
 
     sizes = [
+        (2048, 2048, 2048),
         (4096, 4096, 4096),
+        (8192, 8192, 8192),
+        (16384, 16384, 16384),
     ]
 
     for M, K, N in sizes:
@@ -26,28 +30,14 @@ def benchmark():
         B = torch.randn(N, K, device='cuda', dtype=torch.bfloat16)
         C = torch.zeros(M, N, device='cuda', dtype=torch.float32)
 
-        # Warmup
-        for _ in range(5):
-            custom_gemm.gemm_cuda(A, B.t(), C)
-        torch.cuda.synchronize()
-
         # Benchmark custom kernel
-        custom_us = benchmark_cuda_function_in_microseconds(
-            custom_gemm.gemm_cuda,
-            A,
-            B.t(),
-            C,
-        )
+        torch.cuda.synchronize()
+        custom_us = do_bench(lambda: custom_gemm.gemm_cuda(A, B.t(), C), warmup=WARMUP, rep=REP, return_mode="median") * 1e3
 
         # Benchmark PyTorch
         out = torch.zeros(M, N, device="cuda", dtype=torch.float32)
-        torch_us = benchmark_cuda_function_in_microseconds(
-            torch.mm,
-            A,
-            B.t(),
-            out_dtype=torch.float32,
-            out=out,
-        )
+        torch.cuda.synchronize()
+        torch_us = do_bench(lambda: torch.mm(A, B.t(), out_dtype=out.dtype, out=out), warmup=WARMUP, rep=REP, return_mode="median") * 1e3
 
         # Calculate tflops
         flops = 2.0 * M * N * K

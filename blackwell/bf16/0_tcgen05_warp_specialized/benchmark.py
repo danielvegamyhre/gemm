@@ -14,7 +14,12 @@ def benchmark():
     def benchmark_cuda_function_in_microseconds(f, *args, **kwargs):
         return do_bench(lambda: f(*args, **kwargs), return_mode="median") * 1e3
 
-    sizes = [(4096, 4096, 4096)]
+    sizes = [
+        (2048, 2048, 2048),
+        (4096, 4096, 4096),
+        (8192, 8192, 8192),
+        (16384, 16384, 16384),
+    ]
 
     for M, K, N in sizes:
         print(f"\nMatrix size: M={M}, K={K}, N={N}")
