@@ -931,8 +931,6 @@ void consumer_warp(
 ) {
     constexpr int CTA_GROUP_SIZE = 2;
     constexpr int TMEM_BUFFERS = 2;
-    constexpr int NUM_EPILOGUE_MBARS = 5; // 5 epilogue mbars for chunks: 128, 64, 64, 64, 128
-    constexpr int NUM_MMA_MBARS = TMEM_BUFFERS;
     constexpr int SF_BK = BK / 32;
     constexpr int SMEM_A_SIZE = BM * BK;
     constexpr int SMEM_B_SIZE = (BN / CTA_GROUP_SIZE) * BK;
@@ -1629,7 +1627,7 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     constexpr int TMEM_WIDTH = (2 * BN - ACCUM_OVERLAP_COLS) + 2 * (SFA_TMEM_COLS + SFB_TMEM_COLS);
 
     // TMEM allocation must be power of 2
-    constexpr int TMEM_WIDTH_ROUNDED = 512; // 1 << (32 - __builtin_clz(TMEM_WIDTH - 1));
+    constexpr int TMEM_WIDTH_ROUNDED = 1 << (32 - __builtin_clz(TMEM_WIDTH - 1));
     assert(TMEM_WIDTH_ROUNDED <= tmem_width_cells);
 
 
