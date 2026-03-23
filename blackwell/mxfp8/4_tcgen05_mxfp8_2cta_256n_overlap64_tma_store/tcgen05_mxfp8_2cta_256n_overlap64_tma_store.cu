@@ -1675,7 +1675,7 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     // use hilbert curve only for square outputs whose dims are powers of 2
     const bool m_power_of_2 = M > 0 && (M & (M - 1)) == 0;
     const bool n_power_of_2 = N > 0 && (N & (N - 1)) == 0;
-    const bool use_hilbert = (M >= 8192 && N >= 8192) && m_power_of_2 && n_power_of_2;
+    const bool use_hilbert = m_power_of_2 && n_power_of_2;
 
     // use TMA stores for large problems, otherwise use direct st_global_256b
     const bool use_tma_store = (M >= 8192 && N >= 8192 && K >= 8192);
