@@ -1612,7 +1612,11 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     constexpr int QUEUE_SIZE = (max_smem_per_sm - smem_tma_store - tmem_addr_size - mma_mbar_size - epilogue_mbar_size) / total_smem_per_stage;
     constexpr int total_smem = total_smem_per_stage * QUEUE_SIZE + mma_mbar_size + epilogue_mbar_size + tmem_addr_size + smem_tma_store;
 
-    const int launch_blocks = 148;
+    // calculate grid dims
+    const int grid_m = M / BM;
+    const int grid_n = N / BN;
+    const int total_blocks = grid_m * grid_n;
+    const int launch_blocks = std::min(total_blocks, NUM_SMS);
     dim3 grid_dim(launch_blocks);
     dim3 block_dim(BLOCK_SIZE);
 

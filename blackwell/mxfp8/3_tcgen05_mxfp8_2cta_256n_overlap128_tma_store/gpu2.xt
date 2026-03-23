@@ -1,0 +1,76 @@
+[1/2] /usr/local/cuda-13.0/bin/nvcc -MD -MF tcgen05_mxfp8_2cta_256n_overlap128_tma_store.cuda.o.d -DTORCH_EXTENSION_NAME=tcgen05_mxfp8_2cta_256n_overlap128_tma_store -DTORCH_API_INCLUDE_EXTENSION_H -isystem /home/dev/.conda/envs/torch/lib/python3.13/site-packages/torch/include -isystem /home/dev/.conda/envs/torch/lib/python3.13/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda-13.0/include -isystem /home/dev/.conda/envs/torch/include/python3.13 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options '-fPIC' -O3 -lineinfo --use_fast_math -gencode=arch=compute_100a,code=sm_100a --ptxas-options=-v -std=c++20 -c /home/dev/gemm/blackwell/mxfp8/3_tcgen05_mxfp8_2cta_256n_overlap128_tma_store/tcgen05_mxfp8_2cta_256n_overlap128_tma_store.cu -o tcgen05_mxfp8_2cta_256n_overlap128_tma_store.cuda.o 
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z16ws_gemm_2cta_mmaILb0ELb0ELi3ELi128ELi256ELi256ELi128ELi256ELi32ELi32ELi128EEv14CUtensorMap_stS0_S0_S0_S0_Pfiii' for 'sm_100a'
+ptxas info    : Function properties for _Z16ws_gemm_2cta_mmaILb0ELb0ELi3ELi128ELi256ELi256ELi128ELi256ELi32ELi32ELi128EEv14CUtensorMap_stS0_S0_S0_S0_Pfiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 202 registers, used 0 barriers
+ptxas info    : Compile time = 53.638 ms
+ptxas info    : Function properties for _Z13consumer_warpILi3ELi128ELi256ELi256ELi128ELi256ELi32ELi8ELi16ELi128ELi32EEviiiijjjjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _Z13producer_warpILb0ELi3ELi128ELi256ELi256ELi32EEvPK14CUtensorMap_stS2_S2_S2_iiiiijiijjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _Z18epilogue_warpgroupILb0ELb0ELi128ELi256ELi128ELi32ELi128EEvPK14CUtensorMap_stPfiiiiijiijjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function '_Z16ws_gemm_2cta_mmaILb0ELb1ELi3ELi128ELi256ELi256ELi128ELi256ELi32ELi32ELi128EEv14CUtensorMap_stS0_S0_S0_S0_Pfiii' for 'sm_100a'
+ptxas info    : Function properties for _Z16ws_gemm_2cta_mmaILb0ELb1ELi3ELi128ELi256ELi256ELi128ELi256ELi32ELi32ELi128EEv14CUtensorMap_stS0_S0_S0_S0_Pfiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 155 registers, used 2 barriers
+ptxas info    : Compile time = 55.198 ms
+ptxas info    : Function properties for _Z13consumer_warpILi3ELi128ELi256ELi256ELi128ELi256ELi32ELi8ELi16ELi128ELi32EEviiiijjjjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _Z13producer_warpILb0ELi3ELi128ELi256ELi256ELi32EEvPK14CUtensorMap_stS2_S2_S2_iiiiijiijjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _Z18epilogue_warpgroupILb0ELb1ELi128ELi256ELi128ELi32ELi128EEvPK14CUtensorMap_stPfiiiiijiijjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function '_Z16ws_gemm_2cta_mmaILb1ELb0ELi3ELi128ELi256ELi256ELi128ELi256ELi32ELi32ELi128EEv14CUtensorMap_stS0_S0_S0_S0_Pfiii' for 'sm_100a'
+ptxas info    : Function properties for _Z16ws_gemm_2cta_mmaILb1ELb0ELi3ELi128ELi256ELi256ELi128ELi256ELi32ELi32ELi128EEv14CUtensorMap_stS0_S0_S0_S0_Pfiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 206 registers, used 0 barriers
+ptxas info    : Compile time = 54.547 ms
+ptxas info    : Function properties for _Z13consumer_warpILi3ELi128ELi256ELi256ELi128ELi256ELi32ELi8ELi16ELi128ELi32EEviiiijjjjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _Z13producer_warpILb1ELi3ELi128ELi256ELi256ELi32EEvPK14CUtensorMap_stS2_S2_S2_iiiiijiijjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _Z18epilogue_warpgroupILb1ELb0ELi128ELi256ELi128ELi32ELi128EEvPK14CUtensorMap_stPfiiiiijiijjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function '_Z16ws_gemm_2cta_mmaILb1ELb1ELi3ELi128ELi256ELi256ELi128ELi256ELi32ELi32ELi128EEv14CUtensorMap_stS0_S0_S0_S0_Pfiii' for 'sm_100a'
+ptxas info    : Function properties for _Z16ws_gemm_2cta_mmaILb1ELb1ELi3ELi128ELi256ELi256ELi128ELi256ELi32ELi32ELi128EEv14CUtensorMap_stS0_S0_S0_S0_Pfiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 159 registers, used 2 barriers
+ptxas info    : Compile time = 59.965 ms
+ptxas info    : Function properties for _Z13consumer_warpILi3ELi128ELi256ELi256ELi128ELi256ELi32ELi8ELi16ELi128ELi32EEviiiijjjjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _Z13producer_warpILb1ELi3ELi128ELi256ELi256ELi32EEvPK14CUtensorMap_stS2_S2_S2_iiiiijiijjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _Z18epilogue_warpgroupILb1ELb1ELi128ELi256ELi128ELi32ELi128EEvPK14CUtensorMap_stPfiiiiijiijjjj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+/home/dev/gemm/blackwell/mxfp8/3_tcgen05_mxfp8_2cta_256n_overlap128_tma_store/tcgen05_mxfp8_2cta_256n_overlap128_tma_store.cu: In function ‘void* get_driver_ptr()’:
+/home/dev/gemm/blackwell/mxfp8/3_tcgen05_mxfp8_2cta_256n_overlap128_tma_store/tcgen05_mxfp8_2cta_256n_overlap128_tma_store.cu:33:40: warning: ‘cudaError_t cudaGetDriverEntryPoint(const char*, void**, long long unsigned int, cudaDriverEntryPointQueryResult*)’ is deprecated [-Wdeprecated-declarations]
+   33 |         CUDA_CHECK(cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &driver_ptr,
+      |                 ~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~                         
+/usr/local/cuda-13.0/include/cuda_runtime_api.h:13101:46: note: declared here
+13101 | extern __CUDA_DEPRECATED __host__ cudaError_t CUDARTAPI cudaGetDriverEntryPoint(const char *symbol, void **funcPtr, unsigned long long flags, enum cudaDriverEntryPointQueryResult *driverStatus = NULL);
+      |                                              ^~~~~~~~~~~~~~~~~~~~~~~
+[2/2] c++ tcgen05_mxfp8_2cta_256n_overlap128_tma_store.o tcgen05_mxfp8_2cta_256n_overlap128_tma_store.cuda.o -shared -L/home/dev/.conda/envs/torch/lib/python3.13/site-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/local/cuda-13.0/lib64 -lcudart -o tcgen05_mxfp8_2cta_256n_overlap128_tma_store.so
+CUDA Device: NVIDIA B200
+PyTorch version: 2.12.0.dev20260319+cu130
+
+Matrix size: M=2048, K=2048, N=2048
+  Custom kernel:        17.408 us (986.90 tflops)
+  PyTorch _scaled_mm:   17.248 us (996.05 tflops)
+  Speedup: 0.99x
+
+Matrix size: M=4096, K=4096, N=4096
+  Custom kernel:        62.432 us (2201.42 tflops)
+  PyTorch _scaled_mm:   54.144 us (2538.40 tflops)
+  Speedup: 0.87x
+
+Matrix size: M=8192, K=8192, N=8192
+  Custom kernel:       428.960 us (2563.20 tflops)
+  PyTorch _scaled_mm:  419.680 us (2619.88 tflops)
+  Speedup: 0.98x
+
+Matrix size: M=16384, K=16384, N=16384
+  Custom kernel:       3611.760 us (2435.40 tflops)
+  PyTorch _scaled_mm:  3483.456 us (2525.11 tflops)
+  Speedup: 0.96x
