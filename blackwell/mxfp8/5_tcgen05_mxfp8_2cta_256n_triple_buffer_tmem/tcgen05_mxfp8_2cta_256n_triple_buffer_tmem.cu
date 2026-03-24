@@ -1680,10 +1680,14 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     dim3 grid_dim(launch_blocks);
     dim3 block_dim(BLOCK_SIZE);
 
-    // use hilbert curve only for square outputs whose dims are powers of 2
+    // use hilbert curve only when the kernel grid is square
+    // kernel uses: grid_m = M/(CTA_GROUP_SIZE*BM) groups, grid_n = N/BN blocks
+    const int kernel_grid_m = M / (CTA_GROUP_SIZE * BM);
+    const int kernel_grid_n = N / BN;
     const bool m_power_of_2 = M > 0 && (M & (M - 1)) == 0;
     const bool n_power_of_2 = N > 0 && (N & (N - 1)) == 0;
-    const bool use_hilbert = (M >= 8192 && N >= 8192) && m_power_of_2 && n_power_of_2; 
+    const bool grid_is_square = (kernel_grid_m == kernel_grid_n);
+    const bool use_hilbert = m_power_of_2 && n_power_of_2 && grid_is_square; 
 
     if (use_hilbert)
     {

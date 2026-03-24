@@ -998,7 +998,7 @@ void producer_warp(
 
 template<int QUEUE_SIZE, int BM, int BN, int BK, int MMA_M, int MMA_N, int MMA_K, int SFA_TMEM_COLS, int SFB_TMEM_COLS, int ACCUM_OVERLAP_COLS, int TMA_STORE_COLS>
 __device__ __noinline__
-void consumer_warp(
+void consumer(
     int K,
     int start_group_id,
     int num_groups,
@@ -1383,7 +1383,7 @@ void ws_gemm_2cta_mma(
         tcgen05_alloc<TMEM_WIDTH_ROUNDED>(tmem_addr_smem);
 
         if (cta_rank == 0 && is_mma_master_thread) {
-            consumer_warp<QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K, SFA_TMEM_COLS, SFB_TMEM_COLS, ACCUM_OVERLAP_COLS, TMA_STORE_COLS>(
+            consumer<QUEUE_SIZE, BM, BN, BK, MMA_M, MMA_N, MMA_K, SFA_TMEM_COLS, SFB_TMEM_COLS, ACCUM_OVERLAP_COLS, TMA_STORE_COLS>(
                 K, start_group_id, num_groups, total_groups, smem,
                 smem_full_mbar_addr, smem_empty_mbar_addr, mma_mbar_addr,
                 epilogue_mbar_addr, tmem_addr_smem
@@ -1620,10 +1620,14 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     dim3 grid_dim(launch_blocks);
     dim3 block_dim(BLOCK_SIZE);
 
-    // use hilbert curve only for square outputs whose dims are powers of 2
+    // use hilbert curve only when the kernel grid is square
+    // kernel uses: grid_m = M/(CTA_GROUP_SIZE*BM) groups, grid_n = N/BN blocks
+    const int kernel_grid_m = M / (CTA_GROUP_SIZE * BM);
+    const int kernel_grid_n = N / BN;
     const bool m_power_of_2 = M > 0 && (M & (M - 1)) == 0;
     const bool n_power_of_2 = N > 0 && (N & (N - 1)) == 0;
-    const bool use_hilbert = m_power_of_2 && n_power_of_2;
+    const bool grid_is_square = (kernel_grid_m == kernel_grid_n);
+    const bool use_hilbert = m_power_of_2 && n_power_of_2 && grid_is_square;
 
     // use TMA stores for large problems, otherwise use direct st_global_256b
     const bool use_tma_store = (M >= 8192 && N >= 8192 && K >= 8192);
