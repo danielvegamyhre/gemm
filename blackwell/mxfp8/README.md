@@ -83,10 +83,3 @@ Basic warp-specialized implementation with 2 CTAs.
 | M=8192, K=8192, N=8192 | 441.312 us (2491.46 tflops) | 418.688 us (2626.09 tflops) | 0.95x |
 | M=16384, K=16384, N=16384 | 3613.616 us (2434.15 tflops) | 3483.712 us (2524.92 tflops) | 0.96x |
 
-## Analysis
-
-- **Kernel 0** (basic warp specialized) shows significantly lower performance, likely due to suboptimal memory access patterns
-- **Kernels 1, 2, 3, 4** achieve near-PyTorch performance (~0.99x) for small matrices (M=2048)
-- **Kernels 3, 4** with TMA store show the best performance for large matrices (M=8192+), reaching 0.97-0.98x speedup
-- All optimized kernels (1-5) achieve 85-99% of PyTorch performance across different problem sizes
-- The 256N blocking with overlap strategies consistently outperforms the basic warp-specialized approach
