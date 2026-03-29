@@ -1627,10 +1627,11 @@ extern "C" void launch_gemm(void* A, void* B, void* SFA, void* SFB, void* C, int
     const bool m_power_of_2 = M > 0 && (M & (M - 1)) == 0;
     const bool n_power_of_2 = N > 0 && (N & (N - 1)) == 0;
     const bool grid_is_square = (kernel_grid_m == kernel_grid_n);
-    const bool use_hilbert = m_power_of_2 && n_power_of_2 && grid_is_square;
+    const bool large_problem_shape = (M >= 8192 && N >= 8192 && K >= 8192);
+    const bool use_hilbert = m_power_of_2 && n_power_of_2 && grid_is_square && large_problem_shape;
 
     // use TMA stores for large problems, otherwise use direct st_global_256b
-    const bool use_tma_store = (M >= 8192 && N >= 8192 && K >= 8192);
+    const bool use_tma_store = large_problem_shape; 
 
     if (use_hilbert && use_tma_store)
     {
